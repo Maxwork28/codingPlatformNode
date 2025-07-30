@@ -116,6 +116,21 @@ router.post(
   adminController.removeStudentFromClass
 );
 
+// New Student Management Routes
+router.put(
+  '/students/:studentId',
+  authMiddleware,
+  requireRole('admin'),
+  adminController.editStudent
+);
+
+router.delete(
+  '/students/:studentId',
+  authMiddleware,
+  requireRole('admin'),
+  adminController.deleteStudent
+);
+
 router.put(
   '/classes/:classId/block-user',
   authMiddleware,

@@ -46,25 +46,25 @@ router.get('/:questionId/statement',
   questionController.viewStatement
 );
 
-router.post('/:questionId/publish', 
+router.put('/:questionId/publish', 
   authMiddleware,
   requireRole('admin', 'teacher'),
   questionController.publishQuestion
 );
 
-router.post('/:questionId/unpublish', 
+router.put('/:questionId/unpublish', 
   authMiddleware,
   requireRole('admin', 'teacher'),
   questionController.unpublishQuestion
 );
 
-router.post('/:questionId/disable', 
+router.put('/:questionId/disable', 
   authMiddleware,
   requireRole('admin', 'teacher'),
   questionController.disableQuestion
 );
 
-router.post('/:questionId/enable', 
+router.put('/:questionId/enable', 
   authMiddleware,
   requireRole('admin', 'teacher'),
   questionController.enableQuestion

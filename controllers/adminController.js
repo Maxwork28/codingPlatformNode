@@ -1550,3 +1550,123 @@ exports.searchQuestionsById = async (req, res) => {
         res.status(500).json({ error: 'Error searching question by ID' });
     }
 };
+
+// Student Management Functions
+exports.editStudent = async (req, res) => {
+    console.log('[Edit Student] Editing student:', req.params.studentId);
+    try {
+        const { studentId } = req.params;
+        const { name, email, number } = req.body;
+        const user = req.user;
+
+        console.log('[Edit Student] User:', user._id, 'Role:', user.role);
+
+        if (!['admin'].includes(user.role)) {
+            console.warn('[Edit Student] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin can edit students' });
+        }
+
+        if (!isValidObjectId(studentId)) {
+            console.error('[Edit Student] Error: Invalid studentId');
+            return res.status(400).json({ error: 'Valid studentId is required' });
+        }
+
+        const student = await User.findById(studentId);
+        if (!student) {
+            console.error('[Edit Student] Error: Student not found');
+            return res.status(404).json({ error: 'Student not found' });
+        }
+
+        if (student.role !== 'student') {
+            console.error('[Edit Student] Error: User is not a student');
+            return res.status(400).json({ error: 'User is not a student' });
+        }
+
+        // Check if email is already taken by another user
+        if (email && email !== student.email) {
+            const existingUser = await User.findOne({ email, _id: { $ne: studentId } });
+            if (existingUser) {
+                console.error('[Edit Student] Error: Email already exists');
+                return res.status(400).json({ error: 'Email already exists' });
+            }
+        }
+
+        // Update student fields
+        const updateData = {};
+        if (name) updateData.name = name;
+        if (email) updateData.email = email;
+        if (number !== undefined) updateData.number = number;
+
+        Object.assign(student, updateData);
+        await student.save();
+
+        console.log('[Edit Student] Student updated:', studentId);
+        res.status(200).json({ 
+            message: 'Student updated successfully', 
+            student: {
+                _id: student._id,
+                name: student.name,
+                email: student.email,
+                number: student.number
+            }
+        });
+    } catch (err) {
+        console.error('[Edit Student] Error:', err.message);
+        res.status(500).json({ error: 'Error editing student' });
+    }
+};
+
+exports.deleteStudent = async (req, res) => {
+    console.log('[Delete Student] Deleting student:', req.params.studentId);
+    try {
+        const { studentId } = req.params;
+        const user = req.user;
+
+        console.log('[Delete Student] User:', user._id, 'Role:', user.role);
+
+        if (!['admin'].includes(user.role)) {
+            console.warn('[Delete Student] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin can delete students' });
+        }
+
+        if (!isValidObjectId(studentId)) {
+            console.error('[Delete Student] Error: Invalid studentId');
+            return res.status(400).json({ error: 'Valid studentId is required' });
+        }
+
+        const student = await User.findById(studentId);
+        if (!student) {
+            console.error('[Delete Student] Error: Student not found');
+            return res.status(404).json({ error: 'Student not found' });
+        }
+
+        if (student.role !== 'student') {
+            console.error('[Delete Student] Error: User is not a student');
+            return res.status(400).json({ error: 'User is not a student' });
+        }
+
+        // Remove student from all classes
+        await Class.updateMany(
+            { students: studentId },
+            { $pull: { students: studentId } }
+        );
+
+        // Delete student's submissions
+        await Submission.deleteMany({ userId: studentId });
+
+        // Remove student from leaderboards
+        await Leaderboard.updateMany(
+            { 'attempts.userId': studentId },
+            { $pull: { attempts: { userId: studentId } } }
+        );
+
+        // Delete the student
+        await student.deleteOne();
+
+        console.log('[Delete Student] Student deleted:', studentId);
+        res.status(200).json({ message: 'Student deleted successfully' });
+    } catch (err) {
+        console.error('[Delete Student] Error:', err.message);
+        res.status(500).json({ error: 'Error deleting student' });
+    }
+};
