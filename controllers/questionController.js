@@ -1295,10 +1295,18 @@ exports.assignQuestionToClass = async (req, res) => {
     console.log('[Assign Question To Class] Assigning question:', req.params.questionId);
     try {
         const { questionId } = req.params;
-        const { classId } = req.body;
+        let classId = req.body.classId;
         const user = req.user;
 
+        console.log('[Assign Question To Class] Request body:', req.body);
+        console.log('[Assign Question To Class] Extracted classId:', classId);
         console.log('[Assign Question To Class] User:', user._id, '| Class:', classId);
+
+        // Validate classId
+        if (!classId || typeof classId !== 'string') {
+            console.error('[Assign Question To Class] Error: Invalid classId', classId);
+            return res.status(400).json({ error: 'Invalid classId provided' });
+        }
 
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Assign Question To Class] Error: Not authorized');

@@ -24,22 +24,65 @@ const validateQuestion = async (questionId) => {
  exports.uploadExcel = async (req, res) => {
     try {
         console.log('uploadExcel: Starting, file:', req.file?.path, 'role:', req.body.role);
+        
+        // Check if file exists
+        if (!req.file) {
+            console.error('uploadExcel: No file uploaded');
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        // Check if file path exists
+        if (!req.file.path) {
+            console.error('uploadExcel: No file path');
+            return res.status(400).json({ error: 'File upload failed' });
+        }
+
+        console.log('uploadExcel: File details:', {
+            originalname: req.file.originalname,
+            mimetype: req.file.mimetype,
+            size: req.file.size,
+            path: req.file.path
+        });
+
         const workbook = xlsx.readFile(req.file.path);
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const data = xlsx.utils.sheet_to_json(sheet);
         console.log('uploadExcel: Excel data parsed:', data);
+        
+        // Log the first entry to see available columns
+        if (data.length > 0) {
+            console.log('uploadExcel: Available columns in first entry:', Object.keys(data[0]));
+        }
+
+        if (!data || data.length === 0) {
+            console.error('uploadExcel: No data found in Excel file');
+            return res.status(400).json({ error: 'No data found in Excel file' });
+        }
 
         for (const entry of data) {
             console.log('uploadExcel: Processing entry:', entry);
+            
+            // Handle different column name formats (case-insensitive)
+            const name = entry.name || entry.Name || entry.NAME;
+            const email = entry.email || entry.Email || entry.EMAIL;
+            const number = entry.number || entry.Number || entry.NUMBER || entry.phone || entry.Phone || entry.PHONE;
+            
+            // Validate required fields
+            if (!name || !email || !number) {
+                console.error('uploadExcel: Missing required fields in entry:', entry);
+                console.error('uploadExcel: Extracted fields:', { name, email, number });
+                continue; // Skip this entry and continue with others
+            }
+
             const password = generatePassword();
             console.log('uploadExcel: Generated password:', password);
             const hashedPassword = await bcrypt.hash(password, 10);
             console.log('uploadExcel: Password hashed');
 
             const user = new User({
-                name: entry.name,
-                email: entry.email,
-                number: entry.number,
+                name: name,
+                email: email,
+                number: number,
                 role: req.body.role,
                 password: hashedPassword
             });
@@ -48,19 +91,24 @@ const validateQuestion = async (questionId) => {
             await user.save();
             console.log('uploadExcel: User saved:', user._id);
 
-            await sendEmail(
-                entry.email,
-                'Your Login Credentials',
-                `Email: ${entry.email}\nPassword: ${password}\nRole: ${req.body.role}`
-            );
-            console.log('uploadExcel: Email sent to:', entry.email);
+            try {
+                await sendEmail(
+                    email,
+                    'Your Login Credentials',
+                    `Email: ${email}\nPassword: ${password}\nRole: ${req.body.role}`
+                );
+                console.log('uploadExcel: Email sent to:', email);
+            } catch (emailError) {
+                console.error('uploadExcel: Failed to send email to:', email, emailError);
+                // Continue processing other users even if email fails
+            }
         }
 
         console.log('uploadExcel: All users processed successfully');
         res.status(200).json({ message: 'Users created and emails sent' });
     } catch (err) {
         console.error('uploadExcel: Error:', err);
-        res.status(500).json({ error: 'Error processing file' });
+        res.status(500).json({ error: 'Error processing file: ' + err.message });
     }
 };
 
@@ -209,8 +257,21 @@ exports.getAllTeachers = async (req, res) => {
 exports.getAllStudents = async (req, res) => {
     try {
         console.log('getAllStudents: Request received, user:', { id: req.user._id, role: req.user.role });
+        
+        // Check if there are any users in the database
+        const totalUsers = await User.countDocuments();
+        console.log('getAllStudents: Total users in database:', totalUsers);
+        
+        // Check users by role
+        const adminCount = await User.countDocuments({ role: 'admin' });
+        const teacherCount = await User.countDocuments({ role: 'teacher' });
+        const studentCount = await User.countDocuments({ role: 'student' });
+        console.log('getAllStudents: Users by role - admin:', adminCount, 'teacher:', teacherCount, 'student:', studentCount);
+        
         const students = await User.find({ role: 'student' }).select('name email number');
         console.log('getAllStudents: Students fetched:', students.length);
+        console.log('getAllStudents: Students data:', students);
+        
         res.status(200).json({ students });
     } catch (err) {
         console.error('getAllStudents: Error:', err);

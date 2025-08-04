@@ -96,6 +96,12 @@ router.get('/classes/:classId/questions/:questionId/report',
   questionController.getQuestionPerspectiveReport
 );
 
+router.post('/:questionId/assign', 
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  questionController.assignQuestionToClass
+);
+
 router.get('/:questionId', 
   authMiddleware,
   questionController.getQuestion
@@ -106,22 +112,16 @@ router.get('/',
   questionController.getAllQuestions
 );
 
-router.post('/:questionId/assign', 
-  authMiddleware,
-  requireRole('admin', 'teacher'),
-  questionController.assignQuestionToClass
+router.post('/:questionId/run-custom', 
+    authMiddleware,
+    requireRole('student'),
+    questionController.runWithCustomInput
 );
 
 router.get('/submissions/:submissionId/code',
   authMiddleware,
   requireRole('admin', 'teacher'),
   questionController.viewSubmissionCode
-);
-
-router.post('/:questionId/run-custom', 
-    authMiddleware,
-    requireRole('student'),
-    questionController.runWithCustomInput
 );
 
 module.exports = router;
