@@ -124,4 +124,17 @@ router.get('/submissions/:submissionId/code',
   questionController.viewSubmissionCode
 );
 
+// Teacher-specific testing routes (no leaderboard impact)
+router.post('/:questionId/teacher-test', 
+  authMiddleware,
+  requireRole('teacher', 'admin'),
+  questionController.teacherTestQuestion
+);
+
+router.post('/:questionId/teacher-test-custom', 
+  authMiddleware,
+  requireRole('teacher', 'admin'),
+  questionController.teacherTestWithCustomInput
+);
+
 module.exports = router;

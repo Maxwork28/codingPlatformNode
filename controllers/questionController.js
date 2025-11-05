@@ -1619,3 +1619,199 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
         res.status(500).json({ error: 'Error fetching question perspective report' });
     }
 };
+
+// Teacher-specific testing endpoint - ALL test cases visible, no leaderboard impact
+exports.teacherTestQuestion = async (req, res) => {
+    console.log('[Teacher Test Question] Teacher testing code');
+    try {
+        const { questionId } = req.params;
+        const { answer, classId, language } = req.body;
+        const user = req.user;
+
+        console.log('[Teacher Test Question] User:', user._id, '| Question:', questionId, '| Class:', classId, '| Language:', language);
+
+        // Authorization check - only teachers and admins
+        if (!['teacher', 'admin'].includes(user.role)) {
+            console.warn('[Teacher Test Question] Error: User is not teacher/admin');
+            return res.status(403).json({ error: 'Only teachers and admins can test questions' });
+        }
+
+        // Get question
+        const question = await Question.findById(questionId);
+        if (!question) {
+            console.error('[Teacher Test Question] Error: Question not found:', questionId);
+            return res.status(404).json({ error: 'Question not found' });
+        }
+
+        // Verify question is associated with class (optional check)
+        const classEntry = question.classes.find(c => c.classId.toString() === classId);
+        if (!classEntry) {
+            console.warn('[Teacher Test Question] Warning: Question not associated with class, but allowing teacher test');
+        }
+
+        // Only coding questions can be tested
+        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
+            console.error('[Teacher Test Question] Error: Not a coding question');
+            return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be tested' });
+        }
+
+        // Validate language
+        if (!language || !question.languages.includes(language)) {
+            console.error('[Teacher Test Question] Error: Invalid or unsupported language:', language);
+            return res.status(400).json({ error: `Language ${language} is not supported for this question` });
+        }
+
+        let codeToExecute = answer;
+        if (question.type === 'fillInTheBlanksCoding') {
+            if (!question.codeSnippet) {
+                console.error('[Teacher Test Question] Error: Missing codeSnippet');
+                return res.status(400).json({ error: 'Question is missing code snippet' });
+            }
+            codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
+            console.log('[Teacher Test Question] Combined code for execution');
+        }
+
+        // Execute with ALL test cases (public + hidden)
+        let testResults;
+        try {
+            console.log('[Teacher Test Question] Executing code with ALL test cases');
+            testResults = await executeDockerCode(
+                language,
+                codeToExecute,
+                question.testCases, // ALL test cases
+                question.timeLimit,
+                question.memoryLimit
+            );
+            console.log('[Teacher Test Question] Test results:', testResults);
+        } catch (err) {
+            console.error('[Teacher Test Question] Error: Code execution failed:', err.message);
+            return res.status(500).json({ error: `Code execution failed: ${err.message}` });
+        }
+
+        const passedTestCases = testResults.filter(test => test.passed).length;
+        const totalTestCases = testResults.length;
+        const isCorrect = testResults.every(test => test.passed);
+        const publicTestCases = testResults.filter(test => test.isPublic).length;
+        const hiddenTestCases = testResults.filter(test => !test.isPublic).length;
+
+        // NO DATABASE SAVE - this is just for testing
+        // NO LEADERBOARD UPDATE
+        // NO SOCKET.IO EMISSION
+
+        console.log('[Teacher Test Question] Successfully processed (no DB save)');
+        res.status(200).json({
+            message: 'Code tested successfully (teacher mode - no submission saved)',
+            testResults,
+            passedTestCases,
+            totalTestCases,
+            publicTestCases,
+            hiddenTestCases,
+            isCorrect,
+            explanation: question.explanation,
+            teacherMode: true
+        });
+    } catch (err) {
+        console.error('[Teacher Test Question] Error processing test:', err.message);
+        res.status(500).json({ error: 'Error testing code' });
+    }
+};
+
+// Teacher-specific custom input testing - no validation on input format
+exports.teacherTestWithCustomInput = async (req, res) => {
+    console.log('[Teacher Test With Custom Input] Teacher testing with custom input');
+    try {
+        const { questionId } = req.params;
+        const { answer, classId, language, customInput, expectedOutput } = req.body;
+        const user = req.user;
+
+        console.log('[Teacher Test With Custom Input] User:', user._id, '| Question:', questionId, '| Language:', language);
+
+        // Authorization check - only teachers and admins
+        if (!['teacher', 'admin'].includes(user.role)) {
+            console.warn('[Teacher Test With Custom Input] Error: User is not teacher/admin');
+            return res.status(403).json({ error: 'Only teachers and admins can test questions' });
+        }
+
+        // Get question
+        const question = await Question.findById(questionId);
+        if (!question) {
+            console.error('[Teacher Test With Custom Input] Error: Question not found:', questionId);
+            return res.status(404).json({ error: 'Question not found' });
+        }
+
+        // Only coding questions can be tested
+        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
+            console.error('[Teacher Test With Custom Input] Error: Not a coding question');
+            return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be tested' });
+        }
+
+        // Validate language
+        if (!language || !question.languages.includes(language)) {
+            console.error('[Teacher Test With Custom Input] Error: Invalid or unsupported language:', language);
+            return res.status(400).json({ error: `Language ${language} is not supported for this question` });
+        }
+
+        // Validate custom input exists
+        if (!customInput || typeof customInput !== 'string' || !customInput.trim()) {
+            console.error('[Teacher Test With Custom Input] Error: Invalid custom input');
+            return res.status(400).json({ error: 'Valid custom input is required' });
+        }
+
+        let codeToExecute = answer;
+        if (question.type === 'fillInTheBlanksCoding') {
+            if (!question.codeSnippet) {
+                console.error('[Teacher Test With Custom Input] Error: Missing codeSnippet');
+                return res.status(400).json({ error: 'Question is missing code snippet' });
+            }
+            codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
+            console.log('[Teacher Test With Custom Input] Combined code for execution');
+        }
+
+        // Create custom test case - NO FORMAT VALIDATION for teachers
+        const customTestCase = [{
+            input: customInput.trim(),
+            expectedOutput: expectedOutput ? expectedOutput.trim() : '',
+            isPublic: true
+        }];
+
+        // Execute with custom input
+        let testResults;
+        try {
+            console.log('[Teacher Test With Custom Input] Executing code with custom input');
+            testResults = await executeDockerCode(
+                language,
+                codeToExecute,
+                customTestCase,
+                question.timeLimit,
+                question.memoryLimit
+            );
+            console.log('[Teacher Test With Custom Input] Test results:', testResults);
+        } catch (err) {
+            console.error('[Teacher Test With Custom Input] Error: Code execution failed:', err.message);
+            return res.status(500).json({ error: `Code execution failed: ${err.message}` });
+        }
+
+        const testResult = testResults[0];
+        const passed = expectedOutput ? testResult.passed : null; // Only check if expected output provided
+
+        // NO DATABASE SAVE
+        // NO LEADERBOARD UPDATE
+        // NO SOCKET.IO EMISSION
+
+        console.log('[Teacher Test With Custom Input] Successfully processed (no DB save)');
+        res.status(200).json({
+            message: 'Code tested with custom input successfully (teacher mode)',
+            testResult,
+            customInput: customInput.trim(),
+            expectedOutput: expectedOutput ? expectedOutput.trim() : null,
+            actualOutput: testResult.output,
+            passed,
+            error: testResult.error,
+            explanation: question.explanation,
+            teacherMode: true
+        });
+    } catch (err) {
+        console.error('[Teacher Test With Custom Input] Error processing test:', err.message);
+        res.status(500).json({ error: 'Error testing code with custom input' });
+    }
+};

@@ -227,13 +227,37 @@ exports.manageTeacherPermission = async (req, res) => {
 
 
 exports.getAllClasses = async (req, res) => {
-        try {
-        console.log('getAllClasses: Request received, user:', { id: req.user._id, role: req.user.role });
-        const classes = await Class.find()
+    try {
+        const { search } = req.query;
+        console.log('getAllClasses: Request received, user:', { id: req.user._id, role: req.user.role }, 'search:', search);
+        
+        // Build query
+        let query = {};
+        
+        // If search parameter is provided, search by class name or creator name
+        if (search && search.trim()) {
+            const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
+            
+            // First, find users whose names match the search
+            const matchingUsers = await User.find({ name: searchRegex }).select('_id');
+            const matchingUserIds = matchingUsers.map(u => u._id);
+            
+            // Search by class name OR creator name
+            query = {
+                $or: [
+                    { name: searchRegex },
+                    { createdBy: { $in: matchingUserIds } }
+                ]
+            };
+            console.log('getAllClasses: Applying search filter:', { search, matchingUsersCount: matchingUserIds.length });
+        }
+        
+        const classes = await Class.find(query)
             .populate('createdBy', 'name email')
             .populate('students', 'name email')
             .populate('teachers', 'name email')
             .populate('questions', 'title type description points classes');
+        
         console.log('getAllClasses: Classes fetched:', classes.length);
         res.status(200).json({ classes });
     } catch (err) {
@@ -244,8 +268,26 @@ exports.getAllClasses = async (req, res) => {
 
 exports.getAllTeachers = async (req, res) => {
     try {
-        console.log('getAllTeachers: Request received, user:', { id: req.user._id, role: req.user.role });
-        const teachers = await User.find({ role: 'teacher' }).select('name email canCreateClass');
+        const { search } = req.query;
+        console.log('getAllTeachers: Request received, user:', { id: req.user._id, role: req.user.role }, 'search:', search);
+        
+        // Build query
+        let query = { role: 'teacher' };
+        
+        // If search parameter is provided, search by teacher name or email
+        if (search && search.trim()) {
+            const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
+            query = {
+                role: 'teacher',
+                $or: [
+                    { name: searchRegex },
+                    { email: searchRegex }
+                ]
+            };
+            console.log('getAllTeachers: Applying search filter:', { search });
+        }
+        
+        const teachers = await User.find(query).select('name email canCreateClass');
         console.log('getAllTeachers: Teachers fetched:', teachers.length);
         res.status(200).json({ teachers });
     } catch (err) {
@@ -256,21 +298,28 @@ exports.getAllTeachers = async (req, res) => {
 
 exports.getAllStudents = async (req, res) => {
     try {
-        console.log('getAllStudents: Request received, user:', { id: req.user._id, role: req.user.role });
+        const { search } = req.query;
+        console.log('getAllStudents: Request received, user:', { id: req.user._id, role: req.user.role }, 'search:', search);
         
-        // Check if there are any users in the database
-        const totalUsers = await User.countDocuments();
-        console.log('getAllStudents: Total users in database:', totalUsers);
+        // Build query
+        let query = { role: 'student' };
         
-        // Check users by role
-        const adminCount = await User.countDocuments({ role: 'admin' });
-        const teacherCount = await User.countDocuments({ role: 'teacher' });
-        const studentCount = await User.countDocuments({ role: 'student' });
-        console.log('getAllStudents: Users by role - admin:', adminCount, 'teacher:', teacherCount, 'student:', studentCount);
+        // If search parameter is provided, search by student name, email, or number
+        if (search && search.trim()) {
+            const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
+            query = {
+                role: 'student',
+                $or: [
+                    { name: searchRegex },
+                    { email: searchRegex },
+                    { number: searchRegex }
+                ]
+            };
+            console.log('getAllStudents: Applying search filter:', { search });
+        }
         
-        const students = await User.find({ role: 'student' }).select('name email number');
+        const students = await User.find(query).select('name email number');
         console.log('getAllStudents: Students fetched:', students.length);
-        console.log('getAllStudents: Students data:', students);
         
         res.status(200).json({ students });
     } catch (err) {

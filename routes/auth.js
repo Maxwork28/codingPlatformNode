@@ -45,8 +45,14 @@ router.post('/login', async (req, res) => {
         );
         console.log('JWT token generated:', token);
 
-        // Send response
-        res.status(200).json({ token, role: user.role });
+        // Send response with user details
+        res.status(200).json({
+            token,
+            role: user.role,
+            id: user._id,
+            name: user.name,
+            email: user.email,
+        });
         console.log('Login successful, response sent');
 
     } catch (err) {
@@ -107,15 +113,17 @@ router.post('/forgot-password', async (req, res) => {
 router.get('/me', authMiddleware, async (req, res) => {
     try {
         // req.user is set by authMiddleware
-        const user = await User.findById(req.user._id).select('id role'); // Select only id and role
+        const user = await User.findById(req.user._id).select('name email role'); // Select name, email, and role
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
         res.status(200).json({
             id: user._id,
+            name: user.name,
+            email: user.email,
             role: user.role,
         });
-        console.log('GET /auth/me successful:', { id: user._id, role: user.role });
+        console.log('GET /auth/me successful:', { id: user._id, name: user.name, email: user.email, role: user.role });
     } catch (err) {
         console.error('Error fetching user details:', err);
         res.status(500).json({ error: 'Server error' });

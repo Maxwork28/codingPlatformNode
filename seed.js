@@ -220,7 +220,7 @@ const CLASS_DATA = [
   { name: 'CS203: Advanced Python Programming', description: 'Dive deeper into Python.' },
   { name: 'CS303: Competitive Programming', description: 'Prepare for coding competitions.' },
   { name: 'CS401: Software Engineering', description: 'Learn software development methodologies.' },
-  { name: 'Demo Class', description: 'A demo class with all questions available for student1@example.com to practice.' }
+  { name: 'Demo Class', description: 'A demo class with all questions available, published, enabled, and assigned. Perfect for testing and practice! Login with demo@example.com.' }
 ];
 
 // Realistic question data
@@ -442,6 +442,17 @@ async function seedDatabase() {
       });
     }
 
+    // Demo Student
+    users.push({
+      name: 'Demo Student',
+      email: 'demo@example.com',
+      number: faker.phone.number(),
+      role: 'student',
+      password: hashedPassword,
+      canCreateClass: false,
+      isBlocked: {}
+    });
+
     // Students
     for (let i = 0; i < 50; i++) {
       users.push({
@@ -466,16 +477,25 @@ async function seedDatabase() {
     console.log('[Seed] Generating classes...');
     const classes = [];
     const student1 = insertedUsers.find((u) => u.email === 'student1@example.com');
+    const demoStudent = insertedUsers.find((u) => u.email === 'demo@example.com');
     for (const classData of CLASS_DATA) {
       const numTeachers = randomInt(1, 2);
       const numStudents = randomInt(10, 20);
       let selectedStudents = faker.helpers.arrayElements(studentUsers, numStudents);
-      if (classData.name === 'Demo Class' && student1) {
-        // Ensure student1@example.com is included in Demo Class
-        selectedStudents = [student1, ...faker.helpers.arrayElements(
-          studentUsers.filter((s) => s._id.toString() !== student1._id.toString()),
-          numStudents - 1
-        )];
+      if (classData.name === 'Demo Class') {
+        // Ensure demo@example.com and student1@example.com are included in Demo Class
+        const otherStudents = faker.helpers.arrayElements(
+          studentUsers.filter((s) => 
+            s._id.toString() !== student1?._id.toString() && 
+            s._id.toString() !== demoStudent?._id.toString()
+          ),
+          numStudents - 2
+        );
+        selectedStudents = [
+          ...(demoStudent ? [demoStudent] : []),
+          ...(student1 ? [student1] : []),
+          ...otherStudents
+        ].filter(Boolean);
       }
       classes.push({
         name: classData.name,
@@ -497,12 +517,18 @@ async function seedDatabase() {
     // Update isBlocked for students
     console.log('[Seed] Updating isBlocked for students...');
     const userBulkOps = [];
+    const demoClassForBlocking = insertedClasses.find((c) => c.name === 'Demo Class');
     for (const cls of insertedClasses) {
       for (const studentId of cls.students) {
+        const student = insertedUsers.find((u) => u._id.toString() === studentId.toString());
+        // Never block demo@example.com or any students in Demo Class
+        const shouldBlock = cls.name !== 'Demo Class' && 
+                           student?.email !== 'demo@example.com' && 
+                           Math.random() > 0.9;
         userBulkOps.push({
           updateOne: {
             filter: { _id: studentId },
-            update: { $set: { [`isBlocked.${cls._id}`]: cls.name !== 'Demo Class' && Math.random() > 0.9 } } // No block for Demo Class
+            update: { $set: { [`isBlocked.${cls._id}`]: shouldBlock } }
           }
         });
       }
@@ -521,7 +547,10 @@ async function seedDatabase() {
         insertedClasses.filter((c) => c.name !== 'Demo Class'),
         randomInt(1, 3)
       ).map((c) => c._id);
-      const allClassIds = demoClass ? [...new Set([...classIds, demoClass._id])] : classIds;
+      
+      // Always include Demo Class as the first entry with published and enabled status
+      const allClassIds = demoClass ? [demoClass._id, ...classIds] : classIds;
+      
       const question = {
         classes: allClassIds.map((classId) => ({
           classId,
@@ -569,16 +598,27 @@ async function seedDatabase() {
     // Update Classes with Questions and Assignments
     console.log('[Seed] Updating classes with questions and assignments...');
     const classBulkOps = [];
+    const demoClassDoc = insertedClasses.find((c) => c.name === 'Demo Class');
     for (const cls of insertedClasses) {
       const classQuestions = insertedQuestions.filter((q) =>
         q.classes.some((c) => c.classId.toString() === cls._id.toString())
       );
-      const assignments = classQuestions.slice(0, randomInt(1, classQuestions.length)).map((q) => ({
-        questionId: q._id,
-        assignedAt: new Date(),
-        dueDate: faker.date.future(),
-        maxPoints: q.points
-      }));
+      
+      // For Demo Class, add ALL questions as assignments
+      // For other classes, add a random subset
+      const assignments = cls._id.toString() === demoClassDoc?._id.toString()
+        ? classQuestions.map((q) => ({
+            questionId: q._id,
+            assignedAt: new Date(),
+            dueDate: faker.date.future(),
+            maxPoints: q.points
+          }))
+        : classQuestions.slice(0, randomInt(1, classQuestions.length)).map((q) => ({
+            questionId: q._id,
+            assignedAt: new Date(),
+            dueDate: faker.date.future(),
+            maxPoints: q.points
+          }));
 
       classBulkOps.push({
         updateOne: {
@@ -712,12 +752,23 @@ async function seedDatabase() {
     const submissionCount = await Submission.countDocuments();
     const leaderboardCount = await Leaderboard.countDocuments();
     const sampleStudent = await User.findOne({ role: 'student' }).lean();
+    const demoStudentDoc = await User.findOne({ email: 'demo@example.com' }).lean();
+    const demoClassFinal = await Class.findOne({ name: 'Demo Class' }).populate('questions').populate('students').lean();
+    
     console.log(`[Seed] Total users: ${userCount}`);
     console.log(`[Seed] Total classes: ${classCount}`);
     console.log(`[Seed] Total questions: ${questionCount}`);
     console.log(`[Seed] Total submissions: ${submissionCount}`);
     console.log(`[Seed] Total leaderboard entries: ${leaderboardCount}`);
     console.log('[Seed] Sample student isBlocked:', sampleStudent.isBlocked);
+    console.log('\n[Seed] ===== DEMO ACCOUNT INFO =====');
+    console.log(`[Seed] Demo Student Email: demo@example.com`);
+    console.log(`[Seed] Demo Student Password: Password123!`);
+    console.log(`[Seed] Demo Class Name: ${demoClassFinal?.name}`);
+    console.log(`[Seed] Demo Class Students: ${demoClassFinal?.students?.length || 0}`);
+    console.log(`[Seed] Demo Class Questions: ${demoClassFinal?.questions?.length || 0} (ALL PUBLISHED & ENABLED)`);
+    console.log(`[Seed] Demo Class Assignments: ${demoClassFinal?.assignments?.length || 0} (ALL QUESTIONS)`);
+    console.log('[Seed] ================================\n');
 
     console.log('[Seed] Database seeding completed successfully!');
   } catch (error) {
