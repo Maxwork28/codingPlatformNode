@@ -1027,9 +1027,14 @@ exports.searchLeaderboard = async (req, res) => {
 
         console.log('searchLeaderboard: Query:', query);
         let leaderboard = await Leaderboard.find(query)
-            .populate('studentId', 'name email')
+            .populate('studentId', 'name email isBlocked')
             .lean();
-        console.log('searchLeaderboard: Raw leaderboard:', leaderboard);
+        console.log('searchLeaderboard: Raw leaderboard count:', leaderboard.length);
+        console.log('searchLeaderboard: Detailed leaderboard entries:');
+        leaderboard.forEach((entry, idx) => {
+            const isBlockedForClass = entry.studentId?.isBlocked ? entry.studentId.isBlocked[classId] || false : false;
+            console.log(`  [${idx}] Student: ${entry.studentId?.name}, needsFocus: ${entry.needsFocus}, activityStatus: ${entry.activityStatus}, totalSubmits: ${entry.totalSubmits}, isBlocked: ${isBlockedForClass}`);
+        });
 
         if (name) {
             const studentIds = await User.find(
@@ -1045,7 +1050,20 @@ exports.searchLeaderboard = async (req, res) => {
             }
         }
 
-        console.log('searchLeaderboard: Final leaderboard:', leaderboard);
+        // Add isBlocked status from User model to each leaderboard entry
+        leaderboard = leaderboard.map(entry => {
+            const isBlockedForClass = entry.studentId?.isBlocked ? (entry.studentId.isBlocked[classId] || false) : false;
+            return {
+                ...entry,
+                isBlocked: isBlockedForClass
+            };
+        });
+        
+        console.log('searchLeaderboard: Final leaderboard count:', leaderboard.length);
+        console.log('searchLeaderboard: Returning to frontend:');
+        leaderboard.forEach((entry, idx) => {
+            console.log(`  [${idx}] Returning - Student: ${entry.studentId?.name}, needsFocus: ${entry.needsFocus}, activityStatus: ${entry.activityStatus}, isBlocked: ${entry.isBlocked}`);
+        });
         res.status(200).json({ leaderboard });
     } catch (err) {
         console.error('searchLeaderboard: Error:', err.message, err.stack);
@@ -1091,9 +1109,15 @@ exports.blockUnblockStudent = async (req, res) => {
             return res.status(403).json({ error: 'Teacher not assigned to this class' });
         }
 
+        console.log('[blockUnblockStudent] Current isBlocked status for this class:', student.isBlocked.get(classId));
+        console.log('[blockUnblockStudent] Setting isBlocked to:', isBlocked);
+        
         student.isBlocked.set(classId, isBlocked);
         await student.save();
-        console.log('[blockUnblockStudent] Student block status updated:', { studentId, isBlocked });
+        
+        console.log('[blockUnblockStudent] ✅ Student saved successfully!');
+        console.log('[blockUnblockStudent] Final isBlocked status:', student.isBlocked.get(classId));
+        console.log('[blockUnblockStudent] Full isBlocked Map:', Object.fromEntries(student.isBlocked));
 
         req.io.to(`class:${classId}`).emit('studentBlockStatusUpdated', {
             classId,
@@ -1151,8 +1175,11 @@ exports.focusUnfocusStudent = async (req, res) => {
             return res.status(403).json({ error: 'Teacher not assigned to this class' });
         }
 
+        console.log('[focusUnfocusStudent] Looking up leaderboard for:', { classId, studentId });
         let leaderboard = await Leaderboard.findOne({ classId, studentId });
+        
         if (!leaderboard) {
+            console.log('[focusUnfocusStudent] No leaderboard found, creating new one');
             leaderboard = new Leaderboard({
                 classId,
                 studentId,
@@ -1166,16 +1193,45 @@ exports.focusUnfocusStudent = async (req, res) => {
                 activityStatus: 'inactive',
                 needsFocus
             });
+            console.log('[focusUnfocusStudent] New leaderboard created with needsFocus:', needsFocus);
         } else {
+            console.log('[focusUnfocusStudent] Existing leaderboard found:', {
+                _id: leaderboard._id,
+                currentNeedsFocus: leaderboard.needsFocus,
+                currentActivityStatus: leaderboard.activityStatus,
+                totalSubmits: leaderboard.totalSubmits,
+                newNeedsFocus: needsFocus
+            });
+            
             leaderboard.needsFocus = needsFocus;
+            console.log('[focusUnfocusStudent] Set needsFocus to:', needsFocus);
+            
             if (needsFocus) {
+                console.log('[focusUnfocusStudent] Setting activityStatus to "focused" because needsFocus=true');
                 leaderboard.activityStatus = 'focused';
             } else if (leaderboard.activityStatus === 'focused') {
-                leaderboard.activityStatus = leaderboard.totalSubmits > 0 ? 'active' : 'inactive';
+                const newStatus = leaderboard.totalSubmits > 0 ? 'active' : 'inactive';
+                console.log('[focusUnfocusStudent] Setting activityStatus from "focused" to:', newStatus, '(totalSubmits:', leaderboard.totalSubmits + ')');
+                leaderboard.activityStatus = newStatus;
+            } else {
+                console.log('[focusUnfocusStudent] Not changing activityStatus, currently:', leaderboard.activityStatus);
             }
         }
+        
+        console.log('[focusUnfocusStudent] Saving leaderboard with:', {
+            needsFocus: leaderboard.needsFocus,
+            activityStatus: leaderboard.activityStatus
+        });
+        
         await leaderboard.save();
-        console.log('[focusUnfocusStudent] Leaderboard focus status updated:', { studentId, needsFocus });
+        
+        console.log('[focusUnfocusStudent] ✅ Leaderboard saved successfully!');
+        console.log('[focusUnfocusStudent] Final values:', {
+            studentId: leaderboard.studentId,
+            needsFocus: leaderboard.needsFocus,
+            activityStatus: leaderboard.activityStatus,
+            _id: leaderboard._id
+        });
 
         req.io.to(`class:${classId}`).emit('studentFocusStatusUpdated', {
             classId,

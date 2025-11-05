@@ -1194,11 +1194,27 @@ exports.getLeaderboard = async (req, res) => {
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
 
-        const leaderboard = await Leaderboard.find({ classId })
-            .populate('studentId', 'name email')
+        let leaderboard = await Leaderboard.find({ classId })
+            .populate('studentId', 'name email isBlocked')
             .lean();
 
-        console.log('[Get Leaderboard] Leaderboard fetched:', leaderboard.length, 'entries');
+        console.log('[Get Leaderboard] Raw leaderboard fetched:', leaderboard.length, 'entries');
+        console.log('[Get Leaderboard] Detailed entries:');
+        leaderboard.forEach((entry, idx) => {
+            const isBlockedForClass = entry.studentId?.isBlocked ? (entry.studentId.isBlocked[classId] || false) : false;
+            console.log(`  [${idx}] Student: ${entry.studentId?.name}, needsFocus: ${entry.needsFocus}, activityStatus: ${entry.activityStatus}, isBlocked: ${isBlockedForClass}`);
+        });
+        
+        // Add isBlocked status from User model to each leaderboard entry
+        leaderboard = leaderboard.map(entry => {
+            const isBlockedForClass = entry.studentId?.isBlocked ? (entry.studentId.isBlocked[classId] || false) : false;
+            return {
+                ...entry,
+                isBlocked: isBlockedForClass
+            };
+        });
+        
+        console.log('[Get Leaderboard] ✅ Returning leaderboard with isBlocked fields');
         res.status(200).json({ leaderboard });
     } catch (err) {
         console.error('[Get Leaderboard] Error:', err.message);

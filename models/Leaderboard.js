@@ -78,7 +78,22 @@ leaderboardSchema.pre('save', function (next) {
     this.totalRuns = runCount;
     this.totalSubmits = submitCount;
 
-    this.activityStatus = this.totalSubmits > 0 ? (this.totalSubmits >= 5 ? 'focused' : 'active') : 'inactive';
+    // Respect manual needsFocus setting
+    // If needsFocus is explicitly true, force to 'focused'
+    // Otherwise, calculate based on activity but don't auto-focus
+    if (this.needsFocus === true) {
+        console.log('[Leaderboard pre-save] needsFocus=true, forcing activityStatus to "focused"');
+        this.activityStatus = 'focused';
+    } else {
+        // When needsFocus is false, use submission count but cap at 'active'
+        // Don't automatically promote to 'focused' just because of high submission count
+        if (this.totalSubmits === 0) {
+            this.activityStatus = 'inactive';
+        } else {
+            this.activityStatus = 'active';
+        }
+        console.log('[Leaderboard pre-save] needsFocus=false, calculated activityStatus:', this.activityStatus, '(totalSubmits:', this.totalSubmits + ')');
+    }
     next();
 });
 
