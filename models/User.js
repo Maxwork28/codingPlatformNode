@@ -8,7 +8,7 @@ const userSchema = new mongoose.Schema({
     password: String,
     resetToken: String,
     resetTokenExpiry: Date,
-    canCreateClass: { type: Boolean, default: false },
+    canCreateQuestion: { type: Boolean, default: false },
     isBlocked: { type: Map, of: Boolean, default: {} }
 }, {
     indexes: [

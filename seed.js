@@ -11,7 +11,7 @@ const userSchema = new mongoose.Schema({
   password: String,
   resetToken: String,
   resetTokenExpiry: Date,
-  canCreateClass: { type: Boolean, default: false },
+  canCreateQuestion: { type: Boolean, default: false },
   isBlocked: { type: Map, of: Boolean, default: {} }
 }, {
   indexes: [{ key: { name: 'text', email: 'text' } }]
@@ -424,7 +424,7 @@ async function seedDatabase() {
         number: faker.phone.number(),
         role: 'admin',
         password: hashedPassword,
-        canCreateClass: true,
+        canCreateQuestion: true,
         isBlocked: {}
       });
     }
@@ -437,7 +437,7 @@ async function seedDatabase() {
         number: faker.phone.number(),
         role: 'teacher',
         password: hashedPassword,
-        canCreateClass: true,
+        canCreateQuestion: true,
         isBlocked: {}
       });
     }
@@ -449,7 +449,7 @@ async function seedDatabase() {
       number: faker.phone.number(),
       role: 'student',
       password: hashedPassword,
-      canCreateClass: false,
+      canCreateQuestion: false,
       isBlocked: {}
     });
 
@@ -461,7 +461,7 @@ async function seedDatabase() {
         number: faker.phone.number(),
         role: 'student',
         password: hashedPassword,
-        canCreateClass: false,
+        canCreateQuestion: false,
         isBlocked: {}
       });
     }

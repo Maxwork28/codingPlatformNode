@@ -24,6 +24,8 @@ const questionSchema = new mongoose.Schema({
     updatedAt: { type: Date, default: Date.now },
     hints: [{ type: String }],
     solution: { type: String },
+    solutionCode: { type: String }, // Solution code for coding questions
+    solutionLanguage: { type: String }, // Language for solution code
     level: { type: String, enum: ['beginner', 'intermediate', 'advanced'] },
     type: {
         type: String,
@@ -45,6 +47,14 @@ const questionSchema = new mongoose.Schema({
     testCases: [testCaseSchema], // For coding and fillInTheBlanksCoding
     constraints: { type: String },
     examples: [{ type: String }],
+    functionSignature: { type: String },
+    templateCode: [{
+        language: {
+            type: String,
+            enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']
+        },
+        code: { type: String }
+    }],
     languages: [{
         type: String,
         enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']
@@ -52,11 +62,26 @@ const questionSchema = new mongoose.Schema({
     timeLimit: { type: Number, default: 2 },
     memoryLimit: { type: Number, default: 256 },
     maxAttempts: { type: Number },
-    explanation: { type: String }
+    explanation: { type: String },
+    // Draft-related fields
+    status: {
+        type: String,
+        enum: ['draft', 'published', 'archived'],
+        default: 'published'
+    },
+    isDraft: {
+        type: Boolean,
+        default: false
+    },
+    publishedAt: { type: Date },
+    publishedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 }, {
     indexes: [
         { key: { 'classes.classId': 1 } },
-        { key: { title: 'text', tags: 'text' } }
+        { key: { title: 'text', tags: 'text' } },
+        { key: { status: 1 } },
+        { key: { isDraft: 1 } },
+        { key: { createdBy: 1, status: 1 } }
     ]
 });
 

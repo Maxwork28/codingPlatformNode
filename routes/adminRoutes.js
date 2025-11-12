@@ -248,4 +248,54 @@ router.get(
   adminController.searchQuestionsById
 );
 
+// Draft Question Routes (Admin and Teacher)
+router.post(
+  '/questions/draft',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.createDraftQuestion
+);
+
+router.get(
+  '/questions/drafts',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.getDrafts
+);
+
+router.get(
+  '/questions/drafts/count',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.getDraftCount
+);
+
+router.get(
+  '/questions/drafts/:questionId',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.getDraftQuestion
+);
+
+router.put(
+  '/questions/drafts/:questionId',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.updateDraftQuestion
+);
+
+router.put(
+  '/questions/drafts/:questionId/publish',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.publishDraftQuestion
+);
+
+router.delete(
+  '/questions/drafts/:questionId',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.deleteDraftQuestion
+);
+
 module.exports = router;

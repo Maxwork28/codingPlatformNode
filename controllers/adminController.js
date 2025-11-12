@@ -118,14 +118,14 @@ exports.createClass = async (req, res) => {
         const user = req.user;
 
         console.log('createClass: Request received:', { name, description, file: req.file?.path });
-        console.log('createClass: User:', { id: user._id, role: user.role, canCreateClass: user.canCreateClass });
+        console.log('createClass: User:', { id: user._id, role: user.role, canCreateQuestion: user.canCreateQuestion });
 
         if (!name) {
             console.log('createClass: Validation failed: Class name is missing');
             return res.status(400).json({ error: 'Class name is required' });
         }
 
-        if (user.role !== 'admin' && !(user.role === 'teacher' && user.canCreateClass)) {
+        if (user.role !== 'admin' && !(user.role === 'teacher' && user.canCreateQuestion)) {
             console.log('createClass: Authorization failed: User not allowed to create class');
             return res.status(403).json({ error: 'Unauthorized to create class' });
         }
@@ -191,17 +191,17 @@ exports.createClass = async (req, res) => {
 
 exports.manageTeacherPermission = async (req, res) => {
     try {
-        const { teacherId, canCreateClass } = req.body;
-        console.log('manageTeacherPermission: Request received:', { teacherId, canCreateClass, userRole: req.user.role });
+        const { teacherId, canCreateQuestion } = req.body;
+        console.log('manageTeacherPermission: Request received:', { teacherId, canCreateQuestion, userRole: req.user.role });
 
         if (req.user.role !== 'admin') {
             console.log('manageTeacherPermission: Authorization failed: User is not admin');
             return res.status(403).json({ error: 'Only admins can manage teacher permissions' });
         }
 
-        if (!teacherId || typeof canCreateClass !== 'boolean') {
-            console.log('manageTeacherPermission: Validation failed: Invalid teacherId or canCreateClass');
-            return res.status(400).json({ error: 'Teacher ID and canCreateClass (boolean) are required' });
+        if (!teacherId || typeof canCreateQuestion !== 'boolean') {
+            console.log('manageTeacherPermission: Validation failed: Invalid teacherId or canCreateQuestion');
+            return res.status(400).json({ error: 'Teacher ID and canCreateQuestion (boolean) are required' });
         }
 
         const teacher = await User.findById(teacherId);
@@ -212,13 +212,13 @@ exports.manageTeacherPermission = async (req, res) => {
             return res.status(404).json({ error: 'Teacher not found' });
         }
 
-        teacher.canCreateClass = canCreateClass;
+        teacher.canCreateQuestion = canCreateQuestion;
         await teacher.save();
-        console.log('manageTeacherPermission: Teacher updated:', { id: teacher._id, canCreateClass });
+        console.log('manageTeacherPermission: Teacher updated:', { id: teacher._id, canCreateQuestion });
 
-        const action = canCreateClass ? 'granted' : 'revoked';
+        const action = canCreateQuestion ? 'granted' : 'revoked';
         console.log(`manageTeacherPermission: Permission ${action} for teacher`);
-        res.status(200).json({ message: `Class creation permission ${action} for teacher` });
+        res.status(200).json({ message: `Question creation permission ${action} for teacher` });
     } catch (err) {
         console.error('manageTeacherPermission: Error:', err);
         res.status(500).json({ error: 'Error managing teacher permission' });
@@ -287,7 +287,7 @@ exports.getAllTeachers = async (req, res) => {
             console.log('getAllTeachers: Applying search filter:', { search });
         }
         
-        const teachers = await User.find(query).select('name email canCreateClass');
+        const teachers = await User.find(query).select('name email canCreateQuestion');
         console.log('getAllTeachers: Teachers fetched:', teachers.length);
         res.status(200).json({ teachers });
     } catch (err) {
@@ -377,7 +377,7 @@ exports.getTeachersByClass = async (req, res) => {
         }
 
         const classData = await Class.findById(classId)
-            .populate('teachers', 'name email canCreateClass');
+            .populate('teachers', 'name email canCreateQuestion');
         if (!classData) {
             console.error('[getTeachersByClass] Validation failed: Class not found');
             return res.status(404).json({ error: 'Class not found' });
@@ -679,7 +679,7 @@ exports.getClassDetails = async (req, res) => {
         console.log('getClassDetails: Request received:', { classId, user: { id: userId, role: req.user.role } });
 
         const classData = await Class.findById(classId)
-            .populate('teachers', 'name email canCreateClass')
+            .populate('teachers', 'name email canCreateQuestion')
             .populate('createdBy', 'name email')
             .populate('students', 'name email')
             .populate('questions', 'title type description points classes')
@@ -1400,20 +1400,28 @@ exports.adminCreateQuestion = async (req, res) => {
             }
         }
 
+        // Check if this is a draft
+        const isDraft = questionData.status === 'draft' || questionData.isDraft === true;
+
         // Create question
         const question = new Question({
             ...questionData,
             createdBy: user._id,
             points: questionData.points || (questionData.type === 'singleCorrectMcq' ? 10 : questionData.type === 'multipleCorrectMcq' ? 10 : questionData.type === 'fillInTheBlanks' ? 15 : 20),
             classes: [], // Admins don't assign to classes
+            status: isDraft ? 'draft' : 'published',
+            isDraft: isDraft,
+            publishedAt: isDraft ? null : new Date(),
+            publishedBy: isDraft ? null : user._id,
             createdAt: new Date(),
             updatedAt: new Date(),
         });
 
         await question.save();
-        console.log('[Admin Create Question] Saved:', question._id);
+        console.log('[Admin Create Question] Saved:', question._id, '| Status:', question.status);
 
-        res.status(201).json({ message: 'Question created successfully', question });
+        const message = isDraft ? 'Draft saved successfully' : 'Question created successfully';
+        res.status(201).json({ message, question });
     } catch (err) {
         console.error('[Admin Create Question] Error:', err.message);
         res.status(500).json({ error: 'Error creating question' });
@@ -1424,9 +1432,9 @@ exports.getAllQuestionsPaginated = async (req, res) => {
     console.log('[Get All Questions Paginated] Fetching questions with pagination');
     try {
         const user = req.user;
-        const { page = 1, limit = 10 } = req.query;
+        const { page = 1, limit = 10, includeDrafts = false } = req.query;
 
-        console.log('[Get All Questions Paginated] User:', user._id, '| Page:', page, '| Limit:', limit);
+        console.log('[Get All Questions Paginated] User:', user._id, '| Page:', page, '| Limit:', limit, '| IncludeDrafts:', includeDrafts);
 
         if (!['admin'].includes(user.role)) {
             console.warn('[Get All Questions Paginated] Error: Not authorized');
@@ -1446,12 +1454,16 @@ exports.getAllQuestionsPaginated = async (req, res) => {
             return res.status(400).json({ error: 'Invalid limit' });
         }
 
-        const questions = await Question.find()
+        // Build query - exclude drafts by default
+        const query = includeDrafts === 'true' ? {} : { status: { $ne: 'draft' }, isDraft: { $ne: true } };
+
+        const questions = await Question.find(query)
+            .sort({ updatedAt: -1 })
             .skip((pageNum - 1) * limitNum)
             .limit(limitNum)
             .lean();
 
-        const totalQuestions = await Question.countDocuments();
+        const totalQuestions = await Question.countDocuments(query);
 
         console.log('[Get All Questions Paginated] Questions fetched:', questions.length, 'Total:', totalQuestions);
         res.status(200).json({
@@ -1714,6 +1726,346 @@ exports.searchQuestionsById = async (req, res) => {
     } catch (err) {
         console.error('[Search Questions By ID] Error:', err.message);
         res.status(500).json({ error: 'Error searching question by ID' });
+    }
+};
+
+// Create draft question
+exports.createDraftQuestion = async (req, res) => {
+    console.log('[Create Draft Question] Started');
+    try {
+        const questionData = req.body;
+        const user = req.user;
+
+        console.log('[Create Draft Question] User:', user._id, '| Role:', user.role);
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            console.warn('[Create Draft Question] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin or teacher can create drafts' });
+        }
+
+        // Basic validation - drafts can have minimal data
+        if (!questionData || !questionData.type) {
+            console.error('[Create Draft Question] Error: Type missing');
+            return res.status(400).json({ error: 'Question type is required' });
+        }
+
+        // Validate question type
+        const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'];
+        if (!validTypes.includes(questionData.type)) {
+            console.error('[Create Draft Question] Error: Invalid type:', questionData.type);
+            return res.status(400).json({ error: 'Invalid question type' });
+        }
+
+        // Create draft question with minimal validation
+        const draftQuestion = new Question({
+            ...questionData,
+            title: questionData.title || 'Untitled Question',
+            description: questionData.description || '',
+            difficulty: questionData.difficulty || 'easy',
+            createdBy: user._id,
+            status: 'draft',
+            isDraft: true,
+            points: questionData.points || 10,
+            classes: [],
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        });
+
+        await draftQuestion.save();
+        console.log('[Create Draft Question] Draft saved:', draftQuestion._id);
+
+        res.status(201).json({ message: 'Draft created successfully', question: draftQuestion });
+    } catch (err) {
+        console.error('[Create Draft Question] Error:', err.message);
+        res.status(500).json({ error: 'Error creating draft' });
+    }
+};
+
+// Get all drafts
+exports.getDrafts = async (req, res) => {
+    console.log('[Get Drafts] Fetching drafts');
+    try {
+        const user = req.user;
+        const { page = 1, limit = 20, search = '' } = req.query;
+
+        console.log('[Get Drafts] User:', user._id, '| Page:', page, '| Limit:', limit, '| Search:', search);
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            console.warn('[Get Drafts] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin or teacher can view drafts' });
+        }
+
+        const pageNum = parseInt(page, 10);
+        const limitNum = parseInt(limit, 10);
+
+        // Build query
+        const query = {
+            status: 'draft',
+            isDraft: true,
+            createdBy: user._id
+        };
+
+        // Add search if provided
+        if (search && search.trim()) {
+            query.$or = [
+                { title: { $regex: search, $options: 'i' } },
+                { tags: { $regex: search, $options: 'i' } }
+            ];
+        }
+
+        const drafts = await Question.find(query)
+            .sort({ updatedAt: -1 })
+            .skip((pageNum - 1) * limitNum)
+            .limit(limitNum)
+            .select('title type description difficulty tags points createdAt updatedAt status')
+            .lean();
+
+        const totalDrafts = await Question.countDocuments(query);
+
+        console.log('[Get Drafts] Drafts fetched:', drafts.length, 'Total:', totalDrafts);
+        res.status(200).json({
+            drafts,
+            pagination: {
+                currentPage: pageNum,
+                totalPages: Math.ceil(totalDrafts / limitNum),
+                totalDrafts,
+                limit: limitNum
+            }
+        });
+    } catch (err) {
+        console.error('[Get Drafts] Error:', err.message);
+        res.status(500).json({ error: 'Error fetching drafts' });
+    }
+};
+
+// Get draft count
+exports.getDraftCount = async (req, res) => {
+    console.log('[Get Draft Count] Fetching draft count');
+    try {
+        const user = req.user;
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            console.warn('[Get Draft Count] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin or teacher can view draft count' });
+        }
+
+        const count = await Question.countDocuments({
+            status: 'draft',
+            isDraft: true,
+            createdBy: user._id
+        });
+
+        console.log('[Get Draft Count] Count:', count);
+        res.status(200).json({ count });
+    } catch (err) {
+        console.error('[Get Draft Count] Error:', err.message);
+        res.status(500).json({ error: 'Error fetching draft count' });
+    }
+};
+
+// Get single draft
+exports.getDraftQuestion = async (req, res) => {
+    console.log('[Get Draft Question] Fetching draft:', req.params.questionId);
+    try {
+        const { questionId } = req.params;
+        const user = req.user;
+
+        console.log('[Get Draft Question] User:', user._id);
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            console.warn('[Get Draft Question] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin or teacher can view drafts' });
+        }
+
+        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
+            console.error('[Get Draft Question] Error: Invalid questionId');
+            return res.status(400).json({ error: 'Valid questionId is required' });
+        }
+
+        const question = await Question.findOne({
+            _id: questionId,
+            status: 'draft',
+            isDraft: true,
+            createdBy: user._id
+        }).lean();
+
+        if (!question) {
+            console.error('[Get Draft Question] Error: Draft not found');
+            return res.status(404).json({ error: 'Draft not found' });
+        }
+
+        console.log('[Get Draft Question] Draft found:', questionId);
+        res.status(200).json({ question });
+    } catch (err) {
+        console.error('[Get Draft Question] Error:', err.message);
+        res.status(500).json({ error: 'Error fetching draft' });
+    }
+};
+
+// Update draft
+exports.updateDraftQuestion = async (req, res) => {
+    console.log('[Update Draft Question] Updating draft:', req.params.questionId);
+    try {
+        const { questionId } = req.params;
+        const questionData = req.body;
+        const user = req.user;
+
+        console.log('[Update Draft Question] User:', user._id);
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            console.warn('[Update Draft Question] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin or teacher can update drafts' });
+        }
+
+        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
+            console.error('[Update Draft Question] Error: Invalid questionId');
+            return res.status(400).json({ error: 'Valid questionId is required' });
+        }
+
+        const question = await Question.findOne({
+            _id: questionId,
+            status: 'draft',
+            isDraft: true,
+            createdBy: user._id
+        });
+
+        if (!question) {
+            console.error('[Update Draft Question] Error: Draft not found');
+            return res.status(404).json({ error: 'Draft not found' });
+        }
+
+        // Update question data
+        Object.keys(questionData).forEach(key => {
+            if (questionData[key] !== undefined) {
+                question[key] = questionData[key];
+            }
+        });
+
+        question.updatedAt = new Date();
+        await question.save();
+
+        console.log('[Update Draft Question] Draft updated:', questionId);
+        res.status(200).json({ message: 'Draft updated successfully', question });
+    } catch (err) {
+        console.error('[Update Draft Question] Error:', err.message);
+        res.status(500).json({ error: 'Error updating draft' });
+    }
+};
+
+// Publish draft (convert to published)
+exports.publishDraftQuestion = async (req, res) => {
+    console.log('[Publish Draft Question] Publishing draft:', req.params.questionId);
+    try {
+        const { questionId } = req.params;
+        const questionData = req.body; // Optional: final question data
+        const user = req.user;
+
+        console.log('[Publish Draft Question] User:', user._id);
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            console.warn('[Publish Draft Question] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin or teacher can publish drafts' });
+        }
+
+        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
+            console.error('[Publish Draft Question] Error: Invalid questionId');
+            return res.status(400).json({ error: 'Valid questionId is required' });
+        }
+
+        const question = await Question.findOne({
+            _id: questionId,
+            status: 'draft',
+            isDraft: true,
+            createdBy: user._id
+        });
+
+        if (!question) {
+            console.error('[Publish Draft Question] Error: Draft not found');
+            return res.status(404).json({ error: 'Draft not found' });
+        }
+
+        // Validate question before publishing (full validation)
+        if (!question.title || question.title.trim() === '') {
+            return res.status(400).json({ error: 'Title is required to publish' });
+        }
+        if (!question.description || question.description.trim() === '') {
+            return res.status(400).json({ error: 'Description is required to publish' });
+        }
+
+        // Type-specific validation
+        if (question.type === 'coding' || question.type === 'fillInTheBlanksCoding') {
+            if (!question.languages || question.languages.length === 0) {
+                return res.status(400).json({ error: 'At least one language is required' });
+            }
+            if (!question.testCases || question.testCases.length === 0) {
+                return res.status(400).json({ error: 'At least one test case is required' });
+            }
+        }
+
+        // Update with final data if provided
+        if (questionData) {
+            Object.keys(questionData).forEach(key => {
+                if (questionData[key] !== undefined) {
+                    question[key] = questionData[key];
+                }
+            });
+        }
+
+        // Publish the question
+        question.status = 'published';
+        question.isDraft = false;
+        question.publishedAt = new Date();
+        question.publishedBy = user._id;
+        question.updatedAt = new Date();
+
+        await question.save();
+
+        console.log('[Publish Draft Question] Draft published:', questionId);
+        res.status(200).json({ message: 'Question published successfully', question });
+    } catch (err) {
+        console.error('[Publish Draft Question] Error:', err.message);
+        res.status(500).json({ error: 'Error publishing draft' });
+    }
+};
+
+// Delete draft
+exports.deleteDraftQuestion = async (req, res) => {
+    console.log('[Delete Draft Question] Deleting draft:', req.params.questionId);
+    try {
+        const { questionId } = req.params;
+        const user = req.user;
+
+        console.log('[Delete Draft Question] User:', user._id);
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            console.warn('[Delete Draft Question] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin or teacher can delete drafts' });
+        }
+
+        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
+            console.error('[Delete Draft Question] Error: Invalid questionId');
+            return res.status(400).json({ error: 'Valid questionId is required' });
+        }
+
+        const question = await Question.findOne({
+            _id: questionId,
+            status: 'draft',
+            isDraft: true,
+            createdBy: user._id
+        });
+
+        if (!question) {
+            console.error('[Delete Draft Question] Error: Draft not found');
+            return res.status(404).json({ error: 'Draft not found' });
+        }
+
+        await question.deleteOne();
+
+        console.log('[Delete Draft Question] Draft deleted:', questionId);
+        res.status(200).json({ message: 'Draft deleted successfully' });
+    } catch (err) {
+        console.error('[Delete Draft Question] Error:', err.message);
+        res.status(500).json({ error: 'Error deleting draft' });
     }
 };
 

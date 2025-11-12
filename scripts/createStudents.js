@@ -35,7 +35,7 @@
 //                 number,
 //                 role: 'student',
 //                 password: hashedPassword,
-//                 canCreateClass: false // Explicitly set for consistency
+//                 canCreateQuestion: false // Explicitly set for consistency
 //             });
 //         }
 

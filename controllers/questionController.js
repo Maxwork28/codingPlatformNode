@@ -22,6 +22,15 @@ const languageConfig = {
     go: { image: 'go-compiler', ext: '.go', compileCmd: null, runCmd: ['go', 'run', '/app/code.go'] },
 };
 
+const ensureTeacherQuestionPermission = (user, actionLabel, res) => {
+    if (user.role === 'teacher' && !user.canCreateQuestion) {
+        console.warn(`${actionLabel} Error: Teacher lacks question creation permission`);
+        res.status(403).json({ error: 'Teacher is not permitted to manage questions' });
+        return false;
+    }
+    return true;
+};
+
 const executeDockerCode = async (language, code, testCases, timeLimit, memoryLimit) => {
     console.log('[executeDockerCode] Starting execution for language:', language);
     const config = languageConfig[language];
@@ -36,21 +45,36 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
     await fs.mkdir(tempDir, { recursive: true });
     await fs.writeFile(path.join(tempDir, codeFile), code);
 
-    const container = await docker.createContainer({
-        Image: config.image,
-        AttachStdout: true,
-        AttachStderr: true,
-        Tty: false,
-        HostConfig: {
-            Binds: [`${tempDir}:/app:rw`],
-            NetworkMode: 'none',
-            Memory: memoryLimit * 1024 * 1024, // MB to bytes
-            CpuPeriod: 100000, // 100ms period
-            CpuQuota: Math.floor(timeLimit * 100000), // Time limit in microseconds
-        },
-        WorkingDir: '/app',
-        Cmd: ['sleep', 'infinity'],
-    });
+    let container;
+    try {
+        container = await docker.createContainer({
+            Image: config.image,
+            AttachStdout: true,
+            AttachStderr: true,
+            Tty: false,
+            HostConfig: {
+                Binds: [`${tempDir}:/app:rw`],
+                NetworkMode: 'none',
+                Memory: memoryLimit * 1024 * 1024, // MB to bytes
+                CpuPeriod: 100000, // 100ms period
+                CpuQuota: Math.floor(timeLimit * 100000), // Time limit in microseconds
+            },
+            WorkingDir: '/app',
+            Cmd: ['sleep', 'infinity'],
+        });
+    } catch (err) {
+        console.error(`[executeDockerCode] Error creating container for ${language}:`, err.message);
+        // Check if the error is about missing image
+        if (err.message && (err.message.includes('No such image') || err.message.includes('no such container'))) {
+            throw new Error(
+                `Docker image '${config.image}' not found. Please build the Docker images first by running:\n` +
+                `  Windows: build-docker-images.bat\n` +
+                `  Linux/Mac: ./build-docker-images.sh\n` +
+                `  Or manually: docker build -t ${config.image}:latest docker/${language}`
+            );
+        }
+        throw err;
+    }
     console.log('[executeDockerCode] Container created');
     await container.start();
     console.log('[executeDockerCode] Container started');
@@ -668,6 +692,9 @@ exports.assignQuestion = async (req, res) => {
             console.warn('[Question Assignment] Error: Role not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can assign questions' });
         }
+        if (!ensureTeacherQuestionPermission(user, '[Question Assignment]', res)) {
+            return;
+        }
 
         if (!questionData || !questionData.type || !questionData.title) {
             console.error('[Question Assignment] Error: Type or title missing');
@@ -754,6 +781,9 @@ exports.editQuestion = async (req, res) => {
             console.warn('[Edit Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can edit' });
         }
+        if (!ensureTeacherQuestionPermission(user, '[Edit Question]', res)) {
+            return;
+        }
 
         const question = await Question.findById(questionId);
         if (!question) {
@@ -829,6 +859,9 @@ exports.deleteQuestion = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Delete Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can delete' });
+        }
+        if (!ensureTeacherQuestionPermission(user, '[Delete Question]', res)) {
+            return;
         }
 
         const question = await Question.findById(questionId);
@@ -963,6 +996,9 @@ exports.publishQuestion = async (req, res) => {
             console.warn('[Publish Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can publish' });
         }
+        if (!ensureTeacherQuestionPermission(user, '[Publish Question]', res)) {
+            return;
+        }
 
         const question = await Question.findById(questionId);
         if (!question) {
@@ -1017,6 +1053,9 @@ exports.unpublishQuestion = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Unpublish Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can unpublish' });
+        }
+        if (!ensureTeacherQuestionPermission(user, '[Unpublish Question]', res)) {
+            return;
         }
 
         const question = await Question.findById(questionId);
@@ -1073,6 +1112,9 @@ exports.disableQuestion = async (req, res) => {
             console.warn('[Disable Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can disable' });
         }
+        if (!ensureTeacherQuestionPermission(user, '[Disable Question]', res)) {
+            return;
+        }
 
         const question = await Question.findById(questionId);
         if (!question) {
@@ -1127,6 +1169,9 @@ exports.enableQuestion = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Enable Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can enable' });
+        }
+        if (!ensureTeacherQuestionPermission(user, '[Enable Question]', res)) {
+            return;
         }
 
         const question = await Question.findById(questionId);
@@ -1327,6 +1372,9 @@ exports.assignQuestionToClass = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Assign Question To Class] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can assign questions' });
+        }
+        if (!ensureTeacherQuestionPermission(user, '[Assign Question To Class]', res)) {
+            return;
         }
 
         const question = await Question.findById(questionId);
@@ -1638,70 +1686,213 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
 
 // Teacher-specific testing endpoint - ALL test cases visible, no leaderboard impact
 exports.teacherTestQuestion = async (req, res) => {
-    console.log('[Teacher Test Question] Teacher testing code');
+    console.log('========================================');
+    console.log('[Teacher Test Question] ====== START ======');
+    console.log('[Teacher Test Question] Request received at:', new Date().toISOString());
+    console.log('[Teacher Test Question] Request params:', req.params);
+    console.log('[Teacher Test Question] Request body:', JSON.stringify(req.body, null, 2));
+    console.log('[Teacher Test Question] Request headers:', {
+        'content-type': req.headers['content-type'],
+        'authorization': req.headers['authorization'] ? 'present' : 'missing'
+    });
+    
     try {
         const { questionId } = req.params;
         const { answer, classId, language } = req.body;
         const user = req.user;
 
-        console.log('[Teacher Test Question] User:', user._id, '| Question:', questionId, '| Class:', classId, '| Language:', language);
+        console.log('[Teacher Test Question] Extracted data:', {
+            questionId,
+            answer: answer ? `${answer.substring(0, 100)}... (length: ${answer.length})` : 'MISSING',
+            classId: classId || 'null (draft question)',
+            language,
+            userId: user?._id,
+            userRole: user?.role
+        });
+
+        // Validate request data
+        if (!questionId) {
+            console.error('[Teacher Test Question] ERROR: questionId is missing');
+            return res.status(400).json({ error: 'questionId is required' });
+        }
+
+        if (!answer) {
+            console.error('[Teacher Test Question] ERROR: answer (solution code) is missing');
+            return res.status(400).json({ error: 'Solution code is required' });
+        }
+
+        if (!language) {
+            console.error('[Teacher Test Question] ERROR: language is missing');
+            return res.status(400).json({ error: 'Language is required' });
+        }
+
+        if (!user) {
+            console.error('[Teacher Test Question] ERROR: User is not authenticated');
+            return res.status(401).json({ error: 'User not authenticated' });
+        }
 
         // Authorization check - only teachers and admins
         if (!['teacher', 'admin'].includes(user.role)) {
-            console.warn('[Teacher Test Question] Error: User is not teacher/admin');
+            console.warn('[Teacher Test Question] ERROR: User is not teacher/admin. Role:', user.role);
             return res.status(403).json({ error: 'Only teachers and admins can test questions' });
         }
 
+        console.log('[Teacher Test Question] Authorization passed. User role:', user.role);
+
         // Get question
+        console.log('[Teacher Test Question] Fetching question from database:', questionId);
         const question = await Question.findById(questionId);
+        
         if (!question) {
-            console.error('[Teacher Test Question] Error: Question not found:', questionId);
+            console.error('[Teacher Test Question] ERROR: Question not found in database:', questionId);
             return res.status(404).json({ error: 'Question not found' });
         }
 
+        console.log('[Teacher Test Question] Question found:', {
+            id: question._id,
+            type: question.type,
+            title: question.title?.substring(0, 50),
+            languages: question.languages,
+            testCasesCount: question.testCases?.length || 0,
+            timeLimit: question.timeLimit,
+            memoryLimit: question.memoryLimit,
+            isDraft: question.isDraft,
+            status: question.status
+        });
+
         // Verify question is associated with class (optional check)
-        const classEntry = question.classes.find(c => c.classId.toString() === classId);
-        if (!classEntry) {
-            console.warn('[Teacher Test Question] Warning: Question not associated with class, but allowing teacher test');
+        // For drafts, classId might not be provided or question might not be assigned to classes yet
+        if (classId) {
+            console.log('[Teacher Test Question] Checking class association:', classId);
+            const classEntry = question.classes?.find(c => c.classId.toString() === classId);
+            if (!classEntry) {
+                console.warn('[Teacher Test Question] WARNING: Question not associated with class, but allowing teacher test (draft question)');
+            } else {
+                console.log('[Teacher Test Question] Question is associated with class');
+            }
+        } else {
+            // For drafts, classId is optional
+            console.log('[Teacher Test Question] No classId provided - testing draft question (this is OK)');
         }
 
         // Only coding questions can be tested
         if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
-            console.error('[Teacher Test Question] Error: Not a coding question');
+            console.error('[Teacher Test Question] ERROR: Not a coding question. Type:', question.type);
             return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be tested' });
         }
 
+        console.log('[Teacher Test Question] Question type is valid:', question.type);
+
         // Validate language
-        if (!language || !question.languages.includes(language)) {
-            console.error('[Teacher Test Question] Error: Invalid or unsupported language:', language);
-            return res.status(400).json({ error: `Language ${language} is not supported for this question` });
+        if (!question.languages || !Array.isArray(question.languages) || question.languages.length === 0) {
+            console.error('[Teacher Test Question] ERROR: Question has no languages defined');
+            return res.status(400).json({ error: 'Question has no supported languages' });
         }
+
+        if (!question.languages.includes(language)) {
+            console.error('[Teacher Test Question] ERROR: Invalid or unsupported language:', {
+                requested: language,
+                supported: question.languages
+            });
+            return res.status(400).json({ 
+                error: `Language ${language} is not supported for this question. Supported languages: ${question.languages.join(', ')}` 
+            });
+        }
+
+        console.log('[Teacher Test Question] Language is valid:', language);
+
+        // Validate test cases
+        if (!question.testCases || !Array.isArray(question.testCases) || question.testCases.length === 0) {
+            console.error('[Teacher Test Question] ERROR: Question has no test cases');
+            return res.status(400).json({ error: 'Question has no test cases. Please add at least one test case.' });
+        }
+
+        console.log('[Teacher Test Question] Test cases found:', {
+            total: question.testCases.length,
+            public: question.testCases.filter(tc => tc.isPublic).length,
+            hidden: question.testCases.filter(tc => !tc.isPublic).length,
+            testCases: question.testCases.map(tc => ({
+                input: tc.input?.substring(0, 50),
+                expectedOutput: tc.expectedOutput?.substring(0, 50),
+                isPublic: tc.isPublic
+            }))
+        });
 
         let codeToExecute = answer;
         if (question.type === 'fillInTheBlanksCoding') {
+            console.log('[Teacher Test Question] Processing fillInTheBlanksCoding question');
             if (!question.codeSnippet) {
-                console.error('[Teacher Test Question] Error: Missing codeSnippet');
+                console.error('[Teacher Test Question] ERROR: Missing codeSnippet for fillInTheBlanksCoding question');
                 return res.status(400).json({ error: 'Question is missing code snippet' });
             }
             codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
-            console.log('[Teacher Test Question] Combined code for execution');
+            console.log('[Teacher Test Question] Combined code for execution (length:', codeToExecute.length, ')');
+        } else {
+            console.log('[Teacher Test Question] Processing coding question. Code length:', codeToExecute.length);
         }
+
+        // Validate time and memory limits
+        const timeLimit = question.timeLimit || 2;
+        const memoryLimit = question.memoryLimit || 256;
+        console.log('[Teacher Test Question] Execution limits:', {
+            timeLimit,
+            memoryLimit
+        });
 
         // Execute with ALL test cases (public + hidden)
         let testResults;
         try {
-            console.log('[Teacher Test Question] Executing code with ALL test cases');
+            console.log('[Teacher Test Question] ====== EXECUTING CODE ======');
+            console.log('[Teacher Test Question] Calling executeDockerCode with:', {
+                language,
+                codeLength: codeToExecute.length,
+                testCasesCount: question.testCases.length,
+                timeLimit,
+                memoryLimit
+            });
+            
             testResults = await executeDockerCode(
                 language,
                 codeToExecute,
                 question.testCases, // ALL test cases
-                question.timeLimit,
-                question.memoryLimit
+                timeLimit,
+                memoryLimit
             );
-            console.log('[Teacher Test Question] Test results:', testResults);
+            
+            console.log('[Teacher Test Question] ====== CODE EXECUTION COMPLETE ======');
+            console.log('[Teacher Test Question] Test results received:', {
+                count: testResults?.length || 0,
+                results: testResults?.map((result, idx) => ({
+                    index: idx,
+                    passed: result.passed,
+                    input: result.input?.substring(0, 30),
+                    output: result.output?.substring(0, 30),
+                    expected: result.expected?.substring(0, 30),
+                    error: result.error?.substring(0, 50)
+                }))
+            });
         } catch (err) {
-            console.error('[Teacher Test Question] Error: Code execution failed:', err.message);
-            return res.status(500).json({ error: `Code execution failed: ${err.message}` });
+            console.error('[Teacher Test Question] ====== CODE EXECUTION FAILED ======');
+            console.error('[Teacher Test Question] Error type:', err.constructor.name);
+            console.error('[Teacher Test Question] Error message:', err.message);
+            console.error('[Teacher Test Question] Error stack:', err.stack);
+            console.error('[Teacher Test Question] Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
+            
+            // Provide more detailed error message
+            let errorMessage = err.message || 'Unknown error';
+            if (errorMessage.includes('No such image') || errorMessage.includes('no such container')) {
+                errorMessage = `Docker image not found. Please build Docker images first. Original error: ${errorMessage}`;
+            }
+            
+            return res.status(500).json({ 
+                error: `Code execution failed: ${errorMessage}`,
+                details: process.env.NODE_ENV === 'development' ? err.stack : undefined
+            });
+        }
+
+        if (!testResults || !Array.isArray(testResults) || testResults.length === 0) {
+            console.error('[Teacher Test Question] ERROR: Test results are empty or invalid');
+            return res.status(500).json({ error: 'Code execution returned no test results' });
         }
 
         const passedTestCases = testResults.filter(test => test.passed).length;
@@ -1710,12 +1901,19 @@ exports.teacherTestQuestion = async (req, res) => {
         const publicTestCases = testResults.filter(test => test.isPublic).length;
         const hiddenTestCases = testResults.filter(test => !test.isPublic).length;
 
+        console.log('[Teacher Test Question] Test summary:', {
+            passedTestCases,
+            totalTestCases,
+            isCorrect,
+            publicTestCases,
+            hiddenTestCases
+        });
+
         // NO DATABASE SAVE - this is just for testing
         // NO LEADERBOARD UPDATE
         // NO SOCKET.IO EMISSION
 
-        console.log('[Teacher Test Question] Successfully processed (no DB save)');
-        res.status(200).json({
+        const responseData = {
             message: 'Code tested successfully (teacher mode - no submission saved)',
             testResults,
             passedTestCases,
@@ -1725,10 +1923,32 @@ exports.teacherTestQuestion = async (req, res) => {
             isCorrect,
             explanation: question.explanation,
             teacherMode: true
+        };
+
+        console.log('[Teacher Test Question] ====== SUCCESS ======');
+        console.log('[Teacher Test Question] Sending response:', {
+            status: 200,
+            testResultsCount: responseData.testResults.length,
+            passedTestCases: responseData.passedTestCases,
+            totalTestCases: responseData.totalTestCases,
+            isCorrect: responseData.isCorrect
         });
+        console.log('========================================');
+
+        res.status(200).json(responseData);
     } catch (err) {
-        console.error('[Teacher Test Question] Error processing test:', err.message);
-        res.status(500).json({ error: 'Error testing code' });
+        console.error('[Teacher Test Question] ====== UNEXPECTED ERROR ======');
+        console.error('[Teacher Test Question] Error type:', err.constructor.name);
+        console.error('[Teacher Test Question] Error message:', err.message);
+        console.error('[Teacher Test Question] Error stack:', err.stack);
+        console.error('[Teacher Test Question] Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
+        console.error('========================================');
+        
+        res.status(500).json({ 
+            error: 'Error testing code',
+            message: err.message,
+            details: process.env.NODE_ENV === 'development' ? err.stack : undefined
+        });
     }
 };
 
