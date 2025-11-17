@@ -10,6 +10,12 @@ router.get('/search',
   questionController.searchQuestions
 );
 
+router.post('/exam-only', 
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  questionController.createExamOnlyQuestion
+);
+
 router.post('/assign', 
   authMiddleware,
   requireRole('admin', 'teacher'),

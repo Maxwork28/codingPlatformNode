@@ -1,54 +1,58 @@
-const express = require('express');
-const mongoose = require('mongoose');
-const http = require('http');
-const { Server } = require('socket.io');
-const adminRoutes = require('./routes/adminRoutes');
-const authRoutes = require('./routes/auth');
-const questionRoutes = require('./routes/questionRoutes');
-const User = require('./models/User');
-const Class = require('./models/Class');
-const bcrypt = require('bcrypt');
-const cors = require('cors');
+const express = require("express");
+const mongoose = require("mongoose");
+const http = require("http");
+const { Server } = require("socket.io");
+const adminRoutes = require("./routes/adminRoutes");
+const authRoutes = require("./routes/auth");
+const questionRoutes = require("./routes/questionRoutes");
+const contactRoutes = require("./routes/contactRoutes");
+const examRoutes = require("./routes/examRoutes");
+const User = require("./models/User");
+const Class = require("./models/Class");
+const bcrypt = require("bcrypt");
+const cors = require("cors");
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: 'https://www.algosutra.co.in', 
-        // origin: ['http://localhost:5173', 'http://localhost:5174'],
-        credentials: true,
-        methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    },
+  cors: {
+    // origin: 'https://www.algosutra.co.in',
+    origin: ["http://localhost:5173", "http://localhost:5174"],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE"],
+  },
 });
 
-app.use(cors({ origin: 'https://www.algosutra.co.in', credentials: true }));
-// app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'], credentials: true }));
+app.use(cors({ origin: "http://localhost:5173", credentials: true }));
+// app.use(cors({ origin: ['http://localhost:3000', 'http://localhost:5174'], credentials: true }));
 app.use(express.json()); // Parse JSON bodies
 app.use(express.urlencoded({ extended: true }));
 // Middleware to attach io to req
 app.use((req, res, next) => {
-    req.io = io;
-    next();
+  req.io = io;
+  next();
 });
 
 // Routes
-app.use('/auth', authRoutes);
-app.use('/admin', adminRoutes);
-app.use('/questions', questionRoutes);
+app.use("/auth", authRoutes);
+app.use("/admin", adminRoutes);
+app.use("/questions", questionRoutes);
+app.use("/contact", contactRoutes);
+app.use("/exams", examRoutes);
 
 // Socket.IO connection handling
-io.on('connection', (socket) => {
-    console.log('[Socket.IO] Client connected:', socket.id);
+io.on("connection", (socket) => {
+  console.log("[Socket.IO] Client connected:", socket.id);
 
-    // Join class-specific room
-    socket.on('joinClass', (classId) => {
-        socket.join(`class:${classId}`);
-        console.log(`[Socket.IO] Client ${socket.id} joined class:${classId}`);
-    });
+  // Join class-specific room
+  socket.on("joinClass", (classId) => {
+    socket.join(`class:${classId}`);
+    console.log(`[Socket.IO] Client ${socket.id} joined class:${classId}`);
+  });
 
-    socket.on('disconnect', () => {
-        console.log('[Socket.IO] Client disconnected:', socket.id);
-    });
+  socket.on("disconnect", () => {
+    console.log("[Socket.IO] Client disconnected:", socket.id);
+  });
 });
 
 // async function createInitialAdmin() {
@@ -74,8 +78,11 @@ io.on('connection', (socket) => {
 //     }
 // }
 
-mongoose.connect('mongodb://localhost:27017/education_platform').then(async () => {
-    console.log('MongoDB connected');
+mongoose
+  .connect("mongodb://localhost:27017/education_platform")
+  .then(async () => {
+    console.log("MongoDB connected");
     // await createInitialAdmin();
-    server.listen(3000, () => console.log('Server started on port 3000'));
-}).catch(err => console.error('MongoDB connection error:', err));
+    server.listen(3000, () => console.log("Server started on port 3000"));
+  })
+  .catch((err) => console.error("MongoDB connection error:", err));

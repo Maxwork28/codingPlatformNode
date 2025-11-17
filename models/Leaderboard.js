@@ -4,7 +4,7 @@ const attemptSchema = new mongoose.Schema({
     questionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Question', required: true },
     questionType: { 
         type: String, 
-        enum: ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'], 
+        enum: ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'], 
         required: true 
     },
     submissionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Submission', required: true },
@@ -50,7 +50,7 @@ leaderboardSchema.pre('save', function (next) {
 
     for (const attempt of this.attempts) {
         const qId = attempt.questionId.toString();
-        if (!['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'].includes(attempt.questionType)) {
+        if (!['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'].includes(attempt.questionType)) {
             console.error(`[Leaderboard] Invalid questionType: ${attempt.questionType} for questionId: ${qId}`);
             attempt.questionType = 'coding'; // Fallback to a valid type or handle appropriately
         }

@@ -6,6 +6,7 @@ const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Class = require('../models/Class');
 const Leaderboard = require('../models/Leaderboard');
+const { buildDriverCode, extractFunctionName } = require('../utils/driverCodeTemplates');
 
 const docker = new Docker();
 
@@ -146,11 +147,197 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
     return testResults;
 };
 
+/**
+ * Execute code with driver template for codingWithDriver type
+ * @param {string} language - Programming language
+ * @param {string} studentCode - Student's function code
+ * @param {string} functionSignature - Function signature
+ * @param {array} testCases - Array of test cases with structured input
+ * @param {number} timeLimit - Time limit in seconds
+ * @param {number} memoryLimit - Memory limit in MB
+ * @returns {array} Test results
+ */
+const executeCodeWithDriver = async (language, studentCode, functionSignature, testCases, timeLimit, memoryLimit) => {
+    console.log('[executeCodeWithDriver] Starting execution for language:', language);
+    const config = languageConfig[language];
+    if (!config) {
+        console.error('[executeCodeWithDriver] Unsupported language:', language);
+        throw new Error(`Unsupported language: ${language}`);
+    }
+
+    // Extract function name from signature
+    const functionName = extractFunctionName(functionSignature);
+    console.log('[executeCodeWithDriver] Function name:', functionName);
+
+    const codeFile = language === 'java' ? 'Solution.java' : `code${config.ext}`;
+    const tempDir = path.join(__dirname, '../temp', Date.now().toString());
+    console.log('[executeCodeWithDriver] Creating temp directory:', tempDir);
+    await fs.mkdir(tempDir, { recursive: true });
+
+    const testResults = [];
+    let container = null;
+
+    try {
+        for (const test of testCases) {
+            console.log('[executeCodeWithDriver] Running test case with input:', test.input);
+            
+            // Build driver code with student's function
+            let completeCode;
+            try {
+                // For JavaScript and Python, we can use simple templates
+                if (language === 'javascript') {
+                    const testInputJson = JSON.stringify(test.input);
+                    const params = Object.keys(test.input).map(key => `testInput.${key}`).join(', ');
+                    completeCode = `${studentCode}
+
+// Driver Code
+const testInput = ${testInputJson};
+const result = ${functionName}(${params});
+console.log(JSON.stringify(result));`;
+                } else if (language === 'python') {
+                    const testInputJson = JSON.stringify(test.input);
+                    const params = Object.keys(test.input).map(key => `test_input['${key}']`).join(', ');
+                    completeCode = `import json
+
+${studentCode}
+
+# Driver Code
+test_input = ${testInputJson}
+result = ${functionName}(${params})
+print(json.dumps(result))`;
+                } else {
+                    // For other languages, use buildDriverCode
+                    completeCode = buildDriverCode(language, studentCode, functionName, test.input);
+                }
+                
+                console.log('[executeCodeWithDriver] Complete code generated');
+            } catch (err) {
+                console.error('[executeCodeWithDriver] Error building driver code:', err.message);
+                throw new Error(`Failed to build driver code: ${err.message}`);
+            }
+
+            // Write code to temp file
+            await fs.writeFile(path.join(tempDir, codeFile), completeCode);
+
+            // Create and start container
+            if (!container) {
+                container = await docker.createContainer({
+                    Image: config.image,
+                    AttachStdout: true,
+                    AttachStderr: true,
+                    Tty: false,
+                    HostConfig: {
+                        Binds: [`${tempDir}:/app:rw`],
+                        NetworkMode: 'none',
+                        Memory: memoryLimit * 1024 * 1024,
+                        CpuPeriod: 100000,
+                        CpuQuota: Math.floor(timeLimit * 100000),
+                    },
+                    WorkingDir: '/app',
+                    Cmd: ['sleep', 'infinity'],
+                });
+                await container.start();
+                console.log('[executeCodeWithDriver] Container started');
+            }
+
+            // Compile if needed
+            if (config.compileCmd) {
+                console.log('[executeCodeWithDriver] Compiling with:', config.compileCmd);
+                const compileExec = await container.exec({
+                    Cmd: config.compileCmd,
+                    AttachStdout: true,
+                    AttachStderr: true,
+                });
+                const compileStream = await compileExec.start({});
+                let compileOutput = '', compileError = '';
+                await new Promise((resolve) => {
+                    docker.modem.demuxStream(compileStream, 
+                        { write: (data) => compileOutput += data.toString() },
+                        { write: (data) => compileError += data.toString() }
+                    );
+                    compileStream.on('end', resolve);
+                });
+                
+                if (compileError) {
+                    console.error('[executeCodeWithDriver] Compilation failed');
+                    testResults.push({
+                        input: test.input,
+                        output: `Compilation Error: ${compileError}`,
+                        expected: test.expectedOutput,
+                        passed: false,
+                        isPublic: test.isPublic,
+                        error: compileError
+                    });
+                    continue;
+                }
+            }
+
+            // Execute code
+            console.log('[executeCodeWithDriver] Executing code');
+            const exec = await container.exec({
+                Cmd: config.runCmd,
+                AttachStdout: true,
+                AttachStderr: true,
+            });
+            const stream = await exec.start({});
+            let output = '', error = '';
+            await new Promise((resolve) => {
+                docker.modem.demuxStream(stream, 
+                    { write: (data) => output += data.toString() },
+                    { write: (data) => error += data.toString() }
+                );
+                stream.on('end', resolve);
+            });
+
+            console.log('[executeCodeWithDriver] Test output:', output);
+            if (error) console.log('[executeCodeWithDriver] Test error:', error);
+
+            const passed = output.trim() === test.expectedOutput.trim();
+            testResults.push({
+                input: test.input,
+                output: output.trim(),
+                expected: test.expectedOutput,
+                passed,
+                isPublic: test.isPublic,
+                error: error.trim() || null
+            });
+        }
+    } catch (err) {
+        console.error('[executeCodeWithDriver] Execution error:', err.message, err.stack);
+        for (const test of testCases) {
+            if (!testResults.find(r => JSON.stringify(r.input) === JSON.stringify(test.input))) {
+                testResults.push({
+                    input: test.input,
+                    output: `Execution Error: ${err.message}`,
+                    expected: test.expectedOutput,
+                    passed: false,
+                    isPublic: test.isPublic,
+                    error: err.message
+                });
+            }
+        }
+    } finally {
+        console.log('[executeCodeWithDriver] Cleaning up');
+        try {
+            if (container) {
+                await container.stop();
+                await container.remove();
+            }
+            await fs.rm(tempDir, { recursive: true, force: true });
+        } catch (cleanupErr) {
+            console.error('[executeCodeWithDriver] Cleanup error:', cleanupErr.message);
+        }
+    }
+
+    console.log('[executeCodeWithDriver] Test results:', testResults);
+    return testResults;
+};
+
 exports.submitAnswer = async (req, res) => {
     console.log('[Submission] New answer submission started');
     try {
         const { questionId } = req.params;
-        const { answer, classId, language } = req.body;
+        const { answer, classId, language, examId, examAttemptId } = req.body;
         const user = req.user;
 
         console.log('[Submission] User:', user._id, '| Question:', questionId, '| Class:', classId, '| Language:', language);
@@ -279,12 +466,52 @@ exports.submitAnswer = async (req, res) => {
                 passedTestCases = 0;
                 totalTestCases = question.testCases.length;
             }
+        } else if (question.type === 'codingWithDriver') {
+            // Handle codingWithDriver type
+            if (!language || !question.languages.includes(language)) {
+                console.error('[Submission] Error: Invalid or unsupported language:', language);
+                return res.status(400).json({ error: `Language ${language} is not supported for this question` });
+            }
+            
+            // Find function signature for the language
+            const funcSig = question.functionSignature.find(sig => sig.language === language);
+            if (!funcSig) {
+                console.error('[Submission] Error: No function signature for language:', language);
+                return res.status(400).json({ error: `No function signature defined for ${language}` });
+            }
+            
+            try {
+                console.log('[Submission] Executing codingWithDriver for language:', language);
+                const testResults = await executeCodeWithDriver(
+                    language,
+                    answer,
+                    funcSig.signature,
+                    question.testCases,
+                    question.timeLimit,
+                    question.memoryLimit
+                );
+                totalTestCases = testResults.length;
+                passedTestCases = testResults.filter(test => test.passed).length;
+                isCorrect = testResults.every(test => test.passed);
+                score = isCorrect ? question.points : Math.floor((passedTestCases / totalTestCases) * question.points);
+                output = JSON.stringify(testResults.filter(result => result.isPublic));
+                console.log('[Submission] codingWithDriver test results:', testResults);
+            } catch (err) {
+                console.error('[Submission] Error: Code execution failed:', err.message);
+                isCorrect = false;
+                score = 0;
+                output = `Error: ${err.message}`;
+                passedTestCases = 0;
+                totalTestCases = question.testCases.length;
+            }
         }
 
         const submission = new Submission({
             questionId,
             classId,
             studentId: user._id,
+            examId,
+            examAttemptId,
             answer,
             language,
             isCorrect,
@@ -370,7 +597,7 @@ exports.runQuestion = async (req, res) => {
     console.log('[Run Question] New code run started');
     try {
         const { questionId } = req.params;
-        const { answer, classId, language } = req.body;
+        const { answer, classId, language, examId, examAttemptId } = req.body;
         const user = req.user;
         console.log('[Run Question] User:', user._id, '| Question:', questionId, '| Class:', classId, '| Language:', language);
 
@@ -417,9 +644,9 @@ exports.runQuestion = async (req, res) => {
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
 
-        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
+        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding' && question.type !== 'codingWithDriver') {
             console.error('[Run Question] Error: Not a coding question');
-            return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be run' });
+            return res.status(400).json({ error: 'Only coding, fillInTheBlanksCoding, or codingWithDriver questions can be run' });
         }
 
         if (!language || !question.languages.includes(language)) {
@@ -447,13 +674,31 @@ exports.runQuestion = async (req, res) => {
         let testResults;
         try {
             console.log('[Run Question] Starting code execution for language:', language);
-            testResults = await executeDockerCode(
-                language,
-                codeToExecute,
-                publicTestCases,
-                question.timeLimit,
-                question.memoryLimit
-            );
+            
+            // Use appropriate execution method based on question type
+            if (question.type === 'codingWithDriver') {
+                const funcSig = question.functionSignature.find(sig => sig.language === language);
+                if (!funcSig) {
+                    console.error('[Run Question] Error: No function signature for language:', language);
+                    return res.status(400).json({ error: `No function signature defined for ${language}` });
+                }
+                testResults = await executeCodeWithDriver(
+                    language,
+                    answer,
+                    funcSig.signature,
+                    publicTestCases,
+                    question.timeLimit,
+                    question.memoryLimit
+                );
+            } else {
+                testResults = await executeDockerCode(
+                    language,
+                    codeToExecute,
+                    publicTestCases,
+                    question.timeLimit,
+                    question.memoryLimit
+                );
+            }
             console.log('[Run Question] Test results:', testResults);
         } catch (err) {
             console.error('[Run Question] Error: Code execution failed:', err.message);
@@ -467,6 +712,8 @@ exports.runQuestion = async (req, res) => {
             questionId,
             classId,
             studentId: user._id,
+            examId,
+            examAttemptId,
             answer,
             language,
             isCorrect,
@@ -618,6 +865,8 @@ exports.runWithCustomInput = async (req, res) => {
             questionId,
             classId,
             studentId: user._id,
+            examId,
+            examAttemptId,
             answer,
             language,
             isCorrect: testResults[0].passed && expectedOutput !== undefined,
@@ -1813,5 +2062,79 @@ exports.teacherTestWithCustomInput = async (req, res) => {
     } catch (err) {
         console.error('[Teacher Test With Custom Input] Error processing test:', err.message);
         res.status(500).json({ error: 'Error testing code with custom input' });
+    }
+};
+
+exports.createExamOnlyQuestion = async (req, res) => {
+    try {
+        const {
+            classId,
+            examId = null,
+            title,
+            description,
+            difficulty = 'medium',
+            tags = [],
+            points = 0,
+            type,
+            options,
+            correctOption,
+            correctOptions,
+            correctAnswer,
+            codeSnippet,
+            starterCode,
+            functionSignature,
+            driverCode,
+            testCases,
+            languages,
+            hints,
+            solution,
+            level,
+        } = req.body;
+
+        if (!classId || !title || !description || !type) {
+            return res.status(400).json({ error: 'classId, title, description and type are required' });
+        }
+
+        let resolvedLanguages = languages;
+        if ((!resolvedLanguages || !resolvedLanguages.length) && ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(type)) {
+            resolvedLanguages = ['javascript'];
+        }
+
+        const question = new Question({
+            title,
+            description,
+            difficulty,
+            tags,
+            points,
+            type,
+            options,
+            correctOption,
+            correctOptions,
+            correctAnswer,
+            codeSnippet,
+            starterCode,
+            functionSignature,
+            driverCode,
+            testCases,
+            languages: resolvedLanguages,
+            hints,
+            solution,
+            level,
+            createdBy: req.user._id,
+            classes: [{
+                classId,
+                isPublished: true,
+                isDisabled: false
+            }],
+            isExamOnly: true,
+            examId
+        });
+
+        await question.save();
+
+        res.status(201).json({ message: 'Exam-only question created', question });
+    } catch (err) {
+        console.error('[QuestionController] createExamOnlyQuestion error:', err);
+        res.status(500).json({ error: 'Failed to create exam-only question' });
     }
 };

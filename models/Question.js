@@ -27,7 +27,7 @@ const questionSchema = new mongoose.Schema({
     level: { type: String, enum: ['beginner', 'intermediate', 'advanced'] },
     type: {
         type: String,
-        enum: ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'],
+        enum: ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'],
         required: true
     },
     options: [{ type: String }], // For singleCorrectMcq and multipleCorrectMcq
@@ -42,6 +42,21 @@ const questionSchema = new mongoose.Schema({
         },
         code: { type: String }
     }],
+    functionSignature: [{
+        language: {
+            type: String,
+            enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']
+        },
+        signature: { type: String },
+        returnType: { type: String }
+    }],
+    driverCode: [{
+        language: {
+            type: String,
+            enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']
+        },
+        template: { type: String }
+    }],
     testCases: [testCaseSchema], // For coding and fillInTheBlanksCoding
     constraints: { type: String },
     examples: [{ type: String }],
@@ -52,11 +67,14 @@ const questionSchema = new mongoose.Schema({
     timeLimit: { type: Number, default: 2 },
     memoryLimit: { type: Number, default: 256 },
     maxAttempts: { type: Number },
-    explanation: { type: String }
+    explanation: { type: String },
+    isExamOnly: { type: Boolean, default: false },
+    examId: { type: mongoose.Schema.Types.ObjectId, ref: 'Exam' }
 }, {
     indexes: [
         { key: { 'classes.classId': 1 } },
-        { key: { title: 'text', tags: 'text' } }
+        { key: { title: 'text', tags: 'text' } },
+        { key: { examId: 1 } }
     ]
 });
 
