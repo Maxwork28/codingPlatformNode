@@ -130,3 +130,8 @@ docker build -t javascript-compiler:latest docker/javascript
 - Memory and CPU limits are set by the Node.js application when creating containers
 - Network is disabled (`NetworkMode: 'none'`) for security
 
+
+
+
+
+

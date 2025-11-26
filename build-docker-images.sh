@@ -49,3 +49,8 @@ echo ""
 echo "Built images:"
 docker images | grep -E "(javascript-compiler|python-compiler|java-compiler|c-compiler|cpp-compiler|php-compiler|ruby-compiler|go-compiler)"
 
+
+
+
+
+

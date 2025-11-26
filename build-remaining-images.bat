@@ -66,3 +66,8 @@ echo.
 echo Built images:
 docker images | findstr /i "javascript-compiler python-compiler java-compiler c-compiler cpp-compiler php-compiler ruby-compiler go-compiler"
 
+
+
+
+
+
