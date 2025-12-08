@@ -11,7 +11,10 @@ const submissionSchema = new mongoose.Schema({
   score: Number,
   output: String,
   submittedAt: { type: Date, default: Date.now },
-  isRun: { type: Boolean, default: false }
+  isRun: { type: Boolean, default: false },
+  examAttemptId: { type: mongoose.Schema.Types.ObjectId, ref: 'ExamAttempt' }, // Link to exam attempt if submitted during exam
+  passedTestCases: { type: Number, default: 0 },
+  totalTestCases: { type: Number, default: 0 }
 });
 
 const Submission = mongoose.model('Submission', submissionSchema);

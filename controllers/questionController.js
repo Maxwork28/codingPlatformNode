@@ -170,6 +170,9 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
     return testResults;
 };
 
+// Export executeDockerCode for use in exam controller
+exports.executeDockerCode = executeDockerCode;
+
 exports.submitAnswer = async (req, res) => {
     console.log('[Submission] New answer submission started');
     try {
@@ -1332,19 +1335,64 @@ exports.getQuestion = async (req, res) => {
 };
 
 exports.getAllQuestions = async (req, res) => {
-    console.log('[Get All Questions] Fetching all questions');
+    console.log('[Get All Questions] Fetching questions');
     try {
         const user = req.user;
 
-        console.log('[Get All Questions] User:', user._id);
+        console.log('[Get All Questions] User:', user._id, 'Role:', user.role);
 
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Get All Questions] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can view all questions' });
+            return res.status(403).json({ error: 'Only admin or teacher can view questions' });
         }
 
-        const questions = await Question.find().lean();
-        console.log('[Get All Questions] Questions fetched:', questions.length);
+        let questions;
+        
+        // For admin: return all questions
+        // For teacher: return only questions created by that teacher
+        if (user.role === 'admin') {
+            console.log('[Get All Questions] ===== ADMIN MODE =====');
+            console.log('[Get All Questions] Admin user - fetching ALL questions (no filter)');
+            const questionCount = await Question.countDocuments();
+            console.log('[Get All Questions] Total questions in database:', questionCount);
+            questions = await Question.find().populate('createdBy', 'name email _id').lean();
+            console.log('[Get All Questions] ✅ All questions fetched:', questions.length);
+            console.log('[Get All Questions] Questions fetched match database count:', questions.length === questionCount ? 'YES' : 'NO');
+        } else {
+            // Teacher: only their own questions
+            console.log('[Get All Questions] ===== TEACHER MODE =====');
+            console.log('[Get All Questions] Teacher user - fetching only questions created by:', user._id);
+            questions = await Question.find({ createdBy: user._id }).populate('createdBy', 'name email _id').lean();
+            console.log('[Get All Questions] ✅ Teacher questions fetched:', questions.length);
+        }
+        
+        // Log question details for debugging
+        if (questions.length > 0) {
+            console.log('[Get All Questions] 📋 Sample questions (first 10):');
+            questions.slice(0, 10).forEach((q, idx) => {
+                const creatorId = q.createdBy?._id?.toString() || q.createdBy?.toString() || 'N/A';
+                const creatorName = q.createdBy?.name || 'N/A';
+                console.log(`  [${idx + 1}] ID: ${q._id}, Title: ${q.title?.substring(0, 50)}..., CreatedBy: ${creatorId} (${creatorName}), Type: ${q.type}`);
+            });
+            
+            // Count questions by creator
+            const questionsByCreator = {};
+            questions.forEach(q => {
+                const creatorId = q.createdBy?._id?.toString() || q.createdBy?.toString() || 'unknown';
+                questionsByCreator[creatorId] = (questionsByCreator[creatorId] || 0) + 1;
+            });
+            console.log('[Get All Questions] 📊 Questions by creator:', JSON.stringify(questionsByCreator, null, 2));
+            console.log('[Get All Questions] 📊 Total unique creators:', Object.keys(questionsByCreator).length);
+            
+            if (user.role === 'admin') {
+                console.log('[Get All Questions] ✅ ADMIN: All questions from all creators are included');
+            } else {
+                console.log(`[Get All Questions] ✅ TEACHER: Questions created by requesting teacher (${user._id}):`, questionsByCreator[user._id.toString()] || 0);
+            }
+        } else {
+            console.log('[Get All Questions] ⚠️ No questions found');
+        }
+        
         res.status(200).json({ questions });
     } catch (err) {
         console.error('[Get All Questions] Error:', err.message);

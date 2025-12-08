@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const adminRoutes = require('./routes/adminRoutes');
 const authRoutes = require('./routes/auth');
 const questionRoutes = require('./routes/questionRoutes');
+const examRoutes = require('./routes/examRoutes');
 const User = require('./models/User');
 const Class = require('./models/Class');
 const bcrypt = require('bcrypt');
@@ -14,15 +15,15 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: 'https://www.algosutra.co.in', 
-        // origin: ['http://localhost:5173', 'http://localhost:5174'],
+        // origin: 'https://www.algosutra.co.in', 
+        origin: ['http://localhost:5173', 'http://localhost:5174'],
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'DELETE'],
     },
 });
 
-app.use(cors({ origin: 'https://www.algosutra.co.in', credentials: true }));
-// app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'], credentials: true }));
+// app.use(cors({ origin: 'https://www.algosutra.co.in', credentials: true }));
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'], credentials: true }));
 app.use(express.json()); // Parse JSON bodies
 app.use(express.urlencoded({ extended: true }));
 // Middleware to attach io to req
@@ -35,6 +36,7 @@ app.use((req, res, next) => {
 app.use('/auth', authRoutes);
 app.use('/admin', adminRoutes);
 app.use('/questions', questionRoutes);
+app.use('/exams', examRoutes);
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {

@@ -29,7 +29,7 @@ const questionSchema = new mongoose.Schema({
     level: { type: String, enum: ['beginner', 'intermediate', 'advanced'] },
     type: {
         type: String,
-        enum: ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'],
+        enum: ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'],
         required: true
     },
     options: [{ type: String }], // For singleCorrectMcq and multipleCorrectMcq
@@ -55,6 +55,15 @@ const questionSchema = new mongoose.Schema({
         },
         code: { type: String }
     }],
+    driverCode: [{
+        language: {
+            type: String,
+            enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']
+        },
+        code: { type: String }
+    }], // For codingWithDriver - fixed driver code that handles input/output
+    isExamOnly: { type: Boolean, default: false }, // Question created only for exam/test
+    examId: { type: mongoose.Schema.Types.ObjectId, ref: 'Exam' }, // Link to exam if exam-only question
     languages: [{
         type: String,
         enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']

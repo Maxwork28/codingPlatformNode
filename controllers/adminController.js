@@ -1255,18 +1255,95 @@ exports.getCounts = async (req, res) => {
     try {
         console.log('getCounts: Request received:', { user: { id: req.user._id, role: req.user.role } });
 
-        const [teacherCount, studentCount, questionCount, classCount] = await Promise.all([
+        const Exam = require('../models/Exam');
+        const ExamAttempt = require('../models/ExamAttempt');
+
+        const [
+            teacherCount, 
+            studentCount, 
+            questionCount, 
+            classCount,
+            activeClassCount,
+            inactiveClassCount,
+            examCount,
+            examDraftCount,
+            examScheduledCount,
+            examActiveCount,
+            examCompletedCount,
+            examTemplateCount,
+            examAttemptCount,
+            totalSubmissions
+        ] = await Promise.all([
             User.countDocuments({ role: 'teacher' }),
             User.countDocuments({ role: 'student' }),
             Question.countDocuments(),
-            Class.countDocuments()
+            Class.countDocuments(),
+            Class.countDocuments({ status: 'active' }),
+            Class.countDocuments({ status: 'inactive' }),
+            Exam.countDocuments({ 'template.isTemplate': { $ne: true } }),
+            Exam.countDocuments({ status: 'draft', 'template.isTemplate': { $ne: true } }),
+            Exam.countDocuments({ status: 'scheduled', 'template.isTemplate': { $ne: true } }),
+            Exam.countDocuments({ status: 'active', 'template.isTemplate': { $ne: true } }),
+            Exam.countDocuments({ status: 'completed', 'template.isTemplate': { $ne: true } }),
+            Exam.countDocuments({ 'template.isTemplate': true }),
+            ExamAttempt.countDocuments(),
+            Submission.countDocuments()
         ]);
+
+        // Get class analytics
+        const classes = await Class.find().select('name status students teachers questions assignments').lean();
+        const classAnalytics = classes.map(cls => ({
+            id: cls._id.toString(),
+            name: cls.name,
+            status: cls.status,
+            studentCount: cls.students?.length || 0,
+            teacherCount: cls.teachers?.length || 0,
+            questionCount: cls.questions?.length || 0,
+            assignmentCount: cls.assignments?.length || 0
+        }));
+
+        // Get exam statistics per class
+        const exams = await Exam.find({ 'template.isTemplate': { $ne: true } })
+            .select('classId status title')
+            .lean();
+        
+        const examStatsByClass = {};
+        exams.forEach(exam => {
+            const classId = exam.classId?.toString();
+            if (!classId) return;
+            
+            if (!examStatsByClass[classId]) {
+                examStatsByClass[classId] = {
+                    total: 0,
+                    draft: 0,
+                    scheduled: 0,
+                    active: 0,
+                    completed: 0
+                };
+            }
+            
+            examStatsByClass[classId].total++;
+            if (exam.status) {
+                examStatsByClass[classId][exam.status] = (examStatsByClass[classId][exam.status] || 0) + 1;
+            }
+        });
+
+        // Add exam counts to class analytics
+        classAnalytics.forEach(cls => {
+            const examStats = examStatsByClass[cls.id.toString()] || { total: 0, draft: 0, scheduled: 0, active: 0, completed: 0 };
+            cls.examCount = examStats.total;
+            cls.examStats = examStats;
+        });
 
         console.log('getCounts: Counts fetched:', {
             teachers: teacherCount,
             students: studentCount,
             questions: questionCount,
-            classes: classCount
+            classes: classCount,
+            activeClasses: activeClassCount,
+            inactiveClasses: inactiveClassCount,
+            exams: examCount,
+            examAttempts: examAttemptCount
         });
 
         res.status(200).json({
@@ -1274,8 +1351,19 @@ exports.getCounts = async (req, res) => {
                 teachers: teacherCount,
                 students: studentCount,
                 questions: questionCount,
-                classes: classCount
-            }
+                classes: classCount,
+                activeClasses: activeClassCount,
+                inactiveClasses: inactiveClassCount,
+                exams: examCount,
+                examDrafts: examDraftCount,
+                examScheduled: examScheduledCount,
+                examActive: examActiveCount,
+                examCompleted: examCompletedCount,
+                examTemplates: examTemplateCount,
+                examAttempts: examAttemptCount,
+                totalSubmissions: totalSubmissions
+            },
+            classAnalytics: classAnalytics
         });
     } catch (err) {
         console.error('getCounts: Error:', err);
@@ -1457,15 +1545,36 @@ exports.getAllQuestionsPaginated = async (req, res) => {
         // Build query - exclude drafts by default
         const query = includeDrafts === 'true' ? {} : { status: { $ne: 'draft' }, isDraft: { $ne: true } };
 
+        console.log('[Get All Questions Paginated] ===== ADMIN MODE =====');
+        console.log('[Get All Questions Paginated] Query filter:', JSON.stringify(query));
+        
+        // Count total questions matching query
+        const totalQuestions = await Question.countDocuments(query);
+        console.log('[Get All Questions Paginated] Total questions matching query:', totalQuestions);
+        
+        // Count all questions in database (no filter)
+        const totalAllQuestions = await Question.countDocuments({});
+        console.log('[Get All Questions Paginated] Total questions in database (all):', totalAllQuestions);
+
         const questions = await Question.find(query)
+            .populate('createdBy', 'name email _id')
             .sort({ updatedAt: -1 })
             .skip((pageNum - 1) * limitNum)
             .limit(limitNum)
             .lean();
 
-        const totalQuestions = await Question.countDocuments(query);
-
-        console.log('[Get All Questions Paginated] Questions fetched:', questions.length, 'Total:', totalQuestions);
+        console.log('[Get All Questions Paginated] ✅ Questions fetched for page:', questions.length, 'out of', totalQuestions, 'total');
+        
+        // Log sample questions with creator info
+        if (questions.length > 0) {
+            console.log('[Get All Questions Paginated] 📋 Questions on this page:');
+            questions.forEach((q, idx) => {
+                const creatorId = q.createdBy?._id?.toString() || q.createdBy?.toString() || 'N/A';
+                const creatorName = q.createdBy?.name || 'N/A';
+                console.log(`  [${idx + 1}] ID: ${q._id}, Title: ${q.title?.substring(0, 40)}..., CreatedBy: ${creatorId} (${creatorName}), Type: ${q.type}`);
+            });
+        }
+        
         res.status(200).json({
             questions,
             pagination: {
@@ -1473,7 +1582,8 @@ exports.getAllQuestionsPaginated = async (req, res) => {
                 totalPages: Math.ceil(totalQuestions / limitNum),
                 totalQuestions,
                 limit: limitNum
-            }
+            },
+            totalPages: Math.ceil(totalQuestions / limitNum) // Also include at root level for compatibility
         });
     } catch (err) {
         console.error('[Get All Questions Paginated] Error:', err.message);
