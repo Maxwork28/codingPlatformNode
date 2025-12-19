@@ -229,12 +229,32 @@ exports.manageTeacherPermission = async (req, res) => {
 exports.getAllClasses = async (req, res) => {
     try {
         const { search } = req.query;
-        console.log('getAllClasses: Request received, user:', { id: req.user._id, role: req.user.role }, 'search:', search);
+        const userRole = req.user.role;
+        const userId = req.user._id;
+        console.log('getAllClasses: Request received, user:', { id: userId, role: userRole, userIdType: typeof userId }, 'search:', search);
         
         // Build query
         let query = {};
         
-        // If search parameter is provided, search by class name or creator name
+        // Filter by role: Teachers and Students should only see their assigned classes
+        if (userRole === 'teacher') {
+            // Ensure userId is treated as ObjectId for proper MongoDB matching
+            query = {
+                $or: [
+                    { teachers: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId },
+                    { createdBy: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId }
+                ]
+            };
+            console.log('getAllClasses: Filtering classes for teacher:', userId.toString(), 'Query:', JSON.stringify(query));
+        } else if (userRole === 'student') {
+            query = {
+                students: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId
+            };
+            console.log('getAllClasses: Filtering classes for student:', userId.toString());
+        }
+        // Admin sees all classes (no additional filter)
+        
+        // If search parameter is provided, add search filter
         if (search && search.trim()) {
             const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
             
@@ -242,23 +262,40 @@ exports.getAllClasses = async (req, res) => {
             const matchingUsers = await User.find({ name: searchRegex }).select('_id');
             const matchingUserIds = matchingUsers.map(u => u._id);
             
-            // Search by class name OR creator name
-            query = {
+            // Combine role-based filter with search filter
+            const searchFilter = {
                 $or: [
                     { name: searchRegex },
                     { createdBy: { $in: matchingUserIds } }
                 ]
             };
+            
+            // Merge search filter with existing query
+            if (Object.keys(query).length > 0) {
+                query = {
+                    $and: [
+                        query,
+                        searchFilter
+                    ]
+                };
+            } else {
+                query = searchFilter;
+            }
             console.log('getAllClasses: Applying search filter:', { search, matchingUsersCount: matchingUserIds.length });
         }
         
+        console.log('getAllClasses: Final query:', JSON.stringify(query, null, 2));
         const classes = await Class.find(query)
             .populate('createdBy', 'name email')
             .populate('students', 'name email')
             .populate('teachers', 'name email')
             .populate('questions', 'title type description points classes');
         
-        console.log('getAllClasses: Classes fetched:', classes.length);
+        console.log('getAllClasses: Classes fetched:', classes.length, 'for role:', userRole);
+        if (userRole === 'teacher' && classes.length > 0) {
+            console.log('getAllClasses: Sample class teachers:', classes[0].teachers?.map(t => t._id?.toString()));
+            console.log('getAllClasses: Sample class createdBy:', classes[0].createdBy?._id?.toString());
+        }
         res.status(200).json({ classes });
     } catch (err) {
         console.error('getAllClasses: Error:', err);
@@ -331,12 +368,9 @@ exports.getAllStudents = async (req, res) => {
 exports.getStudentsByClass = async (req, res) => {
     try {
         const { classId } = req.params;
-        console.log('[getStudentsByClass] Request received:', { classId, user: { id: req.user._id, role: req.user.role } });
-
-        if (req.user.role !== 'admin') {
-            console.error('[getStudentsByClass] Authorization failed: User is not admin');
-            return res.status(403).json({ error: 'Unauthorized: Admins only' });
-        }
+        const userRole = req.user.role;
+        const userId = req.user._id;
+        console.log('[getStudentsByClass] Request received:', { classId, user: { id: userId, role: userRole } });
 
         if (!isValidObjectId(classId)) {
             console.error('[getStudentsByClass] Validation failed: Invalid classId');
@@ -344,10 +378,26 @@ exports.getStudentsByClass = async (req, res) => {
         }
 
         const classData = await Class.findById(classId)
-            .populate('students', 'name email number isBlocked');
+            .populate('students', 'name email number isBlocked')
+            .populate('teachers', '_id');
         if (!classData) {
             console.error('[getStudentsByClass] Validation failed: Class not found');
             return res.status(404).json({ error: 'Class not found' });
+        }
+
+        // Authorization: Admin can see all, Teacher can only see students in classes they're assigned to
+        if (userRole === 'teacher') {
+            const isAssignedTeacher = classData.teachers.some(t => String(t._id) === String(userId));
+            const isCreator = String(classData.createdBy) === String(userId);
+            
+            if (!isAssignedTeacher && !isCreator) {
+                console.error('[getStudentsByClass] Authorization failed: Teacher not assigned to class');
+                return res.status(403).json({ error: 'Unauthorized: You are not assigned to this class' });
+            }
+            console.log('[getStudentsByClass] Teacher authorized:', { isAssignedTeacher, isCreator });
+        } else if (userRole !== 'admin' && userRole !== 'student') {
+            console.error('[getStudentsByClass] Authorization failed: Invalid role');
+            return res.status(403).json({ error: 'Unauthorized' });
         }
 
         const students = classData.students.map((student) => ({
@@ -355,10 +405,10 @@ exports.getStudentsByClass = async (req, res) => {
             name: student.name,
             email: student.email,
             number: student.number,
-            isBlocked: student.isBlocked.get(classId.toString()) || false,
+            isBlocked: student.isBlocked?.get?.(classId.toString()) || false,
         }));
 
-        console.log('[getStudentsByClass] Students fetched:', students.length);
+        console.log('[getStudentsByClass] Students fetched:', students.length, 'for role:', userRole);
         res.status(200).json({ students });
     } catch (err) {
         console.error('[getStudentsByClass] Error:', err.message, err.stack);

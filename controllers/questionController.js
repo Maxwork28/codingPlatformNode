@@ -1283,15 +1283,29 @@ exports.getQuestionsByClass = async (req, res) => {
             return res.status(403).json({ error: 'Not authorized to view questions' });
         }
 
-        const classData = await Class.findById(classId).populate('questions');
+        const classData = await Class.findById(classId)
+            .populate('questions')
+            .populate('teachers', '_id');
         if (!classData) {
             console.error('[Get Questions By Class] Error: Class not found');
             return res.status(404).json({ error: 'Class not found' });
         }
 
+        // Authorization checks
         if (user.role === 'student' && !classData.students.includes(user._id)) {
             console.warn('[Get Questions By Class] Error: Student not enrolled');
             return res.status(403).json({ error: 'Student not enrolled in class' });
+        }
+        
+        if (user.role === 'teacher') {
+            const isAssignedTeacher = classData.teachers.some(t => String(t._id || t) === String(user._id));
+            const isCreator = String(classData.createdBy) === String(user._id);
+            
+            if (!isAssignedTeacher && !isCreator) {
+                console.warn('[Get Questions By Class] Error: Teacher not assigned to class');
+                return res.status(403).json({ error: 'Teacher not assigned to this class' });
+            }
+            console.log('[Get Questions By Class] Teacher authorized:', { isAssignedTeacher, isCreator });
         }
 
         const questions = classData.questions.filter(q => {
@@ -1359,11 +1373,44 @@ exports.getAllQuestions = async (req, res) => {
             console.log('[Get All Questions] ✅ All questions fetched:', questions.length);
             console.log('[Get All Questions] Questions fetched match database count:', questions.length === questionCount ? 'YES' : 'NO');
         } else {
-            // Teacher: only their own questions
+            // Teacher: their own questions + questions assigned to classes they're assigned to
             console.log('[Get All Questions] ===== TEACHER MODE =====');
-            console.log('[Get All Questions] Teacher user - fetching only questions created by:', user._id);
-            questions = await Question.find({ createdBy: user._id }).populate('createdBy', 'name email _id').lean();
-            console.log('[Get All Questions] ✅ Teacher questions fetched:', questions.length);
+            console.log('[Get All Questions] Teacher user - fetching questions created by:', user._id);
+            
+            // First, find all classes where this teacher is assigned
+            const teacherClasses = await Class.find({
+                $or: [
+                    { teachers: user._id },
+                    { createdBy: user._id }
+                ]
+            }).select('_id');
+            
+            const teacherClassIds = teacherClasses.map(c => c._id);
+            console.log('[Get All Questions] Teacher is assigned to classes:', teacherClassIds.length, teacherClassIds.map(id => id.toString()));
+            
+            // Find questions that are either:
+            // 1. Created by the teacher, OR
+            // 2. Assigned to classes the teacher is assigned to
+            const questionQuery = {
+                $or: [
+                    { createdBy: user._id },
+                    { 'classes.classId': { $in: teacherClassIds } }
+                ]
+            };
+            
+            questions = await Question.find(questionQuery)
+                .populate('createdBy', 'name email _id')
+                .lean();
+            
+            console.log('[Get All Questions] ✅ Teacher questions fetched:', questions.length, '(own + assigned to their classes)');
+            
+            // Log breakdown
+            const ownQuestions = questions.filter(q => String(q.createdBy?._id || q.createdBy) === String(user._id));
+            const assignedQuestions = questions.filter(q => {
+                const creatorId = String(q.createdBy?._id || q.createdBy);
+                return creatorId !== String(user._id) && q.classes?.some(c => teacherClassIds.some(tcId => String(tcId) === String(c.classId)));
+            });
+            console.log('[Get All Questions] 📊 Breakdown - Own questions:', ownQuestions.length, '| Assigned questions:', assignedQuestions.length);
         }
         
         // Log question details for debugging

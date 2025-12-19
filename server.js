@@ -79,5 +79,5 @@ io.on('connection', (socket) => {
 mongoose.connect('mongodb://localhost:27017/education_platform').then(async () => {
     console.log('MongoDB connected');
     // await createInitialAdmin();
-    server.listen(3000, () => console.log('Server started on port 3000'));
+    server.listen(3001, () => console.log('Server started on port 3001'));
 }).catch(err => console.error('MongoDB connection error:', err));
