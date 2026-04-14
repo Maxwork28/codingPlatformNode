@@ -15,7 +15,7 @@ const classSchema = new mongoose.Schema({
     }],
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },
     createdAt: { type: Date, default: Date.now },
-    totalRuns: { type: Number, default: 0 }, // Total runs across all students
+    totalRuns: { type: Number, default: 0 }, // Total runs across all vhbhbhbstudents
     totalSubmits: { type: Number, default: 0 } // Total submits across all students
 }, {
     indexes: [
