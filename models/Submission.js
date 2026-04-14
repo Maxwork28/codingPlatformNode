@@ -14,9 +14,12 @@ const submissionSchema = new mongoose.Schema({
   isRun: { type: Boolean, default: false },
   examAttemptId: { type: mongoose.Schema.Types.ObjectId, ref: 'ExamAttempt' }, // Link to exam attempt if submitted during exam
   passedTestCases: { type: Number, default: 0 },
-  totalTestCases: { type: Number, default: 0 }
+  totalTestCases: { type: Number, default: 0 },
+  status: {
+    type: String,
+    enum: ['accepted', 'wrong_answer', 'tle', 'mle', 'runtime_error', 'compile_error'],
+    default: 'accepted'
+  }
 });
-
-const Submission = mongoose.model('Submission', submissionSchema);
 
 module.exports = mongoose.model('Submission', submissionSchema);

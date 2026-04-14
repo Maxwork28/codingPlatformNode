@@ -177,6 +177,13 @@ router.delete(
 
 // Leaderboard and Stats Routes
 router.get(
+  '/classes/:classId/question-summary',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.getQuestionSummary
+);
+
+router.get(
   '/classes/:classId/participant-stats',
   authMiddleware,
   requireRole('admin', 'teacher'),

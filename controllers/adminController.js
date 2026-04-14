@@ -754,6 +754,47 @@ exports.getClassDetails = async (req, res) => {
     }
 };
 
+exports.getQuestionSummary = async (req, res) => {
+    try {
+        const { classId } = req.params;
+        const user = req.user;
+        if (!['admin', 'teacher'].includes(user.role)) {
+            return res.status(403).json({ error: 'Not authorized' });
+        }
+        const classData = await Class.findById(classId);
+        if (!classData) return res.status(404).json({ error: 'Class not found' });
+        if (user.role === 'teacher' && !classData.teachers.some(t => t.toString() === user._id.toString()) && classData.createdBy?.toString() !== user._id.toString()) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
+        }
+        const questions = await Question.find({ 'classes.classId': classId }).select('_id title type');
+        const summaries = await Promise.all(questions.map(async (q) => {
+            const subs = await Submission.aggregate([
+                { $match: { questionId: q._id, classId: new mongoose.Types.ObjectId(classId), isRun: false } },
+                { $sort: { submittedAt: -1 } },
+                { $group: { _id: '$studentId', latestCorrect: { $first: '$isCorrect' } } },
+                { $group: {
+                    _id: null,
+                    attempted: { $sum: 1 },
+                    successful: { $sum: { $cond: ['$latestCorrect', 1, 0] } }
+                } }
+            ]);
+            const s = subs[0] || { attempted: 0, successful: 0 };
+            return {
+                questionId: q._id,
+                title: q.title,
+                type: q.type,
+                attempted: s.attempted,
+                successful: s.successful,
+                unsuccessful: (s.attempted || 0) - (s.successful || 0)
+            };
+        }));
+        res.status(200).json({ summaries });
+    } catch (err) {
+        console.error('getQuestionSummary Error:', err);
+        res.status(500).json({ error: 'Error fetching question summary' });
+    }
+};
+
 exports.getParticipantStats = async (req, res) => {
     try {
         const { classId } = req.params;
@@ -1169,6 +1210,7 @@ exports.blockUnblockStudent = async (req, res) => {
         console.log('[blockUnblockStudent] Final isBlocked status:', student.isBlocked.get(classId));
         console.log('[blockUnblockStudent] Full isBlocked Map:', Object.fromEntries(student.isBlocked));
 
+        if (req.io) req.io.to(`class:${classId}`).emit('analyticsUpdated', { classId });
         req.io.to(`class:${classId}`).emit('studentBlockStatusUpdated', {
             classId,
             studentId,
@@ -1443,7 +1485,7 @@ exports.adminCreateQuestion = async (req, res) => {
         }
 
         // Validate question type
-        const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'];
+        const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'];
         if (!validTypes.includes(questionData.type)) {
             console.error('[Admin Create Question] Error: Invalid type:', questionData.type);
             return res.status(400).json({ error: 'Invalid question type' });
@@ -1519,6 +1561,47 @@ exports.adminCreateQuestion = async (req, res) => {
             if (!questionData.starterCode.every(sc => sc.language && sc.code && questionData.languages.includes(sc.language))) {
                 console.error('[Admin Create Question] Error: Invalid starterCode');
                 return res.status(400).json({ error: 'Invalid starter code structure' });
+            }
+            if (!Array.isArray(questionData.testCases) || questionData.testCases.length === 0) {
+                console.error('[Admin Create Question] Error: No test cases');
+                return res.status(400).json({ error: 'At least one test case is required' });
+            }
+            if (!questionData.testCases.every(tc => tc.input && tc.expectedOutput && typeof tc.isPublic === 'boolean')) {
+                console.error('[Admin Create Question] Error: Invalid test cases');
+                return res.status(400).json({ error: 'Test cases must have input, expectedOutput, and isPublic' });
+            }
+            if (typeof questionData.timeLimit !== 'number' || questionData.timeLimit <= 0) {
+                console.error('[Admin Create Question] Error: Invalid time limit');
+                return res.status(400).json({ error: 'Time limit must be positive' });
+            }
+            if (typeof questionData.memoryLimit !== 'number' || questionData.memoryLimit <= 0) {
+                console.error('[Admin Create Question] Error: Invalid memory limit');
+                return res.status(400).json({ error: 'Memory limit must be positive' });
+            }
+        } else if (questionData.type === 'codingWithDriver') {
+            if (!Array.isArray(questionData.languages) || questionData.languages.length === 0) {
+                console.error('[Admin Create Question] Error: No languages');
+                return res.status(400).json({ error: 'At least one language is required' });
+            }
+            if (!questionData.languages.every(lang => supportedLanguages.includes(lang))) {
+                console.error('[Admin Create Question] Error: Invalid languages');
+                return res.status(400).json({ error: 'Invalid language specified' });
+            }
+            if (!Array.isArray(questionData.templateCode) || questionData.templateCode.length === 0) {
+                console.error('[Admin Create Question] Error: No templateCode');
+                return res.status(400).json({ error: 'Template code is required for codingWithDriver' });
+            }
+            if (!questionData.templateCode.every(tc => tc.language && tc.code && questionData.languages.includes(tc.language))) {
+                console.error('[Admin Create Question] Error: Invalid templateCode');
+                return res.status(400).json({ error: 'Invalid template code structure' });
+            }
+            if (!Array.isArray(questionData.driverCode) || questionData.driverCode.length === 0) {
+                console.error('[Admin Create Question] Error: No driverCode');
+                return res.status(400).json({ error: 'Driver code is required for codingWithDriver' });
+            }
+            if (!questionData.driverCode.every(dc => dc.language && dc.code && questionData.languages.includes(dc.language))) {
+                console.error('[Admin Create Question] Error: Invalid driverCode');
+                return res.status(400).json({ error: 'Invalid driver code structure' });
             }
             if (!Array.isArray(questionData.testCases) || questionData.testCases.length === 0) {
                 console.error('[Admin Create Question] Error: No test cases');
@@ -1667,7 +1750,7 @@ exports.editQuestion = async (req, res) => {
             return res.status(400).json({ error: 'Question type and title are required' });
         }
 
-        const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'];
+        const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'];
         if (!validTypes.includes(questionData.type)) {
             console.error('[Admin Edit Question] Error: Invalid type:', questionData.type);
             return res.status(400).json({ error: 'Invalid question type' });
@@ -1708,6 +1791,8 @@ exports.editQuestion = async (req, res) => {
             questionData.correctOptions = undefined; // Clear for non-multipleCorrectMcq
             questionData.correctAnswer = undefined;
             questionData.starterCode = undefined;
+            questionData.templateCode = undefined;
+            questionData.driverCode = undefined;
             questionData.testCases = undefined;
             questionData.languages = undefined;
             questionData.timeLimit = undefined;
@@ -1732,6 +1817,8 @@ exports.editQuestion = async (req, res) => {
             questionData.correctOption = undefined; // Clear for non-singleCorrectMcq
             questionData.correctAnswer = undefined;
             questionData.starterCode = undefined;
+            questionData.templateCode = undefined;
+            questionData.driverCode = undefined;
             questionData.testCases = undefined;
             questionData.languages = undefined;
             questionData.timeLimit = undefined;
@@ -1745,6 +1832,8 @@ exports.editQuestion = async (req, res) => {
             questionData.correctOption = undefined;
             questionData.correctOptions = undefined;
             questionData.starterCode = undefined;
+            questionData.templateCode = undefined;
+            questionData.driverCode = undefined;
             questionData.testCases = undefined;
             questionData.languages = undefined;
             questionData.timeLimit = undefined;
@@ -1786,6 +1875,54 @@ exports.editQuestion = async (req, res) => {
             questionData.correctOption = undefined;
             questionData.correctOptions = undefined;
             questionData.correctAnswer = undefined;
+            questionData.templateCode = undefined;
+            questionData.driverCode = undefined;
+        } else if (questionData.type === 'codingWithDriver') {
+            if (!Array.isArray(questionData.languages) || questionData.languages.length === 0) {
+                console.error('[Admin Edit Question] Error: No languages provided');
+                return res.status(400).json({ error: 'At least one language required for coding questions' });
+            }
+            if (!questionData.languages.every(lang => supportedLanguages.includes(lang))) {
+                console.error('[Admin Edit Question] Error: Invalid language');
+                return res.status(400).json({ error: 'Invalid language specified' });
+            }
+            if (!Array.isArray(questionData.templateCode) || questionData.templateCode.length === 0) {
+                console.error('[Admin Edit Question] Error: No templateCode');
+                return res.status(400).json({ error: 'Template code required for codingWithDriver' });
+            }
+            if (!questionData.templateCode.every(tc => tc.language && tc.code && questionData.languages.includes(tc.language))) {
+                console.error('[Admin Edit Question] Error: Invalid templateCode structure');
+                return res.status(400).json({ error: 'Invalid template code structure' });
+            }
+            if (!Array.isArray(questionData.driverCode) || questionData.driverCode.length === 0) {
+                console.error('[Admin Edit Question] Error: No driverCode');
+                return res.status(400).json({ error: 'Driver code required for codingWithDriver' });
+            }
+            if (!questionData.driverCode.every(dc => dc.language && dc.code && questionData.languages.includes(dc.language))) {
+                console.error('[Admin Edit Question] Error: Invalid driverCode structure');
+                return res.status(400).json({ error: 'Invalid driver code structure' });
+            }
+            if (!Array.isArray(questionData.testCases) || questionData.testCases.length === 0) {
+                console.error('[Admin Edit Question] Error: No test cases');
+                return res.status(400).json({ error: 'At least one test case required for coding questions' });
+            }
+            if (!questionData.testCases.every(tc => tc.input && tc.expectedOutput && typeof tc.isPublic === 'boolean')) {
+                console.error('[Admin Edit Question] Error: Invalid test cases');
+                return res.status(400).json({ error: 'Test cases must have input, expectedOutput, and isPublic' });
+            }
+            if (typeof questionData.timeLimit !== 'number' || questionData.timeLimit <= 0) {
+                console.error('[Admin Edit Question] Error: Invalid time limit');
+                return res.status(400).json({ error: 'Time limit must be positive' });
+            }
+            if (typeof questionData.memoryLimit !== 'number' || questionData.memoryLimit <= 0) {
+                console.error('[Admin Edit Question] Error: Invalid memory limit');
+                return res.status(400).json({ error: 'Memory limit must be positive' });
+            }
+            questionData.options = undefined;
+            questionData.correctOption = undefined;
+            questionData.correctOptions = undefined;
+            questionData.correctAnswer = undefined;
+            questionData.starterCode = undefined;
         }
 
         // Update question
@@ -1910,7 +2047,7 @@ exports.createDraftQuestion = async (req, res) => {
         }
 
         // Validate question type
-        const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'];
+        const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'];
         if (!validTypes.includes(questionData.type)) {
             console.error('[Create Draft Question] Error: Invalid type:', questionData.type);
             return res.status(400).json({ error: 'Invalid question type' });

@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Docker = require('dockerode');
 const fs = require('fs').promises;
 const path = require('path');
+const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
 const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Class = require('../models/Class');
@@ -31,7 +32,52 @@ const ensureTeacherQuestionPermission = (user, actionLabel, res) => {
     return true;
 };
 
-const executeDockerCode = async (language, code, testCases, timeLimit, memoryLimit) => {
+/**
+ * Teachers often store test stdin as a bare JSON array, e.g. [1, 5, 3, 9, 2],
+ * while LeetCode-style drivers expect one JSON object with an "arr" field:
+ * {"arr":[1,5,3,9,2]}. Without this, JSON.parse yields an array, data.arr is undefined,
+ * and the solution throws or prints nothing.
+ *
+ * Only wraps when the parsed value is a flat array of finite numbers (or empty).
+ * Nested arrays / non-numeric elements are left unchanged for other problem shapes.
+ */
+const normalizeLeetcodeStyleStdin = (inputStr) => {
+    const s = String(inputStr ?? '').trim();
+    if (!s.startsWith('[')) return inputStr;
+    let parsed;
+    try {
+        parsed = JSON.parse(s);
+    } catch {
+        return inputStr;
+    }
+    if (!Array.isArray(parsed)) return inputStr;
+    const flatNumbers =
+        parsed.length === 0 ||
+        parsed.every((x) => typeof x === 'number' && Number.isFinite(x));
+    if (!flatNumbers) return inputStr;
+    return JSON.stringify({ arr: parsed });
+};
+
+/**
+ * True when this question has driver code for the selected language.
+ * Used so we still merge driver + student answer if the question was saved as type "coding"
+ * by mistake instead of "codingWithDriver" (otherwise only a bare function runs → no stdout).
+ */
+const shouldMergeDriverForLanguage = (question, language) => {
+    if (question.type === 'fillInTheBlanksCoding') return false;
+    if (question.type !== 'coding' && question.type !== 'codingWithDriver') return false;
+    if (!Array.isArray(question.driverCode) || question.driverCode.length === 0) return false;
+    return question.driverCode.some(
+        (d) => d.language === language && d.code && String(d.code).trim().length > 0
+    );
+};
+
+/** Bare-array stdin normalization for LeetCode-style JSON tests */
+const shouldWrapBareArrayStdinForQuestion = (question, language) =>
+    question.type === 'codingWithDriver' || shouldMergeDriverForLanguage(question, language);
+
+const executeDockerCode = async (language, code, testCases, timeLimit, memoryLimit, options = {}) => {
+    const wrapBareArrayStdin = !!options.wrapBareArrayStdinForDriver;
     console.log('[executeDockerCode] Starting execution for language:', language);
     const config = languageConfig[language];
     if (!config) {
@@ -109,7 +155,10 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                         expected: test.expectedOutput,
                         passed: false,
                         isPublic: test.isPublic,
-                        error: compileError
+                        error: compileError,
+                        status: 'compile_error',
+                        isTLE: false,
+                        isMLE: false
                     });
                 }
                 return testResults;
@@ -117,9 +166,16 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
         }
 
         for (const test of testCases) {
-            console.log('[executeDockerCode] Running test case with input:', test.input);
+            const inputStr = String(test.input ?? '');
+            const stdinPayload = wrapBareArrayStdin ? normalizeLeetcodeStyleStdin(inputStr) : inputStr;
+            if (wrapBareArrayStdin && stdinPayload !== inputStr) {
+                console.log('[executeDockerCode] Normalized bare array stdin to {"arr":[...]} for driver compatibility');
+            }
+            console.log('[executeDockerCode] Running test case with input:', inputStr.substring(0, 50));
+            // Pipe stdin via base64 so JSON/shell metacharacters ($, !, quotes, newlines) never break the shell
+            const inputB64 = Buffer.from(stdinPayload, 'utf8').toString('base64');
             const exec = await container.exec({
-                Cmd: ['bash', '-c', `echo "${test.input.replace(/"/g, '\\"')}" | ${config.runCmd.join(' ')}`],
+                Cmd: ['bash', '-c', `printf '%s' '${inputB64}' | base64 -d | ${config.runCmd.join(' ')}`],
                 AttachStdout: true,
                 AttachStderr: true,
             });
@@ -132,28 +188,41 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 );
                 stream.on('end', resolve);
             });
-            console.log('[executeDockerCode] Test output:', output);
-            console.log('[executeDockerCode] Test error:', error);
+            console.log('[executeDockerCode] Test output:', output.substring(0, 100));
             const passed = output.trim() === test.expectedOutput.trim();
+            const errStr = error.trim() || null;
+            const isTLE = errStr && (errStr.toLowerCase().includes('timeout') || errStr.toLowerCase().includes('timed out'));
+            const isMLE = errStr && (errStr.toLowerCase().includes('memory') || errStr.toLowerCase().includes('oom') || (errStr.toLowerCase().includes('killed') && !isTLE));
+            const status = passed ? 'accepted' : (isTLE ? 'tle' : isMLE ? 'mle' : 'wrong_answer');
             testResults.push({
                 input: test.input,
                 output: output.trim(),
                 expected: test.expectedOutput,
                 passed,
                 isPublic: test.isPublic,
-                error: error.trim() || null
+                error: errStr,
+                status,
+                isTLE: !!isTLE,
+                isMLE: !!isMLE
             });
         }
     } catch (err) {
         console.error('[executeDockerCode] Execution error:', err.message, err.stack);
+        const errMsg = err.message || '';
+        const isTLE = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('timed out');
+        const isMLE = errMsg.toLowerCase().includes('memory') || errMsg.toLowerCase().includes('oom') || errMsg.toLowerCase().includes('killed');
+        const status = isTLE ? 'tle' : isMLE ? 'mle' : 'runtime_error';
         for (const test of testCases) {
             testResults.push({
                 input: test.input,
-                output: `Execution Error: ${err.message}`,
+                output: `Execution Error: ${errMsg}`,
                 expected: test.expectedOutput,
                 passed: false,
                 isPublic: test.isPublic,
-                error: err.message
+                error: errMsg,
+                status,
+                isTLE: !!isTLE,
+                isMLE: !!isMLE
             });
         }
     } finally {
@@ -172,6 +241,8 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
 
 // Export executeDockerCode for use in exam controller
 exports.executeDockerCode = executeDockerCode;
+exports.shouldMergeDriverForLanguage = shouldMergeDriverForLanguage;
+exports.shouldWrapBareArrayStdinForQuestion = shouldWrapBareArrayStdinForQuestion;
 
 exports.submitAnswer = async (req, res) => {
     console.log('[Submission] New answer submission started');
@@ -271,7 +342,8 @@ exports.submitAnswer = async (req, res) => {
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
             console.log('[Submission] fillInTheBlanks result:', isCorrect ? 'Correct' : 'Incorrect');
-        } else if (question.type === 'fillInTheBlanksCoding' || question.type === 'coding') {
+        } else if (question.type === 'fillInTheBlanksCoding' || question.type === 'coding' || question.type === 'codingWithDriver') {
+            let submissionStatus = 'wrong_answer';
             if (!language || !question.languages.includes(language)) {
                 console.error('[Submission] Error: Invalid or unsupported language:', language);
                 return res.status(400).json({ error: `Language ${language} is not supported for this question` });
@@ -284,24 +356,44 @@ exports.submitAnswer = async (req, res) => {
                 if (question.type === 'fillInTheBlanksCoding') {
                     codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
                     console.log('[Submission] Combined code for execution:', codeToExecute);
+                } else if (shouldMergeDriverForLanguage(question, language)) {
+                    const driverCodeObj = question.driverCode.find(d => d.language === language);
+                    if (driverCodeObj && driverCodeObj.code) {
+                        codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
+                        console.log('[Submission] Combined driver + user code for execution');
+                    }
                 }
                 const testResults = await executeDockerCode(
                     language,
                     codeToExecute,
                     question.testCases,
                     question.timeLimit,
-                    question.memoryLimit
+                    question.memoryLimit,
+                    { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
                 );
                 totalTestCases = testResults.length;
                 passedTestCases = testResults.filter(test => test.passed).length;
                 isCorrect = testResults.every(test => test.passed);
                 score = isCorrect ? question.points : Math.floor((passedTestCases / totalTestCases) * question.points);
                 output = JSON.stringify(testResults.filter(result => result.isPublic));
+                const firstFail = testResults.find(t => !t.passed);
+                submissionStatus = isCorrect ? 'accepted' : (firstFail?.status || 'wrong_answer');
+                output = JSON.stringify(testResults.filter(r => r.isPublic).map(r => ({
+                    input: r.input,
+                    output: r.output,
+                    expected: r.expected,
+                    passed: r.passed,
+                    status: r.status,
+                    isTLE: r.isTLE,
+                    isMLE: r.isMLE
+                })));
                 console.log('[Submission] Coding test results:', testResults);
             } catch (err) {
                 console.error('[Submission] Error: Code execution failed:', err.message);
                 isCorrect = false;
                 score = 0;
+                const errLower = (err.message || '').toLowerCase();
+                submissionStatus = errLower.includes('timeout') ? 'tle' : errLower.includes('memory') || errLower.includes('oom') || errLower.includes('killed') ? 'mle' : 'runtime_error';
                 output = `Error: ${err.message}`;
                 passedTestCases = 0;
                 totalTestCases = question.testCases.length;
@@ -319,7 +411,8 @@ exports.submitAnswer = async (req, res) => {
             output,
             isRun: false,
             passedTestCases,
-            totalTestCases
+            totalTestCases,
+            status: typeof submissionStatus !== 'undefined' ? submissionStatus : (isCorrect ? 'accepted' : 'wrong_answer')
         });
         await submission.save();
         console.log('[Submission] Saved submission:', submission._id);
@@ -370,6 +463,7 @@ exports.submitAnswer = async (req, res) => {
         }
         await leaderboard.save();
 
+        req.io.to(`class:${classId}`).emit('analyticsUpdated', { classId });
         req.io.to(`class:${classId}`).emit('submissionUpdate', {
             classId,
             studentId: user._id,
@@ -444,9 +538,9 @@ exports.runQuestion = async (req, res) => {
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
 
-        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
+        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding' && question.type !== 'codingWithDriver') {
             console.error('[Run Question] Error: Not a coding question');
-            return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be run' });
+            return res.status(400).json({ error: 'Only coding, fillInTheBlanksCoding, or codingWithDriver questions can be run' });
         }
 
         if (!language || !question.languages.includes(language)) {
@@ -462,6 +556,12 @@ exports.runQuestion = async (req, res) => {
             }
             codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Run Question] Combined code for execution:', codeToExecute);
+        } else if (shouldMergeDriverForLanguage(question, language)) {
+            const driverCodeObj = question.driverCode.find(d => d.language === language);
+            if (driverCodeObj && driverCodeObj.code) {
+                codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
+                console.log('[Run Question] Combined driver + user code for execution');
+            }
         }
 
         // Filter for public test cases only
@@ -479,7 +579,8 @@ exports.runQuestion = async (req, res) => {
                 codeToExecute,
                 publicTestCases,
                 question.timeLimit,
-                question.memoryLimit
+                question.memoryLimit,
+                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
             );
             console.log('[Run Question] Test results:', testResults);
         } catch (err) {
@@ -488,6 +589,8 @@ exports.runQuestion = async (req, res) => {
         }
 
         const isCorrect = testResults.every(test => test.passed);
+        const firstFail = testResults.find(t => !t.passed);
+        const runStatus = isCorrect ? 'accepted' : (firstFail?.status || 'wrong_answer');
         const output = JSON.stringify(testResults);
 
         const submission = new Submission({
@@ -501,7 +604,8 @@ exports.runQuestion = async (req, res) => {
             output,
             isRun: true,
             passedTestCases: testResults.filter(test => test.passed).length,
-            totalTestCases: testResults.length
+            totalTestCases: testResults.length,
+            status: runStatus
         });
         await submission.save();
         console.log('[Run Question] Saved submission (run):', submission._id);
@@ -510,6 +614,7 @@ exports.runQuestion = async (req, res) => {
         await classData.save();
         console.log('[Run Question] Updated class totalRuns');
 
+        req.io.to(`class:${classId}`).emit('analyticsUpdated', { classId });
         req.io.to(`class:${classId}`).emit('codeRun', {
             classId,
             studentId: user._id,
@@ -584,9 +689,9 @@ exports.runWithCustomInput = async (req, res) => {
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
 
-        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
+        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding' && question.type !== 'codingWithDriver') {
             console.error('[Run With Custom Input] Error: Not a coding question');
-            return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be run' });
+            return res.status(400).json({ error: 'Only coding, fillInTheBlanksCoding, or codingWithDriver questions can be run' });
         }
 
         if (!language || !question.languages.includes(language)) {
@@ -599,7 +704,8 @@ exports.runWithCustomInput = async (req, res) => {
             return res.status(400).json({ error: 'Valid custom input is required' });
         }
 
-        if (!customInput.match(/^\[\s*-?\d+(\s*,\s*-?\d+)*\s*\]$/)) {
+        // For codingWithDriver: allow JSON. For coding/fillInTheBlanksCoding: allow array format
+        if (question.type !== 'codingWithDriver' && !customInput.match(/^\[\s*-?\d+(\s*,\s*-?\d+)*\s*\]$/)) {
             console.error('[Run With Custom Input] Error: Invalid array format');
             return res.status(400).json({ error: 'Custom input must be a valid array (e.g., [1, 2, 3])' });
         }
@@ -617,6 +723,12 @@ exports.runWithCustomInput = async (req, res) => {
             }
             codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Run With Custom Input] Combined code for execution:', codeToExecute);
+        } else if (shouldMergeDriverForLanguage(question, language)) {
+            const driverCodeObj = question.driverCode.find(d => d.language === language);
+            if (driverCodeObj && driverCodeObj.code) {
+                codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
+                console.log('[Run With Custom Input] Combined driver + user code for execution');
+            }
         }
 
         const customTestCase = [{
@@ -633,7 +745,8 @@ exports.runWithCustomInput = async (req, res) => {
                 codeToExecute,
                 customTestCase,
                 question.timeLimit,
-                question.memoryLimit
+                question.memoryLimit,
+                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
             );
             console.log('[Run With Custom Input] Test results:', testResults);
         } catch (err) {
@@ -704,12 +817,12 @@ exports.assignQuestion = async (req, res) => {
             return res.status(400).json({ error: 'Question type and title required' });
         }
 
-        if (!['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'].includes(questionData.type)) {
+        if (!['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'].includes(questionData.type)) {
             console.error('[Question Assignment] Error: Invalid type');
             return res.status(400).json({ error: 'Invalid question type' });
         }
 
-        if (questionData.type === 'coding' || questionData.type === 'fillInTheBlanksCoding') {
+        if (questionData.type === 'coding' || questionData.type === 'fillInTheBlanksCoding' || questionData.type === 'codingWithDriver') {
             if (!Array.isArray(questionData.languages) || questionData.languages.length === 0) {
                 console.error('[Question Assignment] Error: No languages');
                 return res.status(400).json({ error: 'At least one language required' });
@@ -737,6 +850,18 @@ exports.assignQuestion = async (req, res) => {
             if (questionData.memoryLimit <= 0) {
                 console.error('[Question Assignment] Error: Invalid memory limit');
                 return res.status(400).json({ error: 'Memory limit must be positive' });
+            }
+            if (questionData.type === 'codingWithDriver') {
+                if (!Array.isArray(questionData.driverCode) || questionData.driverCode.length === 0) {
+                    console.error('[Question Assignment] Error: Driver code required for codingWithDriver');
+                    return res.status(400).json({ error: 'Driver code required for LeetCode-style questions' });
+                }
+                const hasPlaceholder = questionData.driverCode.every(dc =>
+                    dc.code && (dc.code.includes('{{USER_CODE}}') || dc.code.includes('// USER_CODE_HERE') || dc.code.includes('# USER_CODE_HERE'))
+                );
+                if (!hasPlaceholder) {
+                    console.warn('[Question Assignment] Driver code should contain {{USER_CODE}} or // USER_CODE_HERE or # USER_CODE_HERE');
+                }
             }
         }
 
@@ -799,7 +924,7 @@ exports.editQuestion = async (req, res) => {
             return res.status(400).json({ error: 'Type and title required' });
         }
 
-        if (questionData.type === 'coding' || questionData.type === 'fillInTheBlanksCoding') {
+        if (questionData.type === 'coding' || questionData.type === 'fillInTheBlanksCoding' || questionData.type === 'codingWithDriver') {
             if (!Array.isArray(questionData.languages) || questionData.languages.length === 0) {
                 console.error('[Edit Question] Error: No languages');
                 return res.status(400).json({ error: 'At least one language required' });
@@ -827,6 +952,14 @@ exports.editQuestion = async (req, res) => {
             if (questionData.memoryLimit <= 0) {
                 console.error('[Edit Question] Error: Invalid memory limit');
                 return res.status(400).json({ error: 'Memory limit must be positive' });
+            }
+            if (questionData.type === 'codingWithDriver' && questionData.driverCode) {
+                const hasPlaceholder = questionData.driverCode.every(dc =>
+                    dc.code && (dc.code.includes('{{USER_CODE}}') || dc.code.includes('// USER_CODE_HERE') || dc.code.includes('# USER_CODE_HERE'))
+                );
+                if (!hasPlaceholder && questionData.driverCode.length > 0) {
+                    console.warn('[Edit Question] Driver code should contain {{USER_CODE}} or // USER_CODE_HERE or # USER_CODE_HERE');
+                }
             }
         }
 
@@ -1560,15 +1693,23 @@ exports.viewSubmissionCode = async (req, res) => {
         }
 
         console.log('[View Submission Code] Submission fetched:', submissionId);
+        const qId = submission.questionId?._id || submission.questionId;
+        const isCorrect = Boolean(submission.isCorrect);
         res.status(200).json({ 
+            questionId: qId,
+            classId: submission.classId,
             code: submission.answer,
-            language: submission.language,
-            questionTitle: submission.questionId.title,
-            studentName: submission.studentId.name,
-            studentEmail: submission.studentId.email,
-            isCorrect: submission.isCorrect,
+            language: submission.language || 'javascript',
+            questionTitle: submission.questionId?.title || 'Question',
+            studentName: submission.studentId?.name || 'Student',
+            studentEmail: submission.studentId?.email || '',
+            isCorrect,
             score: submission.score,
             submittedAt: submission.submittedAt,
+            status: submission.status || (isCorrect ? 'accepted' : 'wrong_answer'),
+            passedTestCases: submission.passedTestCases ?? 0,
+            totalTestCases: submission.totalTestCases ?? 0,
+            output: submission.output,
         });
     } catch (err) {
         console.error('[View Submission Code] Error:', err.message);
@@ -1871,9 +2012,9 @@ exports.teacherTestQuestion = async (req, res) => {
         }
 
         // Only coding questions can be tested
-        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
+        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding' && question.type !== 'codingWithDriver') {
             console.error('[Teacher Test Question] ERROR: Not a coding question. Type:', question.type);
-            return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be tested' });
+            return res.status(400).json({ error: 'Only coding, fillInTheBlanksCoding, or codingWithDriver questions can be tested' });
         }
 
         console.log('[Teacher Test Question] Question type is valid:', question.type);
@@ -1922,6 +2063,12 @@ exports.teacherTestQuestion = async (req, res) => {
             }
             codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Teacher Test Question] Combined code for execution (length:', codeToExecute.length, ')');
+        } else if (shouldMergeDriverForLanguage(question, language)) {
+            const driverCodeObj = question.driverCode.find(d => d.language === language);
+            if (driverCodeObj && driverCodeObj.code) {
+                codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
+                console.log('[Teacher Test Question] Combined driver + user code (LeetCode-style)');
+            }
         } else {
             console.log('[Teacher Test Question] Processing coding question. Code length:', codeToExecute.length);
         }
@@ -1951,7 +2098,8 @@ exports.teacherTestQuestion = async (req, res) => {
                 codeToExecute,
                 question.testCases, // ALL test cases
                 timeLimit,
-                memoryLimit
+                memoryLimit,
+                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
             );
             
             console.log('[Teacher Test Question] ====== CODE EXECUTION COMPLETE ======');
@@ -2071,9 +2219,9 @@ exports.teacherTestWithCustomInput = async (req, res) => {
         }
 
         // Only coding questions can be tested
-        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding') {
+        if (question.type !== 'coding' && question.type !== 'fillInTheBlanksCoding' && question.type !== 'codingWithDriver') {
             console.error('[Teacher Test With Custom Input] Error: Not a coding question');
-            return res.status(400).json({ error: 'Only coding or fillInTheBlanksCoding questions can be tested' });
+            return res.status(400).json({ error: 'Only coding, fillInTheBlanksCoding, or codingWithDriver questions can be tested' });
         }
 
         // Validate language
@@ -2096,6 +2244,12 @@ exports.teacherTestWithCustomInput = async (req, res) => {
             }
             codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Teacher Test With Custom Input] Combined code for execution');
+        } else if (shouldMergeDriverForLanguage(question, language)) {
+            const driverCodeObj = question.driverCode.find(d => d.language === language);
+            if (driverCodeObj && driverCodeObj.code) {
+                codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
+                console.log('[Teacher Test With Custom Input] Combined driver + user code (LeetCode-style)');
+            }
         }
 
         // Create custom test case - NO FORMAT VALIDATION for teachers
@@ -2114,7 +2268,8 @@ exports.teacherTestWithCustomInput = async (req, res) => {
                 codeToExecute,
                 customTestCase,
                 question.timeLimit,
-                question.memoryLimit
+                question.memoryLimit,
+                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
             );
             console.log('[Teacher Test With Custom Input] Test results:', testResults);
         } catch (err) {

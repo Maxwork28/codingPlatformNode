@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const mongoose = require('mongoose');
 const http = require('http');
@@ -76,8 +78,11 @@ io.on('connection', (socket) => {
 //     }
 // }
 
-mongoose.connect('mongodb://localhost:27017/education_platform').then(async () => {
-    console.log('MongoDB connected');
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/education_platform';
+const PORT = Number(process.env.PORT) || 3000;
+
+mongoose.connect(MONGO_URI).then(async () => {
+    console.log('MongoDB connected:', mongoose.connection.name);
     // await createInitialAdmin();
-    server.listen(3001, () => console.log('Server started on port 3001'));
+    server.listen(PORT, () => console.log(`Server started on port ${PORT}`));
 }).catch(err => console.error('MongoDB connection error:', err));

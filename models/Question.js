@@ -9,7 +9,10 @@ const classSettingsSchema = new mongoose.Schema({
 const testCaseSchema = new mongoose.Schema({
     input: { type: String, required: true },
     expectedOutput: { type: String, required: true },
-    isPublic: { type: Boolean, default: false }
+    isPublic: { type: Boolean, default: false },
+    isLargeTestCase: { type: Boolean, default: false },
+    timeLimit: { type: Number },
+    memoryLimit: { type: Number }
 });
 
 const questionSchema = new mongoose.Schema({

@@ -140,8 +140,9 @@ async function testDockerEnvironment() {
         for (const test of testCases) {
             console.log('[Test Case] Running with input:', test.input, '| Expected:', test.expectedOutput);
 
+            const inputB64 = Buffer.from(String(test.input ?? ''), 'utf8').toString('base64');
             const exec = await container.exec({
-                Cmd: ['bash', '-c', `echo "${test.input}" | ${config.runCmd.join(' ')}`],
+                Cmd: ['bash', '-c', `printf '%s' '${inputB64}' | base64 -d | ${config.runCmd.join(' ')}`],
                 AttachStdin: true,
                 AttachStdout: true,
                 AttachStderr: true,

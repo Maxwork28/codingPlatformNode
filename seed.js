@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const mongoose = require('mongoose');
 const { faker } = require('@faker-js/faker');
 const bcrypt = require('bcrypt');
@@ -77,6 +79,14 @@ const questionSchema = new mongoose.Schema({
   correctAnswer: { type: String },
   codeSnippet: { type: String },
   starterCode: [{
+    language: { type: String, enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'] },
+    code: { type: String }
+  }],
+  templateCode: [{
+    language: { type: String, enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'] },
+    code: { type: String }
+  }],
+  driverCode: [{
     language: { type: String, enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'] },
     code: { type: String }
   }],
@@ -325,8 +335,8 @@ const Leaderboard = mongoose.model('Leaderboard', leaderboardSchema);
 const Exam = mongoose.model('Exam', examSchema);
 const ExamAttempt = mongoose.model('ExamAttempt', examAttemptSchema);
 
-// MongoDB connection
-const MONGO_URI = 'mongodb://localhost:27017/education_platform';
+// MongoDB connection (same as server.js / getTestIds.js when .env is set)
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/education_platform';
 const SALT_ROUNDS = 10;
 
 // Sample data configurations
@@ -431,7 +441,7 @@ const QUESTION_DATA = [
   },
   {
     title: 'Find the Maximum Element',
-    description: 'Write a function to find the maximum element in an array of integers.',
+    description: 'Write a function to find the maximum element in an array of integers. Your program must read one JSON value from stdin (a bare array like [1,2,3]) and print the result.',
     type: 'coding',
     difficulty: 'medium',
     level: 'intermediate',
@@ -439,8 +449,30 @@ const QUESTION_DATA = [
     timeLimit: 3,
     memoryLimit: 256,
     starterCode: [
-      { language: 'javascript', code: 'function findMax(arr) {\n  // Your code here\n}' },
-      { language: 'python', code: 'def find_max(arr):\n    # Your code here\n' }
+      {
+        language: 'javascript',
+        code:
+          "const fs = require('fs');\n" +
+          'function findMax(arr) {\n' +
+          '  // Your code here\n' +
+          '}\n' +
+          "const raw = fs.readFileSync(0, 'utf8').trim();\n" +
+          'const data = JSON.parse(raw);\n' +
+          'const arr = Array.isArray(data) ? data : data.arr;\n' +
+          'console.log(findMax(arr));\n'
+      },
+      {
+        language: 'python',
+        code:
+          'import json\n' +
+          'import sys\n\n' +
+          'def find_max(arr):\n' +
+          '    # Your code here\n' +
+          '    pass\n\n' +
+          'data = json.loads(sys.stdin.read().strip())\n' +
+          "arr = data if isinstance(data, list) else data['arr']\n" +
+          'print(find_max(arr))\n'
+      }
     ],
     testCases: [
       { input: '[1, 5, 3, 9, 2]', expectedOutput: '9', isPublic: true },
@@ -454,6 +486,36 @@ const QUESTION_DATA = [
     hints: ['Track the largest value while iterating.', 'Handle negative numbers.'],
     solution: 'Iterate through the array and update the maximum value.',
     explanation: 'The solution iterates through the array to find the largest element.'
+  },
+  {
+    title: 'Find Maximum (LeetCode-style)',
+    description: 'Write a function to find the maximum element in an array of integers. You only need to implement the function—input/output is handled by the platform.',
+    type: 'codingWithDriver',
+    difficulty: 'easy',
+    level: 'beginner',
+    points: 10,
+    timeLimit: 2,
+    memoryLimit: 256,
+    starterCode: [
+      { language: 'javascript', code: 'function findMax(arr) {\n  // Your code here\n  return 0;\n}' },
+      { language: 'python', code: 'def find_max(arr):\n    # Your code here\n    pass' }
+    ],
+    driverCode: [
+      { language: 'javascript', code: '// {{USER_CODE}}\n\nconst fs = require(\'fs\');\nconst data = JSON.parse(fs.readFileSync(0, \'utf8\').trim());\nconst result = findMax(data.arr);\nconsole.log(result);\n' },
+      { language: 'python', code: 'import json\n\n# {{USER_CODE}}\n\nif __name__ == "__main__":\n    data = json.loads(input())\n    arr = data["arr"]\n    result = find_max(arr)\n    print(result)' }
+    ],
+    testCases: [
+      { input: '{"arr": [1, 5, 3, 9, 2]}', expectedOutput: '9', isPublic: true },
+      { input: '{"arr": [-1, -5, -3]}', expectedOutput: '-1', isPublic: true },
+      { input: '{"arr": [42]}', expectedOutput: '42', isPublic: false }
+    ],
+    constraints: '1 <= arr.length <= 1000, -10^9 <= arr[i] <= 10^9',
+    examples: ['Input: [1, 5, 3, 9, 2] -> Output: 9', 'Input: [-1, -5, -3] -> Output: -1'],
+    languages: ['javascript', 'python'],
+    tags: ['array', 'algorithm', 'leetcode-style'],
+    hints: ['Use max(arr) in Python or Math.max(...arr) in JavaScript.', 'Or iterate and track the largest value.'],
+    solution: 'def find_max(arr): return max(arr)',
+    explanation: 'The solution returns the maximum element. Students only implement the function.'
   },
   {
     title: 'Binary Search Implementation',
@@ -754,12 +816,18 @@ async function seedDatabase() {
         question.correctOptions = questionData.correctOptions;
       } else if (questionData.type === 'fillInTheBlanks') {
         question.correctAnswer = questionData.correctAnswer;
-      } else if (questionData.type === 'coding' || questionData.type === 'fillInTheBlanksCoding') {
+      } else if (questionData.type === 'coding' || questionData.type === 'fillInTheBlanksCoding' || questionData.type === 'codingWithDriver') {
         question.starterCode = questionData.starterCode;
         question.testCases = questionData.testCases;
         question.constraints = questionData.constraints;
         question.examples = questionData.examples;
         question.languages = questionData.languages;
+        if (questionData.type === 'codingWithDriver' && questionData.driverCode) {
+          question.driverCode = questionData.driverCode;
+        }
+        if (questionData.templateCode) {
+          question.templateCode = questionData.templateCode;
+        }
       }
 
       questions.push(question);
@@ -768,6 +836,7 @@ async function seedDatabase() {
     // Generate additional questions to reach 500+
     const questionTemplates = [
       { type: 'coding', baseTitle: 'Two Sum Problem', difficulty: 'easy', level: 'beginner' },
+      { type: 'codingWithDriver', baseTitle: 'Find Max (LeetCode-style)', difficulty: 'easy', level: 'beginner' },
       { type: 'coding', baseTitle: 'Palindrome Check', difficulty: 'easy', level: 'beginner' },
       { type: 'coding', baseTitle: 'Array Rotation', difficulty: 'medium', level: 'intermediate' },
       { type: 'coding', baseTitle: 'Merge Sorted Arrays', difficulty: 'medium', level: 'intermediate' },
@@ -838,7 +907,7 @@ async function seedDatabase() {
         question.correctOptions = [randomInt(0, 3), randomInt(0, 3)].filter((v, i, a) => a.indexOf(v) === i);
       } else if (questionType === 'fillInTheBlanks') {
         question.correctAnswer = faker.lorem.word();
-      } else if (questionType === 'coding' || questionType === 'fillInTheBlanksCoding') {
+      } else if (questionType === 'coding' || questionType === 'fillInTheBlanksCoding' || questionType === 'codingWithDriver') {
         const selectedLanguages = faker.helpers.arrayElements(LANGUAGES, randomInt(2, 5));
         question.starterCode = selectedLanguages.map(lang => ({
           language: lang,
@@ -852,6 +921,29 @@ async function seedDatabase() {
         question.constraints = faker.lorem.sentence();
         question.examples = [faker.lorem.sentence(), faker.lorem.sentence()];
         question.languages = selectedLanguages;
+        if (questionType === 'codingWithDriver') {
+          question.driverCode = selectedLanguages.map(lang => ({
+            language: lang,
+            code:
+              lang === 'python'
+                ? 'import json\n\n# {{USER_CODE}}\n\nif __name__ == "__main__":\n    data = json.loads(input())\n    arr = data["arr"] if isinstance(data, dict) else data\n    result = solution(arr)\n    print(result)'
+                : '// {{USER_CODE}}\n\nconst fs = require(\'fs\');\nconst data = JSON.parse(fs.readFileSync(0, \'utf8\').trim());\nconst arr = Array.isArray(data) ? data : data.arr;\nconst result = solution(arr);\nconsole.log(typeof result === \'object\' ? JSON.stringify(result) : result);\n'
+          }));
+          question.testCases = [
+            { input: '{"arr":[1,2,3]}', expectedOutput: '3', isPublic: true },
+            { input: '{"arr":[-1,5,0]}', expectedOutput: '5', isPublic: true },
+            { input: '{"arr":[10]}', expectedOutput: '10', isPublic: false }
+          ];
+          question.starterCode = selectedLanguages.map((lang) => ({
+            language: lang,
+            code:
+              lang === 'python'
+                ? 'def solution(arr):\n    # Your code here\n    pass'
+                : lang === 'javascript'
+                  ? 'function solution(arr) {\n  // Your code here\n}'
+                  : `// ${lang}\nfunction solution(arr) {\n  // Your code here\n}`
+          }));
+        }
       }
       
       questions.push(question);
@@ -916,7 +1008,7 @@ async function seedDatabase() {
       const student = randomChoice(cls.students);
       const isCorrect = Math.random() > 0.3;
       const isRun = Math.random() > 0.7;
-      const isCustomInput = isRun && (question.type === 'coding' || question.type === 'fillInTheBlanksCoding') && Math.random() > 0.8;
+      const isCustomInput = isRun && (question.type === 'coding' || question.type === 'fillInTheBlanksCoding' || question.type === 'codingWithDriver') && Math.random() > 0.8;
 
       let answer;
       if (question.type === 'singleCorrectMcq') {

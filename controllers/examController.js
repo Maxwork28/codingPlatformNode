@@ -3,7 +3,12 @@ const ExamAttempt = require('../models/ExamAttempt');
 const Class = require('../models/Class');
 const Submission = require('../models/Submission');
 const Question = require('../models/Question');
-const { executeDockerCode } = require('./questionController');
+const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
+const {
+    executeDockerCode,
+    shouldMergeDriverForLanguage,
+    shouldWrapBareArrayStdinForQuestion
+} = require('./questionController');
 
 const sanitizeQuestionForExam = (questionDoc) => ({
     _id: questionDoc._id,
@@ -689,11 +694,10 @@ exports.submitAnswer = async (req, res) => {
             let codeToExecute = answer;
             if (question.type === 'fillInTheBlanksCoding') {
                 codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
-            } else if (question.type === 'codingWithDriver' && question.driverCode) {
+            } else if (shouldMergeDriverForLanguage(question, language)) {
                 const driverCodeObj = question.driverCode.find(d => d.language === language);
-                if (driverCodeObj) {
-                    // Combine user code with driver code
-                    codeToExecute = driverCodeObj.code.replace('// USER_CODE_HERE', answer);
+                if (driverCodeObj && driverCodeObj.code) {
+                    codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
                 }
             }
 
@@ -703,7 +707,8 @@ exports.submitAnswer = async (req, res) => {
                     codeToExecute,
                     question.testCases,
                     question.timeLimit,
-                    question.memoryLimit
+                    question.memoryLimit,
+                    { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
                 );
                 totalTestCases = testResults.length;
                 passedTestCases = testResults.filter(test => test.passed).length;
