@@ -343,22 +343,14 @@ const SALT_ROUNDS = 10;
 const DIFFICULTIES = ['easy', 'medium', 'hard'];
 const LEVELS = ['beginner', 'intermediate', 'advanced'];
 const QUESTION_TYPES = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'];
-const LANGUAGES = ['javascript', 'python', 'java', 'cpp', 'c', 'php', 'ruby', 'go'];
-const ACTIVITY_STATUSES = ['active', 'inactive', 'focused'];
 
-// Realistic class data
+// Minimal seed: single demo class only
 const CLASS_DATA = [
-  { name: 'CS101: Introduction to Programming', description: 'Learn the basics of programming using Python.' },
-  { name: 'CS201: Data Structures', description: 'Explore fundamental data structures like arrays, linked lists, stacks, and queues.' },
-  { name: 'CS301: Algorithms', description: 'Study algorithm design and analysis.' },
-  { name: 'CS102: Web Development Basics', description: 'Build dynamic websites using HTML, CSS, and JavaScript.' },
-  { name: 'CS202: Object-Oriented Programming', description: 'Master OOP concepts in Java.' },
-  { name: 'CS302: Database Systems', description: 'Learn about relational databases, SQL, and NoSQL.' },
-  { name: 'CS103: Introduction to JavaScript', description: 'Get started with JavaScript.' },
-  { name: 'CS203: Advanced Python Programming', description: 'Dive deeper into Python.' },
-  { name: 'CS303: Competitive Programming', description: 'Prepare for coding competitions.' },
-  { name: 'CS401: Software Engineering', description: 'Learn software development methodologies.' },
-  { name: 'Demo Class', description: 'A demo class with all questions available, published, enabled, and assigned. Perfect for testing and practice! Login with demo@example.com.' }
+  {
+    name: 'Demo Class',
+    description:
+      'A demo class with all questions available, published, enabled, and assigned. Login with demo@example.com.'
+  }
 ];
 
 // Realistic question data
@@ -579,6 +571,178 @@ const QUESTION_DATA = [
   }
 ];
 
+/** Build a Question document from QUESTION_DATA row(s); all questions attach only to Demo Class (published, enabled). */
+function buildQuestionDoc(questionData, createdById, demoClassId) {
+  const question = {
+    classes: [
+      {
+        classId: demoClassId,
+        isPublished: true,
+        isDisabled: false
+      }
+    ],
+    title: questionData.title,
+    description: questionData.description,
+    difficulty: questionData.difficulty,
+    level: questionData.level,
+    points: questionData.points,
+    createdBy: createdById,
+    hints: questionData.hints,
+    solution: questionData.solution,
+    type: questionData.type,
+    timeLimit: questionData.timeLimit,
+    memoryLimit: questionData.memoryLimit,
+    tags: questionData.tags,
+    explanation: questionData.explanation,
+    updatedAt: new Date()
+  };
+
+  if (questionData.type === 'singleCorrectMcq') {
+    question.options = questionData.options;
+    question.correctOption = questionData.correctOption;
+  } else if (questionData.type === 'multipleCorrectMcq') {
+    question.options = questionData.options;
+    question.correctOptions = questionData.correctOptions;
+  } else if (questionData.type === 'fillInTheBlanks') {
+    question.correctAnswer = questionData.correctAnswer;
+  } else if (
+    questionData.type === 'coding' ||
+    questionData.type === 'fillInTheBlanksCoding' ||
+    questionData.type === 'codingWithDriver'
+  ) {
+    question.starterCode = questionData.starterCode;
+    question.testCases = questionData.testCases;
+    question.constraints = questionData.constraints;
+    question.examples = questionData.examples;
+    question.languages = questionData.languages;
+    if (questionData.type === 'codingWithDriver' && questionData.driverCode) {
+      question.driverCode = questionData.driverCode;
+    }
+    if (questionData.templateCode) {
+      question.templateCode = questionData.templateCode;
+    }
+  }
+
+  return question;
+}
+
+/** Pad to 10 per type: use QUESTION_DATA seeds first, then generic placeholders. */
+function buildAllQuestions(createdById, demoClassId) {
+  const byType = {};
+  for (const t of QUESTION_TYPES) {
+    byType[t] = [];
+  }
+  for (const row of QUESTION_DATA) {
+    byType[row.type].push(buildQuestionDoc(row, createdById, demoClassId));
+  }
+
+  let genIndex = 0;
+  for (const type of QUESTION_TYPES) {
+    while (byType[type].length < 10) {
+      genIndex += 1;
+      byType[type].push(generateGenericQuestion(type, genIndex, createdById, demoClassId));
+    }
+  }
+
+  return QUESTION_TYPES.flatMap((t) => byType[t]);
+}
+
+function generateGenericQuestion(type, index, createdById, demoClassId) {
+  const base = {
+    classes: [{ classId: demoClassId, isPublished: true, isDisabled: false }],
+    title: `Sample ${type} #${index}`,
+    description: faker.lorem.paragraph(),
+    difficulty: randomChoice(DIFFICULTIES),
+    level: randomChoice(LEVELS),
+    points: randomInt(5, 20),
+    createdBy: createdById,
+    hints: [faker.lorem.sentence()],
+    solution: faker.lorem.sentence(),
+    type,
+    timeLimit: randomInt(1, 4),
+    memoryLimit: 256,
+    tags: faker.helpers.arrayElements(['practice', 'demo', 'generic'], randomInt(1, 3)),
+    explanation: faker.lorem.sentence(),
+    updatedAt: new Date()
+  };
+
+  if (type === 'singleCorrectMcq') {
+    base.options = [
+      faker.lorem.words(3),
+      faker.lorem.words(3),
+      faker.lorem.words(3),
+      faker.lorem.words(3)
+    ];
+    base.correctOption = randomInt(0, 3);
+  } else if (type === 'multipleCorrectMcq') {
+    base.options = [
+      faker.lorem.words(2),
+      faker.lorem.words(2),
+      faker.lorem.words(2),
+      faker.lorem.words(2)
+    ];
+    const a = randomInt(0, 3);
+    let b = randomInt(0, 3);
+    if (b === a) b = (a + 1) % 4;
+    base.correctOptions = [a, b].sort((x, y) => x - y);
+  } else if (type === 'fillInTheBlanks') {
+    base.correctAnswer = faker.lorem.word();
+  } else if (type === 'fillInTheBlanksCoding') {
+    base.starterCode = [
+      { language: 'javascript', code: 'function f(n) {\n  // ___FILL_IN_THE_BLANK___\n}' },
+      { language: 'python', code: 'def f(n):\n    # ___FILL_IN_THE_BLANK___\n' }
+    ];
+    base.testCases = [
+      { input: '3', expectedOutput: '6', isPublic: true },
+      { input: '0', expectedOutput: '1', isPublic: true },
+      { input: '4', expectedOutput: '24', isPublic: false }
+    ];
+    base.constraints = '0 <= n <= 12';
+    base.examples = ['Input: 3 -> Output: 6'];
+    base.languages = ['javascript', 'python'];
+  } else if (type === 'coding') {
+    base.starterCode = [
+      { language: 'javascript', code: 'function sum(a, b) {\n  // Your code\n}' },
+      { language: 'python', code: 'def sum(a, b):\n    pass\n' }
+    ];
+    base.testCases = [
+      { input: '1 2', expectedOutput: '3', isPublic: true },
+      { input: '0 0', expectedOutput: '0', isPublic: true },
+      { input: '-1 5', expectedOutput: '4', isPublic: false }
+    ];
+    base.constraints = 'Integers only';
+    base.examples = ['Input: 1 2 -> Output: 3'];
+    base.languages = ['javascript', 'python'];
+  } else if (type === 'codingWithDriver') {
+    base.starterCode = [
+      { language: 'javascript', code: 'function sumPair(a, b) {\n  return 0;\n}' },
+      { language: 'python', code: 'def sum_pair(a, b):\n    pass' }
+    ];
+    base.driverCode = [
+      {
+        language: 'javascript',
+        code:
+          "// {{USER_CODE}}\nconst fs = require('fs');\nconst d = JSON.parse(fs.readFileSync(0, 'utf8').trim());\nconsole.log(sumPair(d.a, d.b));\n"
+      },
+      {
+        language: 'python',
+        code:
+          'import json\n# {{USER_CODE}}\nif __name__ == "__main__":\n    d = json.loads(input())\n    print(sum_pair(d["a"], d["b"]))'
+      }
+    ];
+    base.testCases = [
+      { input: '{"a":1,"b":2}', expectedOutput: '3', isPublic: true },
+      { input: '{"a":0,"b":0}', expectedOutput: '0', isPublic: true },
+      { input: '{"a":-2,"b":7}', expectedOutput: '5', isPublic: false }
+    ];
+    base.constraints = 'a, b are integers';
+    base.examples = ['Input: a=1 b=2 -> Output: 3'];
+    base.languages = ['javascript', 'python'];
+  }
+
+  return base;
+}
+
 // Utility functions
 const randomChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -603,403 +767,91 @@ async function seedDatabase() {
     ]);
     console.log('[Seed] Existing data cleared');
 
-    // Generate Users - At least 500 total
-    console.log('[Seed] Generating users...');
+    // Minimal users: 1 admin, 1 teacher, 1 student (demo)
+    console.log('[Seed] Generating users (minimal)...');
     const hashedPassword = await bcrypt.hash('Password123!', SALT_ROUNDS);
-    const users = [];
-
-    // Admins (10 admins)
-    for (let i = 0; i < 10; i++) {
-      users.push({
-        name: faker.person.fullName(),
-        email: `admin${i + 1}@example.com`,
-        number: faker.phone.number(),
+    const users = [
+      {
+        name: 'Admin One',
+        email: 'admin1@example.com',
+        number: '1000000000',
         role: 'admin',
         password: hashedPassword,
         canCreateQuestion: true,
         isBlocked: {}
-      });
-    }
-
-    // Teachers (50 teachers)
-    for (let i = 0; i < 50; i++) {
-      users.push({
-        name: faker.person.fullName(),
-        email: `teacher${i + 1}@example.com`,
-        number: faker.phone.number(),
+      },
+      {
+        name: 'Teacher One',
+        email: 'teacher1@example.com',
+        number: '1000000001',
         role: 'teacher',
         password: hashedPassword,
         canCreateQuestion: true,
         isBlocked: {}
-      });
-    }
-
-    // Demo Student
-    users.push({
-      name: 'Demo Student',
-      email: 'demo@example.com',
-      number: faker.phone.number(),
-      role: 'student',
-      password: hashedPassword,
-      canCreateQuestion: false,
-      isBlocked: {}
-    });
-
-    // Students (at least 500 students to ensure 500+ total users)
-    for (let i = 0; i < 500; i++) {
-      users.push({
-        name: faker.person.fullName(),
-        email: `student${i + 1}@example.com`,
-        number: faker.phone.number(),
+      },
+      {
+        name: 'Demo Student',
+        email: 'demo@example.com',
+        number: '1000000002',
         role: 'student',
         password: hashedPassword,
         canCreateQuestion: false,
         isBlocked: {}
-      });
-    }
+      }
+    ];
 
     const insertedUsers = await User.insertMany(users);
     console.log(`[Seed] Inserted ${insertedUsers.length} users`);
 
-    const adminUsers = insertedUsers.filter((u) => u.role === 'admin');
-    const teacherUsers = insertedUsers.filter((u) => u.role === 'teacher');
-    const studentUsers = insertedUsers.filter((u) => u.role === 'student');
-
-    // Generate Classes - At least 500 classes
-    console.log('[Seed] Generating classes...');
-    const classes = [];
-    const student1 = insertedUsers.find((u) => u.email === 'student1@example.com');
+    const teacher = insertedUsers.find((u) => u.role === 'teacher');
     const demoStudent = insertedUsers.find((u) => u.email === 'demo@example.com');
-    
-    // First, add the predefined classes (including Demo Class)
-    for (const classData of CLASS_DATA) {
-      const numTeachers = randomInt(1, 3);
-      const numStudents = randomInt(15, 30);
-      let selectedStudents = faker.helpers.arrayElements(studentUsers, numStudents);
-      if (classData.name === 'Demo Class') {
-        // Ensure demo@example.com and student1@example.com are included in Demo Class
-        const otherStudents = faker.helpers.arrayElements(
-          studentUsers.filter((s) => 
-            s._id.toString() !== student1?._id.toString() && 
-            s._id.toString() !== demoStudent?._id.toString()
-          ),
-          numStudents - 2
-        );
-        selectedStudents = [
-          ...(demoStudent ? [demoStudent] : []),
-          ...(student1 ? [student1] : []),
-          ...otherStudents
-        ].filter(Boolean);
-      }
-      classes.push({
+
+    console.log('[Seed] Generating Demo Class...');
+    const classData = CLASS_DATA[0];
+    const insertedClasses = await Class.insertMany([
+      {
         name: classData.name,
         description: classData.description,
-        createdBy: randomChoice(teacherUsers)._id,
-        teachers: faker.helpers.arrayElements(teacherUsers, numTeachers).map((t) => t._id),
-        students: selectedStudents.map((s) => s._id),
+        createdBy: teacher._id,
+        teachers: [teacher._id],
+        students: [demoStudent._id],
         status: 'active',
         questions: [],
         assignments: [],
         totalRuns: 0,
         totalSubmits: 0
-      });
-    }
-    
-    // Generate additional classes to reach 500+
-    const additionalClassNames = [
-      'CS104: Advanced Programming', 'CS204: Data Structures II', 'CS304: Advanced Algorithms',
-      'CS105: Software Development', 'CS205: Database Design', 'CS305: Machine Learning',
-      'CS106: Mobile Development', 'CS206: Web Development II', 'CS306: Cloud Computing',
-      'CS107: Game Development', 'CS207: Network Programming', 'CS307: Distributed Systems',
-      'CS108: UI/UX Design', 'CS208: Security Fundamentals', 'CS308: Blockchain Technology',
-      'MATH101: Calculus I', 'MATH201: Linear Algebra', 'MATH301: Statistics',
-      'PHYS101: Physics I', 'PHYS201: Physics II', 'CHEM101: Chemistry Basics',
-      'ENG101: English Composition', 'HIST101: World History', 'ECON101: Economics',
-      'BIO101: Biology I', 'BIO201: Biology II', 'PSYCH101: Psychology',
-      'CS401: Capstone Project', 'CS402: Research Methods', 'CS403: Thesis',
-      'CS501: Graduate Algorithms', 'CS502: Advanced Databases', 'CS503: AI Research'
-    ];
-    
-    const totalClassesNeeded = 500;
-    const remainingClasses = totalClassesNeeded - classes.length;
-    
-    for (let i = 0; i < remainingClasses; i++) {
-      const classIndex = i % additionalClassNames.length;
-      const baseName = additionalClassNames[classIndex];
-      const numTeachers = randomInt(1, 3);
-      const numStudents = randomInt(10, 40);
-      const selectedStudents = faker.helpers.arrayElements(studentUsers, Math.min(numStudents, studentUsers.length));
-      
-      classes.push({
-        name: `${baseName} - Section ${Math.floor(i / additionalClassNames.length) + 1}`,
-        description: faker.lorem.sentence(),
-        createdBy: randomChoice(teacherUsers)._id,
-        teachers: faker.helpers.arrayElements(teacherUsers, Math.min(numTeachers, teacherUsers.length)).map((t) => t._id),
-        students: selectedStudents.map((s) => s._id),
-        status: Math.random() > 0.1 ? 'active' : 'inactive',
-        questions: [],
-        assignments: [],
-        totalRuns: 0,
-        totalSubmits: 0
-      });
-    }
-
-    const insertedClasses = await Class.insertMany(classes);
-    console.log(`[Seed] Inserted ${insertedClasses.length} classes`);
-
-    // Update isBlocked for students
-    console.log('[Seed] Updating isBlocked for students...');
-    const userBulkOps = [];
-    const demoClassForBlocking = insertedClasses.find((c) => c.name === 'Demo Class');
-    for (const cls of insertedClasses) {
-      for (const studentId of cls.students) {
-        const student = insertedUsers.find((u) => u._id.toString() === studentId.toString());
-        // Never block demo@example.com or any students in Demo Class
-        const shouldBlock = cls.name !== 'Demo Class' && 
-                           student?.email !== 'demo@example.com' && 
-                           Math.random() > 0.9;
-        userBulkOps.push({
-          updateOne: {
-            filter: { _id: studentId },
-            update: { $set: { [`isBlocked.${cls._id}`]: shouldBlock } }
-          }
-        });
       }
-    }
-    if (userBulkOps.length > 0) {
-      await User.bulkWrite(userBulkOps);
-    }
-    console.log('[Seed] isBlocked updated for students');
+    ]);
+    console.log(`[Seed] Inserted ${insertedClasses.length} class(es)`);
 
-    // Generate Questions - At least 500 questions
-    console.log('[Seed] Generating questions...');
-    const questions = [];
+    // 10 questions per type (6 types) = 60 total; QUESTION_DATA seeds + generics
+    console.log('[Seed] Generating questions (10 per type = 60 total)...');
     const demoClass = insertedClasses.find((c) => c.name === 'Demo Class');
-    
-    // First, add the predefined questions
-    for (const questionData of QUESTION_DATA) {
-      const classIds = faker.helpers.arrayElements(
-        insertedClasses.filter((c) => c.name !== 'Demo Class'),
-        randomInt(1, 5)
-      ).map((c) => c._id);
-      
-      // Always include Demo Class as the first entry with published and enabled status
-      const allClassIds = demoClass ? [demoClass._id, ...classIds] : classIds;
-      
-      const question = {
-        classes: allClassIds.map((classId) => ({
-          classId,
-          isPublished: classId.toString() === demoClass?._id.toString() ? true : Math.random() > 0.5,
-          isDisabled: classId.toString() === demoClass?._id.toString() ? false : Math.random() > 0.8
-        })),
-        title: questionData.title,
-        description: questionData.description,
-        difficulty: questionData.difficulty,
-        level: questionData.level,
-        points: questionData.points,
-        createdBy: randomChoice(teacherUsers)._id,
-        hints: questionData.hints,
-        solution: questionData.solution,
-        type: questionData.type,
-        timeLimit: questionData.timeLimit,
-        memoryLimit: questionData.memoryLimit,
-        tags: questionData.tags,
-        explanation: questionData.explanation,
-        updatedAt: new Date()
-      };
-
-      if (questionData.type === 'singleCorrectMcq') {
-        question.options = questionData.options;
-        question.correctOption = questionData.correctOption;
-      } else if (questionData.type === 'multipleCorrectMcq') {
-        question.options = questionData.options;
-        question.correctOptions = questionData.correctOptions;
-      } else if (questionData.type === 'fillInTheBlanks') {
-        question.correctAnswer = questionData.correctAnswer;
-      } else if (questionData.type === 'coding' || questionData.type === 'fillInTheBlanksCoding' || questionData.type === 'codingWithDriver') {
-        question.starterCode = questionData.starterCode;
-        question.testCases = questionData.testCases;
-        question.constraints = questionData.constraints;
-        question.examples = questionData.examples;
-        question.languages = questionData.languages;
-        if (questionData.type === 'codingWithDriver' && questionData.driverCode) {
-          question.driverCode = questionData.driverCode;
-        }
-        if (questionData.templateCode) {
-          question.templateCode = questionData.templateCode;
-        }
-      }
-
-      questions.push(question);
-    }
-    
-    // Generate additional questions to reach 500+
-    const questionTemplates = [
-      { type: 'coding', baseTitle: 'Two Sum Problem', difficulty: 'easy', level: 'beginner' },
-      { type: 'codingWithDriver', baseTitle: 'Find Max (LeetCode-style)', difficulty: 'easy', level: 'beginner' },
-      { type: 'coding', baseTitle: 'Palindrome Check', difficulty: 'easy', level: 'beginner' },
-      { type: 'coding', baseTitle: 'Array Rotation', difficulty: 'medium', level: 'intermediate' },
-      { type: 'coding', baseTitle: 'Merge Sorted Arrays', difficulty: 'medium', level: 'intermediate' },
-      { type: 'coding', baseTitle: 'Binary Tree Traversal', difficulty: 'hard', level: 'advanced' },
-      { type: 'coding', baseTitle: 'Graph Shortest Path', difficulty: 'hard', level: 'advanced' },
-      { type: 'singleCorrectMcq', baseTitle: 'What is a variable?', difficulty: 'easy', level: 'beginner' },
-      { type: 'singleCorrectMcq', baseTitle: 'What is recursion?', difficulty: 'medium', level: 'intermediate' },
-      { type: 'multipleCorrectMcq', baseTitle: 'Data types in Python', difficulty: 'easy', level: 'beginner' },
-      { type: 'multipleCorrectMcq', baseTitle: 'OOP principles', difficulty: 'medium', level: 'intermediate' },
-      { type: 'fillInTheBlanks', baseTitle: 'Complete the loop', difficulty: 'easy', level: 'beginner' },
-      { type: 'fillInTheBlanksCoding', baseTitle: 'Complete the function', difficulty: 'medium', level: 'intermediate' }
-    ];
-    
-    const totalQuestionsNeeded = 500;
-    const remainingQuestions = totalQuestionsNeeded - questions.length;
-    
-    for (let i = 0; i < remainingQuestions; i++) {
-      const template = questionTemplates[i % questionTemplates.length];
-      const questionType = template.type;
-      const difficulty = template.difficulty;
-      const level = template.level;
-      
-      // Assign to random classes
-      const numClasses = randomInt(1, 8);
-      const assignedClasses = faker.helpers.arrayElements(insertedClasses, Math.min(numClasses, insertedClasses.length));
-      const allClassIds = demoClass && !assignedClasses.some(c => c._id.toString() === demoClass._id.toString())
-        ? [demoClass._id, ...assignedClasses.map(c => c._id)]
-        : assignedClasses.map(c => c._id);
-      
-      const question = {
-        classes: allClassIds.map((classId) => ({
-          classId,
-          isPublished: classId.toString() === demoClass?._id.toString() ? true : Math.random() > 0.3,
-          isDisabled: classId.toString() === demoClass?._id.toString() ? false : Math.random() > 0.85
-        })),
-        title: `${template.baseTitle} - ${i + 1}`,
-        description: faker.lorem.paragraph(),
-        difficulty: difficulty,
-        level: level,
-        points: randomInt(5, 25),
-        createdBy: randomChoice(teacherUsers)._id,
-        hints: [faker.lorem.sentence(), faker.lorem.sentence()],
-        solution: faker.lorem.paragraph(),
-        type: questionType,
-        timeLimit: randomInt(1, 5),
-        memoryLimit: randomInt(128, 512),
-        tags: faker.helpers.arrayElements(['algorithm', 'data-structures', 'programming', 'coding', 'practice', 'test'], randomInt(1, 4)),
-        explanation: faker.lorem.paragraph(),
-        updatedAt: faker.date.past()
-      };
-      
-      // Add type-specific fields
-      if (questionType === 'singleCorrectMcq') {
-        question.options = [
-          faker.lorem.sentence(),
-          faker.lorem.sentence(),
-          faker.lorem.sentence(),
-          faker.lorem.sentence()
-        ];
-        question.correctOption = randomInt(0, 3);
-      } else if (questionType === 'multipleCorrectMcq') {
-        question.options = [
-          faker.lorem.sentence(),
-          faker.lorem.sentence(),
-          faker.lorem.sentence(),
-          faker.lorem.sentence()
-        ];
-        question.correctOptions = [randomInt(0, 3), randomInt(0, 3)].filter((v, i, a) => a.indexOf(v) === i);
-      } else if (questionType === 'fillInTheBlanks') {
-        question.correctAnswer = faker.lorem.word();
-      } else if (questionType === 'coding' || questionType === 'fillInTheBlanksCoding' || questionType === 'codingWithDriver') {
-        const selectedLanguages = faker.helpers.arrayElements(LANGUAGES, randomInt(2, 5));
-        question.starterCode = selectedLanguages.map(lang => ({
-          language: lang,
-          code: `// ${lang} starter code\nfunction solution() {\n  // Your code here\n}`
-        }));
-        question.testCases = [
-          { input: faker.lorem.word(), expectedOutput: faker.lorem.word(), isPublic: true },
-          { input: faker.lorem.word(), expectedOutput: faker.lorem.word(), isPublic: true },
-          { input: faker.lorem.word(), expectedOutput: faker.lorem.word(), isPublic: false }
-        ];
-        question.constraints = faker.lorem.sentence();
-        question.examples = [faker.lorem.sentence(), faker.lorem.sentence()];
-        question.languages = selectedLanguages;
-        if (questionType === 'codingWithDriver') {
-          question.driverCode = selectedLanguages.map(lang => ({
-            language: lang,
-            code:
-              lang === 'python'
-                ? 'import json\n\n# {{USER_CODE}}\n\nif __name__ == "__main__":\n    data = json.loads(input())\n    arr = data["arr"] if isinstance(data, dict) else data\n    result = solution(arr)\n    print(result)'
-                : '// {{USER_CODE}}\n\nconst fs = require(\'fs\');\nconst data = JSON.parse(fs.readFileSync(0, \'utf8\').trim());\nconst arr = Array.isArray(data) ? data : data.arr;\nconst result = solution(arr);\nconsole.log(typeof result === \'object\' ? JSON.stringify(result) : result);\n'
-          }));
-          question.testCases = [
-            { input: '{"arr":[1,2,3]}', expectedOutput: '3', isPublic: true },
-            { input: '{"arr":[-1,5,0]}', expectedOutput: '5', isPublic: true },
-            { input: '{"arr":[10]}', expectedOutput: '10', isPublic: false }
-          ];
-          question.starterCode = selectedLanguages.map((lang) => ({
-            language: lang,
-            code:
-              lang === 'python'
-                ? 'def solution(arr):\n    # Your code here\n    pass'
-                : lang === 'javascript'
-                  ? 'function solution(arr) {\n  // Your code here\n}'
-                  : `// ${lang}\nfunction solution(arr) {\n  // Your code here\n}`
-          }));
-        }
-      }
-      
-      questions.push(question);
-    }
-
+    const questions = buildAllQuestions(teacher._id, demoClass._id);
     const insertedQuestions = await Question.insertMany(questions);
     console.log(`[Seed] Inserted ${insertedQuestions.length} questions`);
 
-    // Update Classes with Questions and Assignments
-    console.log('[Seed] Updating classes with questions and assignments...');
-    const classBulkOps = [];
-    const demoClassDoc = insertedClasses.find((c) => c.name === 'Demo Class');
-    for (const cls of insertedClasses) {
-      const classQuestions = insertedQuestions.filter((q) =>
-        q.classes.some((c) => c.classId.toString() === cls._id.toString())
-      );
-      
-      // For Demo Class, add ALL questions as assignments
-      // For other classes, add a random subset
-      const assignments = cls._id.toString() === demoClassDoc?._id.toString()
-        ? classQuestions.map((q) => ({
-            questionId: q._id,
-            assignedAt: new Date(),
-            dueDate: faker.date.future(),
-            maxPoints: q.points
-          }))
-        : classQuestions.slice(0, randomInt(1, classQuestions.length)).map((q) => ({
-            questionId: q._id,
-            assignedAt: new Date(),
-            dueDate: faker.date.future(),
-            maxPoints: q.points
-          }));
+    console.log('[Seed] Updating Demo Class with questions and assignments...');
+    const classQuestions = insertedQuestions;
+    const assignments = classQuestions.map((q) => ({
+      questionId: q._id,
+      assignedAt: new Date(),
+      dueDate: faker.date.future(),
+      maxPoints: q.points
+    }));
+    await Class.updateOne(
+      { _id: demoClass._id },
+      { $set: { questions: classQuestions.map((q) => q._id), assignments } }
+    );
+    console.log('[Seed] Demo Class updated with questions and assignments');
 
-      classBulkOps.push({
-        updateOne: {
-          filter: { _id: cls._id },
-          update: {
-            $set: {
-              questions: classQuestions.map((q) => q._id),
-              assignments
-            }
-          }
-        }
-      });
-    }
-    if (classBulkOps.length > 0) {
-      await Class.bulkWrite(classBulkOps);
-    }
-    console.log('[Seed] Classes updated with questions and assignments');
-
-    // Generate Submissions - At least 500 submissions
-    console.log('[Seed] Generating submissions...');
+    // Minimal submissions for leaderboard smoke test
+    console.log('[Seed] Generating submissions (minimal)...');
     const submissions = [];
-    const targetSubmissionCount = 2000; // Generate more submissions for better testing
+    const targetSubmissionCount = 20;
+    const demoClassId = demoClass._id;
     for (let i = 0; i < targetSubmissionCount; i++) {
-      const cls = randomChoice(insertedClasses);
+      const cls = insertedClasses.find((c) => c._id.toString() === demoClassId.toString()) || randomChoice(insertedClasses);
       const classQuestions = insertedQuestions.filter((q) =>
         q.classes.some((c) => c.classId.toString() === cls._id.toString())
       );
@@ -1102,617 +954,8 @@ async function seedDatabase() {
     }
     console.log(`[Seed] Inserted ${leaderboardEntries.length} leaderboard entries`);
 
-    // Generate Exam Templates - At least 50 templates
-    console.log('[Seed] Generating exam templates...');
-    const templates = [];
-    const templateTitles = [
-      'Midterm Exam Template', 'Final Exam Template', 'Weekly Quiz Template', 'Practice Test Template',
-      'Chapter 1 Quiz Template', 'Chapter 2 Quiz Template', 'Chapter 3 Quiz Template',
-      'Assignment 1 Template', 'Assignment 2 Template', 'Assignment 3 Template',
-      'Lab Exam Template', 'Project Review Template', 'Comprehensive Test Template',
-      'Unit Test Template', 'Module Assessment Template', 'Skill Evaluation Template'
-    ];
-
-    // Generate 50 templates
-    for (let i = 0; i < 50; i++) {
-      const templateTitle = i < templateTitles.length 
-        ? templateTitles[i] 
-        : `Custom Template ${i + 1}`;
-      const templateClass = randomChoice(insertedClasses);
-      const templateQuestions = insertedQuestions
-        .filter(q => q.classes.some(c => c.classId.toString() === templateClass._id.toString()))
-        .slice(0, randomInt(5, 10));
-      
-      if (templateQuestions.length === 0) continue;
-
-      const sections = [
-        {
-          sectionId: 'section-1',
-          title: 'Section 1: Multiple Choice',
-          description: 'Answer all multiple choice questions',
-          durationSeconds: 1800, // 30 minutes
-          allowRevisit: true,
-          order: 0
-        },
-        {
-          sectionId: 'section-2',
-          title: 'Section 2: Coding',
-          description: 'Solve the coding problems',
-          durationSeconds: 3600, // 60 minutes
-          allowRevisit: true,
-          order: 1
-        }
-      ];
-
-      const examQuestions = templateQuestions.map((q, idx) => ({
-        questionId: q._id,
-        points: q.points || 10,
-        order: idx,
-        sectionId: (q.type === 'coding' || q.type === 'fillInTheBlanksCoding' || q.type === 'codingWithDriver') 
-          ? 'section-2' 
-          : 'section-1',
-        timeLimitSeconds: q.type === 'coding' ? 300 : null // 5 minutes for coding questions
-      }));
-
-      templates.push({
-        title: templateTitle,
-        description: `Template for ${templateTitle.toLowerCase()}`,
-        classId: templateClass._id,
-        questions: examQuestions,
-        sections: sections,
-        proctoring: {
-          durationMinutes: 90,
-          startTime: null,
-          endTime: null,
-          autoSubmitOnEnd: true,
-          tabSwitchLimit: 5,
-          copyPasteDisabled: true,
-          fullscreenRequired: true,
-          internetRequired: true,
-          allowRunCode: true
-        },
-        scoring: {
-          immediateScoreRelease: false,
-          releaseStatus: 'not_released',
-          gradingMode: 'auto'
-        },
-        template: {
-          isTemplate: true,
-          templateName: templateTitle,
-          templateDescription: `Reusable template for ${templateTitle.toLowerCase()}`,
-          baseTemplateId: null
-        },
-        createdBy: randomChoice(teacherUsers)._id,
-        status: 'draft'
-      });
-    }
-
-    const insertedTemplates = await Exam.insertMany(templates);
-    console.log(`[Seed] Inserted ${insertedTemplates.length} exam templates`);
-
-    // Generate Regular Exams - At least 500 exams
-    console.log('[Seed] Generating regular exams...');
-    const exams = [];
-    const examTitles = [
-      'Midterm Examination - CS101', 'Final Exam - Data Structures', 'Weekly Quiz - Week 5',
-      'Practice Test - Algorithms', 'Assessment Test - JavaScript Basics',
-      'Chapter 1 Quiz', 'Chapter 2 Quiz', 'Chapter 3 Quiz', 'Chapter 4 Quiz',
-      'Lab Exam 1', 'Lab Exam 2', 'Lab Exam 3', 'Project Review 1', 'Project Review 2',
-      'Unit Test 1', 'Unit Test 2', 'Module Assessment', 'Comprehensive Test',
-      'Skill Evaluation', 'Progress Test', 'Mock Exam', 'Practice Assessment'
-    ];
-
-    const now = new Date();
-    
-    // Create exams in all statuses - distribute 500 exams across statuses
-    const examStatusConfigs = [
-      { status: 'draft', count: 125, hasStartTime: false, hasEndTime: false },
-      { status: 'scheduled', count: 125, hasStartTime: true, hasEndTime: true, startOffset: 1, endOffset: 2 }, // 1-2 days in future
-      { status: 'active', count: 125, hasStartTime: true, hasEndTime: true, startOffset: -0.5, endOffset: 0.5 }, // Started 12h ago, ends in 12h
-      { status: 'completed', count: 125, hasStartTime: true, hasEndTime: true, startOffset: -2, endOffset: -1 } // Ended 1-2 days ago
-    ];
-
-    let examIndex = 0;
-    for (const config of examStatusConfigs) {
-      for (let i = 0; i < config.count; i++) {
-        const examClass = randomChoice(insertedClasses);
-        const classQuestions = insertedQuestions.filter(q =>
-          q.classes.some(c => c.classId.toString() === examClass._id.toString())
-        );
-
-        if (classQuestions.length === 0) continue;
-
-        // Select questions ensuring all types are represented
-        const selectedQuestions = faker.helpers.arrayElements(
-          classQuestions,
-          Math.min(randomInt(5, 15), classQuestions.length)
-        );
-
-        // Create multiple sections for better testing
-        const sections = [
-          {
-            sectionId: 'section-1',
-            title: 'Section 1: Multiple Choice & Fill-in-the-blanks',
-            description: 'Answer all multiple choice and fill-in-the-blank questions',
-            durationSeconds: randomInt(1800, 3600), // 30-60 minutes
-            allowRevisit: true,
-            order: 0
-          },
-          {
-            sectionId: 'section-2',
-            title: 'Section 2: Coding Problems',
-            description: 'Solve the coding problems',
-            durationSeconds: randomInt(3600, 7200), // 60-120 minutes
-            allowRevisit: true,
-            order: 1
-          }
-        ];
-
-        // Distribute questions across sections
-        const examQuestions = selectedQuestions.map((q, idx) => {
-          const isCoding = ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(q.type);
-          return {
-            questionId: q._id,
-            points: q.points || 10,
-            order: idx,
-            sectionId: isCoding ? 'section-2' : 'section-1',
-            timeLimitSeconds: isCoding ? randomInt(180, 600) : null // 3-10 minutes for coding
-          };
-        });
-
-        // Calculate times based on config
-        let startTime = null;
-        let endTime = null;
-        let durationMinutes = 60;
-
-        if (config.hasStartTime) {
-          const startOffsetMs = config.startOffset * 24 * 60 * 60 * 1000; // Convert days to ms
-          startTime = new Date(now.getTime() + startOffsetMs);
-        }
-
-        if (config.hasEndTime && config.hasStartTime) {
-          const endOffsetMs = config.endOffset * 24 * 60 * 60 * 1000;
-          endTime = new Date(now.getTime() + endOffsetMs);
-          durationMinutes = Math.max(30, Math.floor((endTime.getTime() - startTime.getTime()) / (60 * 1000)));
-        } else if (config.hasEndTime) {
-          const endOffsetMs = config.endOffset * 24 * 60 * 60 * 1000;
-          endTime = new Date(now.getTime() + endOffsetMs);
-          durationMinutes = 60; // Default
-        } else {
-          durationMinutes = randomInt(30, 120); // Default duration for drafts
-        }
-
-        exams.push({
-          title: examIndex < examTitles.length 
-            ? `${examTitles[examIndex % examTitles.length]} - ${examClass.name.substring(0, 20)}` 
-            : `${config.status.charAt(0).toUpperCase() + config.status.slice(1)} Exam ${examIndex + 1} - ${examClass.name.substring(0, 20)}`,
-          description: `${config.status.charAt(0).toUpperCase() + config.status.slice(1)} examination for ${examClass.name}`,
-          classId: examClass._id,
-          questions: examQuestions,
-          sections: sections,
-          proctoring: {
-            durationMinutes: durationMinutes,
-            startTime: startTime,
-            endTime: endTime,
-            autoSubmitOnEnd: true,
-            tabSwitchLimit: randomInt(3, 10),
-            copyPasteDisabled: Math.random() > 0.2,
-            fullscreenRequired: Math.random() > 0.3,
-            internetRequired: Math.random() > 0.4,
-            allowRunCode: Math.random() > 0.3
-          },
-          scoring: {
-            immediateScoreRelease: config.status === 'completed' ? Math.random() > 0.5 : false,
-            releaseStatus: config.status === 'completed' && Math.random() > 0.3 ? 'released' : 'not_released',
-            gradingMode: randomChoice(['auto', 'manual', 'mixed'])
-          },
-          template: {
-            isTemplate: false,
-            baseTemplateId: Math.random() > 0.6 && insertedTemplates.length > 0 ? randomChoice(insertedTemplates)._id : null
-          },
-          createdBy: randomChoice([...teacherUsers, ...adminUsers])._id,
-          status: config.status
-        });
-        examIndex++;
-      }
-    }
-
-    const insertedExams = await Exam.insertMany(exams);
-    console.log(`[Seed] Inserted ${insertedExams.length} regular exams`);
-
-    // Add specific exam for student1 (6:00 PM to 6:30 PM)
-    console.log('[Seed] Creating specific exam for student1...');
-    // student1 is already declared earlier in the function, reuse it
-    if (student1) {
-      // Find Demo Class (student1 is explicitly added to Demo Class)
-      const student1Class = insertedClasses.find((c) => c.name === 'Demo Class');
-      
-      if (student1Class) {
-        // Get questions for this class
-        const classQuestions = insertedQuestions.filter(q =>
-          q.classes.some(c => c.classId.toString() === student1Class._id.toString())
-        );
-        
-        if (classQuestions.length > 0) {
-          // Select a mix of questions
-          const selectedQuestions = faker.helpers.arrayElements(
-            classQuestions,
-            Math.min(8, classQuestions.length)
-          );
-          
-          // Create proper sections
-          const sections = [
-            {
-              sectionId: 'section-1',
-              title: 'Section 1: Multiple Choice & Fill-in-the-blanks',
-              description: 'Answer all multiple choice and fill-in-the-blank questions',
-              durationSeconds: 1800, // 30 minutes
-              allowRevisit: true,
-              order: 0
-            },
-            {
-              sectionId: 'section-2',
-              title: 'Section 2: Coding Problems',
-              description: 'Solve the coding problems',
-              durationSeconds: 1800, // 30 minutes
-              allowRevisit: true,
-              order: 1
-            }
-          ];
-          
-          // Distribute questions across sections
-          const examQuestions = selectedQuestions.map((q, idx) => {
-            const isCoding = ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(q.type);
-            return {
-              questionId: q._id,
-              points: q.points || 10,
-              order: idx,
-              sectionId: isCoding ? 'section-2' : 'section-1',
-              timeLimitSeconds: isCoding ? 300 : null // 5 minutes for coding questions
-            };
-          });
-          
-          // Set start time to 6:20 PM today and end time to 6:50 PM (30 minutes duration)
-          const now = new Date();
-          const startTime = new Date(now);
-          startTime.setHours(18, 20, 0, 0); // 6:20 PM
-          
-          const endTime = new Date(now);
-          endTime.setHours(18, 50, 0, 0); // 6:50 PM
-          
-          // If 6:20 PM has already passed today, set it for tomorrow
-          if (startTime < now) {
-            startTime.setDate(startTime.getDate() + 1);
-            endTime.setDate(endTime.getDate() + 1);
-          }
-          
-          const student1Exam = new Exam({
-            title: 'Student1 Special Exam - 6:20 PM to 6:50 PM',
-            description: 'A scheduled exam for student1 starting at 6:20 PM and ending at 6:50 PM',
-            classId: student1Class._id,
-            questions: examQuestions,
-            sections: sections,
-            proctoring: {
-              durationMinutes: 30, // 30 minutes
-              startTime: startTime,
-              endTime: endTime,
-              autoSubmitOnEnd: true,
-              tabSwitchLimit: 5,
-              copyPasteDisabled: true,
-              fullscreenRequired: true,
-              internetRequired: true,
-              allowRunCode: true
-            },
-            scoring: {
-              immediateScoreRelease: true, // Allow students to see results immediately after submission
-              releaseStatus: 'not_released',
-              gradingMode: 'auto'
-            },
-            template: {
-              isTemplate: false,
-              baseTemplateId: null
-            },
-            createdBy: randomChoice([...teacherUsers, ...adminUsers])._id,
-            status: startTime > now ? 'scheduled' : 'active'
-          });
-          
-          const savedStudent1Exam = await student1Exam.save();
-          insertedExams.push(savedStudent1Exam);
-          console.log(`[Seed] Created exam for student1: "${savedStudent1Exam.title}"`);
-          console.log(`[Seed]   Start Time: ${startTime.toLocaleString()}`);
-          console.log(`[Seed]   End Time: ${endTime.toLocaleString()}`);
-          console.log(`[Seed]   Status: ${savedStudent1Exam.status}`);
-          console.log(`[Seed]   Class: ${student1Class.name}`);
-          console.log(`[Seed]   Questions: ${examQuestions.length}`);
-        } else {
-          console.log('[Seed] Warning: No questions found for student1\'s class, skipping exam creation');
-        }
-      } else {
-        console.log('[Seed] Warning: student1 not found in any class, skipping exam creation');
-      }
-    } else {
-      console.log('[Seed] Warning: student1 not found, skipping exam creation');
-    }
-
-    // Generate Exam Attempts - At least 500 attempts
-    console.log('[Seed] Generating exam attempts...');
-    const examAttempts = [];
-    let attemptCount = 0;
-    const targetAttempts = 1500; // Generate more attempts for better testing
-    
-    for (const exam of insertedExams) {
-      // Skip draft exams (students can't start them)
-      if (exam.status === 'draft') continue;
-      
-      if (attemptCount >= targetAttempts) break;
-
-      const examClass = insertedClasses.find(c => c._id.toString() === exam.classId.toString());
-      if (!examClass || !examClass.students || examClass.students.length === 0) continue;
-
-      // Determine how many students should attempt based on exam status
-      let attemptPercentage = 0.3; // Default 30%
-      if (exam.status === 'completed') {
-        attemptPercentage = 0.7; // 70% for completed exams
-      } else if (exam.status === 'active') {
-        attemptPercentage = 0.5; // 50% for active exams
-      } else if (exam.status === 'scheduled') {
-        attemptPercentage = 0.2; // 20% for scheduled (some might start early)
-      }
-
-      const maxStudents = Math.max(1, Math.floor(examClass.students.length * attemptPercentage));
-      const studentsToAttempt = faker.helpers.arrayElements(
-        examClass.students,
-        Math.min(maxStudents, examClass.students.length)
-      );
-      
-      // Limit attempts per exam to ensure we get good distribution
-      const studentsForThisExam = Math.min(studentsToAttempt.length, Math.floor(targetAttempts / insertedExams.length) + 1);
-      const selectedStudents = studentsToAttempt.slice(0, studentsForThisExam);
-
-      for (const studentId of selectedStudents) {
-        if (attemptCount >= targetAttempts) break;
-        // Determine attempt status based on exam status
-        let attemptStatus;
-        if (exam.status === 'completed') {
-          attemptStatus = randomChoice(['submitted', 'auto_submitted']);
-        } else if (exam.status === 'active') {
-          attemptStatus = randomChoice(['submitted', 'auto_submitted', 'in_progress', 'terminated']);
-        } else if (exam.status === 'scheduled') {
-          // For scheduled exams, students might have started early (in_progress) or not started yet
-          attemptStatus = Math.random() > 0.7 ? 'in_progress' : 'not_started';
-        } else {
-          attemptStatus = randomChoice(['submitted', 'auto_submitted', 'in_progress', 'terminated']);
-        }
-
-        // Calculate startedAt based on exam and attempt status
-        let startedAt;
-        if (attemptStatus === 'not_started') {
-          startedAt = null;
-        } else if (exam.proctoring?.startTime) {
-          // Start within reasonable time of exam start
-          const startOffset = exam.status === 'scheduled' 
-            ? randomInt(-60, 0) * 60 * 1000 // Can start up to 60 min before scheduled start
-            : randomInt(0, 30) * 60 * 1000; // Start within 30 min of exam start
-          startedAt = new Date(exam.proctoring.startTime.getTime() + startOffset);
-        } else {
-          startedAt = faker.date.past();
-        }
-
-        const endsAt = startedAt 
-          ? new Date(startedAt.getTime() + exam.proctoring.durationMinutes * 60 * 1000)
-          : null;
-        
-        const submittedAt = ['submitted', 'auto_submitted', 'terminated'].includes(attemptStatus) && startedAt
-          ? new Date(Math.min(endsAt.getTime(), faker.date.between({ from: startedAt, to: endsAt }).getTime()))
-          : null;
-
-        // Generate answers for some questions (skip if not_started)
-        const answers = [];
-        let totalScore = 0;
-        let maxScore = 0;
-
-        if (attemptStatus === 'not_started') {
-          // No answers for not_started attempts
-        } else {
-          // Answer questions based on attempt status
-          const questionsToAnswer = attemptStatus === 'in_progress'
-            ? exam.questions.slice(0, randomInt(1, Math.floor(exam.questions.length * 0.6))) // Partial answers
-            : exam.questions.slice(0, randomInt(Math.floor(exam.questions.length * 0.7), exam.questions.length)); // Most/all answers
-
-          for (const examQ of questionsToAnswer) {
-          const question = insertedQuestions.find(q => q._id.toString() === examQ.questionId.toString());
-          if (!question) continue;
-
-          const isCorrect = Math.random() > 0.3;
-          const score = isCorrect ? (examQ.points || question.points || 10) : 0;
-          totalScore += score;
-          maxScore += (examQ.points || question.points || 10);
-
-          let answer = null;
-          if (question.type === 'singleCorrectMcq') {
-            answer = isCorrect ? question.correctOption : randomInt(0, question.options.length - 1);
-          } else if (question.type === 'multipleCorrectMcq') {
-            answer = isCorrect ? question.correctOptions : [randomInt(0, question.options.length - 1)];
-          } else if (question.type === 'fillInTheBlanks') {
-            answer = isCorrect ? question.correctAnswer : faker.lorem.word();
-          } else if (question.type === 'coding' || question.type === 'fillInTheBlanksCoding' || question.type === 'codingWithDriver') {
-            answer = question.starterCode?.[0]?.code || '// Code here';
-          }
-
-          // Create submission for all question types
-          let submissionId = null;
-          const submission = new Submission({
-            questionId: question._id,
-            classId: examClass._id,
-            studentId: studentId,
-            answer: answer,
-            language: ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type) 
-              ? (question.languages?.[0] || 'javascript') 
-              : undefined,
-            isCorrect: isCorrect,
-            score: score,
-            output: ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type)
-              ? (isCorrect ? 'All test cases passed' : 'Some test cases failed')
-              : (isCorrect ? 'Correct' : 'Incorrect'),
-            isRun: false,
-            examAttemptId: null, // Will be set after attempt is created
-            passedTestCases: ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type)
-              ? (isCorrect ? question.testCases?.length || 0 : randomInt(0, Math.floor((question.testCases?.length || 0) * 0.5)))
-              : (isCorrect ? 1 : 0),
-            totalTestCases: ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type)
-              ? (question.testCases?.length || 0)
-              : 1
-          });
-          await submission.save();
-          submissionId = submission._id;
-
-          answers.push({
-            questionId: question._id,
-            submissionId: submissionId,
-            answer: answer,
-            score: score,
-            maxScore: examQ.points || question.points || 10,
-            isCorrect: isCorrect,
-            language: ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type) 
-              ? (question.languages?.[0] || 'javascript') 
-              : null,
-            passedTestCases: ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type)
-              ? (isCorrect ? question.testCases?.length || 0 : randomInt(0, Math.floor((question.testCases?.length || 0) * 0.5)))
-              : (isCorrect ? 1 : 0),
-            totalTestCases: ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type)
-              ? (question.testCases?.length || 0)
-              : 1
-          });
-          }
-        }
-
-        // Generate violations (only for started attempts)
-        const violations = [];
-        let tabSwitchCount = 0;
-        let copyPasteCount = 0;
-        let fullscreenExitCount = 0;
-        let networkDropCount = 0;
-
-        if (startedAt && attemptStatus !== 'not_started') {
-          tabSwitchCount = Math.random() > 0.7 ? randomInt(1, 4) : 0;
-          for (let i = 0; i < tabSwitchCount; i++) {
-            violations.push({
-              type: 'tab_switch',
-              timestamp: new Date(startedAt.getTime() + randomInt(5, Math.max(10, exam.proctoring.durationMinutes * 60 - 5)) * 1000),
-              details: { count: i + 1 }
-            });
-          }
-
-          if (Math.random() > 0.8) {
-            copyPasteCount = 1;
-            violations.push({
-              type: 'copy_paste',
-              timestamp: new Date(startedAt.getTime() + randomInt(10, Math.max(15, exam.proctoring.durationMinutes * 60 - 10)) * 1000),
-              details: { action: 'copy' }
-            });
-          }
-
-          if (Math.random() > 0.9) {
-            fullscreenExitCount = 1;
-            violations.push({
-              type: 'fullscreen_exit',
-              timestamp: new Date(startedAt.getTime() + randomInt(15, Math.max(20, exam.proctoring.durationMinutes * 60 - 15)) * 1000),
-              details: { reason: 'user_action' }
-            });
-          }
-
-          if (Math.random() > 0.95) {
-            networkDropCount = 1;
-            violations.push({
-              type: 'network_loss',
-              timestamp: new Date(startedAt.getTime() + randomInt(20, Math.max(25, exam.proctoring.durationMinutes * 60 - 20)) * 1000),
-              details: { duration: randomInt(5, 30) }
-            });
-          }
-
-          // Add heartbeat violations
-          if (startedAt && submittedAt) {
-            const heartbeatInterval = 30 * 1000; // 30 seconds
-            let currentTime = new Date(startedAt.getTime());
-            while (currentTime < submittedAt) {
-              violations.push({
-                type: 'heartbeat',
-                timestamp: new Date(currentTime),
-                details: { status: 'active' }
-              });
-              currentTime = new Date(currentTime.getTime() + heartbeatInterval);
-            }
-          }
-        }
-
-        // Generate timers (only for started attempts)
-        const sectionTimers = startedAt ? exam.sections.map(section => ({
-          sectionId: section.sectionId,
-          remainingSeconds: section.durationSeconds > 0 
-            ? (attemptStatus === 'submitted' || attemptStatus === 'auto_submitted' 
-                ? 0 
-                : randomInt(0, section.durationSeconds))
-            : null,
-          completed: attemptStatus === 'submitted' || attemptStatus === 'auto_submitted'
-        })) : [];
-
-        const questionTimers = startedAt ? exam.questions.map(examQ => {
-          const question = insertedQuestions.find(q => q._id.toString() === examQ.questionId.toString());
-          return {
-            questionId: examQ.questionId,
-            remainingSeconds: examQ.timeLimitSeconds 
-              ? (attemptStatus === 'submitted' || attemptStatus === 'auto_submitted' 
-                  ? 0 
-                  : randomInt(0, examQ.timeLimitSeconds))
-              : null,
-            completed: attemptStatus === 'submitted' || attemptStatus === 'auto_submitted'
-          };
-        }) : [];
-
-        const attempt = new ExamAttempt({
-          examId: exam._id,
-          studentId: studentId,
-          classId: examClass._id,
-          status: attemptStatus,
-          startedAt: startedAt,
-          endsAt: endsAt,
-          submittedAt: submittedAt,
-          autoSubmitted: attemptStatus === 'auto_submitted',
-          manualSubmitted: attemptStatus === 'submitted',
-          currentSectionId: startedAt ? (exam.sections[0]?.sectionId || null) : null,
-          currentQuestionId: startedAt ? (exam.questions[0]?.questionId || null) : null,
-          sectionTimers: sectionTimers,
-          questionTimers: questionTimers,
-          violations: violations,
-          violationCount: violations.length,
-          tabSwitchCount: tabSwitchCount,
-          fullscreenExitCount: fullscreenExitCount,
-          copyPasteCount: copyPasteCount,
-          networkDropCount: networkDropCount,
-          lastHeartbeatAt: startedAt 
-            ? (submittedAt || new Date(startedAt.getTime() + randomInt(5, Math.max(10, exam.proctoring.durationMinutes * 60 - 5)) * 1000))
-            : null,
-          answers: answers,
-          totalScore: totalScore,
-          maxScore: maxScore
-        });
-
-        await attempt.save();
-        examAttempts.push(attempt);
-        attemptCount++;
-
-        // Update all submissions for this attempt with examAttemptId
-        const submissionIds = answers.filter(a => a.submissionId).map(a => a.submissionId);
-        if (submissionIds.length > 0) {
-          await Submission.updateMany(
-            { _id: { $in: submissionIds } },
-            { $set: { examAttemptId: attempt._id } }
-          );
-        }
-      }
-    }
-
-    console.log(`[Seed] Inserted ${examAttempts.length} exam attempts`);
+    // No bulk exams/attempts in minimal seed
+    console.log('[Seed] Skipping exam templates and bulk exams (minimal seed)');
 
     // Verify Data
     console.log('[Seed] Verifying data...');
@@ -1726,47 +969,25 @@ async function seedDatabase() {
     const templateCount = await Exam.countDocuments({ 'template.isTemplate': true });
     const regularExamCount = await Exam.countDocuments({ 'template.isTemplate': { $ne: true } });
     
-    const sampleStudent = await User.findOne({ role: 'student' }).lean();
-    const demoStudentDoc = await User.findOne({ email: 'demo@example.com' }).lean();
     const demoClassFinal = await Class.findOne({ name: 'Demo Class' }).populate('questions').populate('students').lean();
-    
-    // Exam status breakdown
-    const draftExams = await Exam.countDocuments({ status: 'draft', 'template.isTemplate': { $ne: true } });
-    const scheduledExams = await Exam.countDocuments({ status: 'scheduled', 'template.isTemplate': { $ne: true } });
-    const activeExams = await Exam.countDocuments({ status: 'active', 'template.isTemplate': { $ne: true } });
-    const completedExams = await Exam.countDocuments({ status: 'completed', 'template.isTemplate': { $ne: true } });
-    
-    // Exam attempt status breakdown
-    const notStartedAttempts = await ExamAttempt.countDocuments({ status: 'not_started' });
-    const inProgressAttempts = await ExamAttempt.countDocuments({ status: 'in_progress' });
-    const submittedAttempts = await ExamAttempt.countDocuments({ status: 'submitted' });
-    const autoSubmittedAttempts = await ExamAttempt.countDocuments({ status: 'auto_submitted' });
-    const terminatedAttempts = await ExamAttempt.countDocuments({ status: 'terminated' });
+    const questionsByType = await Question.aggregate([
+      { $group: { _id: '$type', count: { $sum: 1 } } },
+      { $sort: { _id: 1 } }
+    ]);
 
     console.log(`[Seed] Total users: ${userCount}`);
     console.log(`[Seed] Total classes: ${classCount}`);
     console.log(`[Seed] Total questions: ${questionCount}`);
+    console.log(`[Seed] Questions by type:`, questionsByType.map((r) => `${r._id}=${r.count}`).join(', '));
     console.log(`[Seed] Total submissions: ${submissionCount}`);
     console.log(`[Seed] Total leaderboard entries: ${leaderboardCount}`);
     console.log(`[Seed] Total exams: ${examCount} (${templateCount} templates, ${regularExamCount} regular exams)`);
-    console.log(`[Seed]   - Draft exams: ${draftExams}`);
-    console.log(`[Seed]   - Scheduled exams: ${scheduledExams}`);
-    console.log(`[Seed]   - Active exams: ${activeExams}`);
-    console.log(`[Seed]   - Completed exams: ${completedExams}`);
     console.log(`[Seed] Total exam attempts: ${examAttemptCount}`);
-    console.log(`[Seed]   - Not started: ${notStartedAttempts}`);
-    console.log(`[Seed]   - In progress: ${inProgressAttempts}`);
-    console.log(`[Seed]   - Submitted: ${submittedAttempts}`);
-    console.log(`[Seed]   - Auto-submitted: ${autoSubmittedAttempts}`);
-    console.log(`[Seed]   - Terminated: ${terminatedAttempts}`);
-    console.log('[Seed] Sample student isBlocked:', sampleStudent.isBlocked);
-    
-    // Get test account IDs
+
     const testAdmin = await User.findOne({ email: 'admin1@example.com' }).lean();
     const testTeacher = await User.findOne({ email: 'teacher1@example.com' }).lean();
     const testStudent = await User.findOne({ email: 'demo@example.com' }).lean();
-    const testStudent2 = await User.findOne({ email: 'student1@example.com' }).lean();
-    
+
     console.log('\n[Seed] ===== TEST ACCOUNT CREDENTIALS =====');
     console.log(`[Seed] ADMIN ACCOUNT:`);
     console.log(`[Seed]   Email: admin1@example.com`);
@@ -1778,15 +999,10 @@ async function seedDatabase() {
     console.log(`[Seed]   Password: Password123!`);
     console.log(`[Seed]   ID: ${testTeacher?._id}`);
     console.log(`[Seed]`);
-    console.log(`[Seed] STUDENT ACCOUNT 1 (Demo):`);
+    console.log(`[Seed] STUDENT (Demo — only student user):`);
     console.log(`[Seed]   Email: demo@example.com`);
     console.log(`[Seed]   Password: Password123!`);
     console.log(`[Seed]   ID: ${testStudent?._id}`);
-    console.log(`[Seed]`);
-    console.log(`[Seed] STUDENT ACCOUNT 2:`);
-    console.log(`[Seed]   Email: student1@example.com`);
-    console.log(`[Seed]   Password: Password123!`);
-    console.log(`[Seed]   ID: ${testStudent2?._id}`);
     console.log(`[Seed]`);
     console.log(`[Seed] ===== DEMO ACCOUNT INFO =====`);
     console.log(`[Seed] Demo Student Email: demo@example.com`);
