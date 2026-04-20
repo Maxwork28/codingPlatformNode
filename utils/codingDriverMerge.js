@@ -5,6 +5,8 @@
  * - Uses replacement callbacks so '$' in student code does not corrupt the merge.
  * - If the driver already declares a function and the student pastes the same full
  *   function, inject only the inner body to avoid duplicate braces / SyntaxError.
+ * - Whole-line '// {{USER_CODE}}' and '# {{USER_CODE}}' are replaced with injected
+ *   code only (not '// ' + code), so line-comment prefixes cannot break drivers.
  */
 
 const PLACEHOLDER_MARKERS = [
@@ -153,11 +155,17 @@ function extractInjectableUserCode(driverTemplate, userAnswer, language) {
  */
 function mergeDriverWithUserAnswer(driverTemplate, userAnswer, options = {}) {
     const inject = extractInjectableUserCode(driverTemplate, userAnswer, options.language);
-    const tpl = String(driverTemplate ?? '');
-    return tpl
-        .replace(/\{\{USER_CODE\}\}/g, () => inject)
-        .replace(/\/\/ USER_CODE_HERE/g, () => inject)
-        .replace(/# USER_CODE_HERE/g, () => inject);
+    let tpl = normalizeNewlines(String(driverTemplate ?? ''));
+
+    // Whole-line '// {{USER_CODE}}' / '# {{USER_CODE}}' before bare '{{USER_CODE}}'.
+    // If we only substituted the braces, the line would become '// ' + code — a line comment (broken drivers).
+    // Use ^/$ (multiline) only so we do not replace inside strings that happen to contain those substrings.
+    tpl = tpl.replace(/^\s*\/\/\s*\{\{USER_CODE\}\}\s*$/gm, () => inject);
+    tpl = tpl.replace(/^\s*#\s*\{\{USER_CODE\}\}\s*$/gm, () => inject);
+    tpl = tpl.replace(/\{\{USER_CODE\}\}/g, () => inject);
+    tpl = tpl.replace(/\/\/ USER_CODE_HERE/g, () => inject);
+    tpl = tpl.replace(/# USER_CODE_HERE/g, () => inject);
+    return tpl;
 }
 
 module.exports = {

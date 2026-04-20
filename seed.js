@@ -493,8 +493,8 @@ const QUESTION_DATA = [
       { language: 'python', code: 'def find_max(arr):\n    # Your code here\n    pass' }
     ],
     driverCode: [
-      { language: 'javascript', code: '// {{USER_CODE}}\n\nconst fs = require(\'fs\');\nconst data = JSON.parse(fs.readFileSync(0, \'utf8\').trim());\nconst result = findMax(data.arr);\nconsole.log(result);\n' },
-      { language: 'python', code: 'import json\n\n# {{USER_CODE}}\n\nif __name__ == "__main__":\n    data = json.loads(input())\n    arr = data["arr"]\n    result = find_max(arr)\n    print(result)' }
+      { language: 'javascript', code: '{{USER_CODE}}\n\nconst fs = require(\'fs\');\nconst data = JSON.parse(fs.readFileSync(0, \'utf8\').trim());\nconst result = findMax(data.arr);\nconsole.log(result);\n' },
+      { language: 'python', code: 'import json\n\n{{USER_CODE}}\n\nif __name__ == "__main__":\n    data = json.loads(input())\n    arr = data["arr"]\n    result = find_max(arr)\n    print(result)' }
     ],
     testCases: [
       { input: '{"arr": [1, 5, 3, 9, 2]}', expectedOutput: '9', isPublic: true },
@@ -722,12 +722,12 @@ function generateGenericQuestion(type, index, createdById, demoClassId) {
       {
         language: 'javascript',
         code:
-          "// {{USER_CODE}}\nconst fs = require('fs');\nconst d = JSON.parse(fs.readFileSync(0, 'utf8').trim());\nconsole.log(sumPair(d.a, d.b));\n"
+          "{{USER_CODE}}\nconst fs = require('fs');\nconst d = JSON.parse(fs.readFileSync(0, 'utf8').trim());\nconsole.log(sumPair(d.a, d.b));\n"
       },
       {
         language: 'python',
         code:
-          'import json\n# {{USER_CODE}}\nif __name__ == "__main__":\n    d = json.loads(input())\n    print(sum_pair(d["a"], d["b"]))'
+          'import json\n{{USER_CODE}}\nif __name__ == "__main__":\n    d = json.loads(input())\n    print(sum_pair(d["a"], d["b"]))'
       }
     ];
     base.testCases = [

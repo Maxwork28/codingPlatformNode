@@ -1441,12 +1441,60 @@ exports.getQuestionsByClass = async (req, res) => {
             console.log('[Get Questions By Class] Teacher authorized:', { isAssignedTeacher, isCreator });
         }
 
-        const questions = classData.questions.filter(q => {
-            const classEntry = q.classes.find(c => c.classId.toString() === classId);
-            return user.role !== 'student' || (classEntry.isPublished && !classEntry.isDisabled);
+        // Collect every question id tied to this class: Class.questions, Class.assignments, and Question.classes.
+        // Assignments often list all "assigned" work while class.questions can be shorter or stale.
+        if (!mongoose.Types.ObjectId.isValid(classId)) {
+            return res.status(400).json({ error: 'Invalid class ID' });
+        }
+        const classOid = new mongoose.Types.ObjectId(classId);
+        const idSet = new Set();
+
+        for (const q of classData.questions || []) {
+            const id = q && q._id ? q._id : q;
+            if (id) idSet.add(String(id));
+        }
+        for (const a of classData.assignments || []) {
+            const qid = a.questionId;
+            const id = qid && qid._id ? qid._id : qid;
+            if (id) idSet.add(String(id));
+        }
+
+        const linkedByClassField = await Question.find({ 'classes.classId': classOid });
+        for (const q of linkedByClassField) {
+            if (q && q._id) idSet.add(String(q._id));
+        }
+
+        const objectIds = [...idSet]
+            .filter((id) => mongoose.Types.ObjectId.isValid(id))
+            .map((id) => new mongoose.Types.ObjectId(id));
+
+        let questions = objectIds.length
+            ? await Question.find({ _id: { $in: objectIds } })
+            : [];
+
+        const getClassEntry = (q) =>
+            q.classes?.find((c) => String(c.classId?._id || c.classId) === String(classId));
+
+        questions = questions.filter((q) => {
+            const classEntry = getClassEntry(q);
+            if (user.role === 'student') {
+                return Boolean(classEntry && classEntry.isPublished && !classEntry.isDisabled);
+            }
+            return true;
         });
 
-        console.log('[Get Questions By Class] Questions fetched:', questions.length);
+        questions.sort((a, b) => {
+            const strip = (t) => (t || '').replace(/<[^>]*>/g, '');
+            const cmp = strip(a.title).localeCompare(strip(b.title));
+            return cmp !== 0 ? cmp : String(a._id).localeCompare(String(b._id));
+        });
+
+        console.log('[Get Questions By Class] Questions fetched:', questions.length, {
+            classQuestionsRef: (classData.questions || []).length,
+            assignments: (classData.assignments || []).length,
+            linkedByQuestionClasses: linkedByClassField.length,
+            uniqueIds: objectIds.length
+        });
         res.status(200).json({ questions });
     } catch (err) {
         console.error('[Get Questions By Class] Error:', err.message);
@@ -1655,7 +1703,7 @@ exports.searchQuestions = async (req, res) => {
         if (title) {
             query.title = { $regex: title, $options: 'i' };
         }
-        if (type && ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding'].includes(type)) {
+        if (type && ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'].includes(type)) {
             query.type = type;
         }
         if (classId && mongoose.Types.ObjectId.isValid(classId)) {

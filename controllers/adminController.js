@@ -1,3 +1,4 @@
+const fs = require('fs').promises;
 const xlsx = require('xlsx');
 const bcrypt = require('bcrypt');
 const User = require('../models/User');
@@ -12,6 +13,14 @@ const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'php', '
 
 // Helper function to validate ObjectId
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+/** Case-insensitive email lookup (unique index is exact string; DB may have mixed case). */
+async function findUserByEmailInsensitive(email) {
+    const trimmed = String(email).trim();
+    if (!trimmed) return null;
+    const safe = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return User.findOne({ email: { $regex: new RegExp(`^${safe}$`, 'i') } });
+}
 
 // Helper function to validate question data
 const validateQuestion = async (questionId) => {
@@ -59,6 +68,11 @@ const validateQuestion = async (questionId) => {
             return res.status(400).json({ error: 'No data found in Excel file' });
         }
 
+        const created = [];
+        const skipped = [];
+        const invalid = [];
+        const seenInFile = new Set();
+
         for (const entry of data) {
             console.log('uploadExcel: Processing entry:', entry);
             
@@ -68,10 +82,25 @@ const validateQuestion = async (questionId) => {
             const number = entry.number || entry.Number || entry.NUMBER || entry.phone || entry.Phone || entry.PHONE;
             
             // Validate required fields
-            if (!name || !email || !number) {
+            if (!name || !email || number === undefined || number === null || String(number).trim() === '') {
                 console.error('uploadExcel: Missing required fields in entry:', entry);
                 console.error('uploadExcel: Extracted fields:', { name, email, number });
-                continue; // Skip this entry and continue with others
+                invalid.push({ email: email || '(missing)', reason: 'missing_name_email_or_number' });
+                continue;
+            }
+
+            const emailNorm = String(email).trim().toLowerCase();
+            if (seenInFile.has(emailNorm)) {
+                skipped.push({ email: emailNorm, reason: 'duplicate_in_file' });
+                continue;
+            }
+            seenInFile.add(emailNorm);
+
+            const existing = await findUserByEmailInsensitive(email);
+            if (existing) {
+                console.log('uploadExcel: Skipping existing user:', emailNorm);
+                skipped.push({ email: emailNorm, reason: 'already_registered' });
+                continue;
             }
 
             const password = generatePassword();
@@ -80,9 +109,9 @@ const validateQuestion = async (questionId) => {
             console.log('uploadExcel: Password hashed');
 
             const user = new User({
-                name: name,
-                email: email,
-                number: number,
+                name: String(name).trim(),
+                email: emailNorm,
+                number: String(number),
                 role: req.body.role,
                 password: hashedPassword
             });
@@ -90,25 +119,44 @@ const validateQuestion = async (questionId) => {
 
             await user.save();
             console.log('uploadExcel: User saved:', user._id);
+            created.push({ email: emailNorm, id: user._id });
 
             try {
                 await sendEmail(
-                    email,
+                    emailNorm,
                     'Your Login Credentials',
-                    `Email: ${email}\nPassword: ${password}\nRole: ${req.body.role}`
+                    `Email: ${emailNorm}\nPassword: ${password}\nRole: ${req.body.role}`
                 );
-                console.log('uploadExcel: Email sent to:', email);
+                console.log('uploadExcel: Email sent to:', emailNorm);
             } catch (emailError) {
-                console.error('uploadExcel: Failed to send email to:', email, emailError);
-                // Continue processing other users even if email fails
+                console.error('uploadExcel: Failed to send email to:', emailNorm, emailError);
             }
         }
 
-        console.log('uploadExcel: All users processed successfully');
-        res.status(200).json({ message: 'Users created and emails sent' });
+        const parts = [];
+        if (created.length) parts.push(`${created.length} user(s) created`);
+        if (skipped.length) parts.push(`${skipped.length} skipped (duplicate or already registered)`);
+        if (invalid.length) parts.push(`${invalid.length} row(s) invalid (missing fields)`);
+        const message = parts.length ? parts.join('. ') + '.' : 'No changes made.';
+
+        console.log('uploadExcel: Done.', { created: created.length, skipped: skipped.length, invalid: invalid.length });
+        res.status(200).json({
+            message,
+            created: created.length,
+            skipped,
+            invalid
+        });
     } catch (err) {
         console.error('uploadExcel: Error:', err);
         res.status(500).json({ error: 'Error processing file: ' + err.message });
+    } finally {
+        if (req.file?.path) {
+            try {
+                await fs.unlink(req.file.path);
+            } catch (unlinkErr) {
+                console.warn('uploadExcel: Could not delete temp file:', unlinkErr.message);
+            }
+        }
     }
 };
 
