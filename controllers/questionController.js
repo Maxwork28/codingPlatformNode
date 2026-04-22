@@ -23,10 +23,11 @@ const languageConfig = {
     go: { image: 'go-compiler', ext: '.go', compileCmd: null, runCmd: ['go', 'run', '/app/code.go'] },
 };
 
-const ensureTeacherQuestionPermission = (user, actionLabel, res) => {
+/** Only for creating a new question document (assignQuestion). Publish/edit/etc. are not gated by this flag. */
+const ensureTeacherCanCreateQuestion = (user, actionLabel, res) => {
     if (user.role === 'teacher' && !user.canCreateQuestion) {
-        console.warn(`${actionLabel} Error: Teacher lacks question creation permission`);
-        res.status(403).json({ error: 'Teacher is not permitted to manage questions' });
+        console.warn(`${actionLabel} Error: Teacher lacks permission to create questions`);
+        res.status(403).json({ error: 'Teacher is not permitted to create questions' });
         return false;
     }
     return true;
@@ -808,7 +809,7 @@ exports.assignQuestion = async (req, res) => {
             console.warn('[Question Assignment] Error: Role not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can assign questions' });
         }
-        if (!ensureTeacherQuestionPermission(user, '[Question Assignment]', res)) {
+        if (!ensureTeacherCanCreateQuestion(user, '[Question Assignment]', res)) {
             return;
         }
 
@@ -909,9 +910,6 @@ exports.editQuestion = async (req, res) => {
             console.warn('[Edit Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can edit' });
         }
-        if (!ensureTeacherQuestionPermission(user, '[Edit Question]', res)) {
-            return;
-        }
 
         const question = await Question.findById(questionId);
         if (!question) {
@@ -995,9 +993,6 @@ exports.deleteQuestion = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Delete Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can delete' });
-        }
-        if (!ensureTeacherQuestionPermission(user, '[Delete Question]', res)) {
-            return;
         }
 
         const question = await Question.findById(questionId);
@@ -1132,9 +1127,6 @@ exports.publishQuestion = async (req, res) => {
             console.warn('[Publish Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can publish' });
         }
-        if (!ensureTeacherQuestionPermission(user, '[Publish Question]', res)) {
-            return;
-        }
 
         const question = await Question.findById(questionId);
         if (!question) {
@@ -1189,9 +1181,6 @@ exports.unpublishQuestion = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Unpublish Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can unpublish' });
-        }
-        if (!ensureTeacherQuestionPermission(user, '[Unpublish Question]', res)) {
-            return;
         }
 
         const question = await Question.findById(questionId);
@@ -1248,9 +1237,6 @@ exports.disableQuestion = async (req, res) => {
             console.warn('[Disable Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can disable' });
         }
-        if (!ensureTeacherQuestionPermission(user, '[Disable Question]', res)) {
-            return;
-        }
 
         const question = await Question.findById(questionId);
         if (!question) {
@@ -1305,9 +1291,6 @@ exports.enableQuestion = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Enable Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can enable' });
-        }
-        if (!ensureTeacherQuestionPermission(user, '[Enable Question]', res)) {
-            return;
         }
 
         const question = await Question.findById(questionId);
@@ -1648,9 +1631,6 @@ exports.assignQuestionToClass = async (req, res) => {
         if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Assign Question To Class] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can assign questions' });
-        }
-        if (!ensureTeacherQuestionPermission(user, '[Assign Question To Class]', res)) {
-            return;
         }
 
         const question = await Question.findById(questionId);
