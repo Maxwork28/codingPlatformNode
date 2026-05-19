@@ -3,6 +3,7 @@ const Docker = require('dockerode');
 const fs = require('fs').promises;
 const path = require('path');
 const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
+const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
 const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Class = require('../models/Class');
@@ -245,6 +246,25 @@ exports.executeDockerCode = executeDockerCode;
 exports.shouldMergeDriverForLanguage = shouldMergeDriverForLanguage;
 exports.shouldWrapBareArrayStdinForQuestion = shouldWrapBareArrayStdinForQuestion;
 
+/** Student-facing test result rows with stable numbering and hidden I/O for private cases */
+const sanitizeTestResultsForStudent = (testResults = []) =>
+    testResults.map((r, index) => ({
+        testCaseNumber: index + 1,
+        passed: !!r.passed,
+        isPublic: r.isPublic !== false,
+        status: r.status,
+        isTLE: !!r.isTLE,
+        isMLE: !!r.isMLE,
+        ...(r.isPublic !== false
+            ? {
+                input: r.input,
+                output: r.output,
+                expected: r.expected,
+                error: r.error || null,
+            }
+            : {}),
+    }));
+
 exports.submitAnswer = async (req, res) => {
     console.log('[Submission] New answer submission started');
     try {
@@ -316,6 +336,7 @@ exports.submitAnswer = async (req, res) => {
         let codeToExecute = answer;
         let passedTestCases = 0;
         let totalTestCases = 0;
+        let testResultsForResponse = null;
 
         console.log('[Submission] Processing question type:', question.type);
         if (question.type === 'singleCorrectMcq') {
@@ -372,22 +393,14 @@ exports.submitAnswer = async (req, res) => {
                     question.memoryLimit,
                     { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
                 );
+                testResultsForResponse = testResults;
                 totalTestCases = testResults.length;
                 passedTestCases = testResults.filter(test => test.passed).length;
                 isCorrect = testResults.every(test => test.passed);
                 score = isCorrect ? question.points : Math.floor((passedTestCases / totalTestCases) * question.points);
-                output = JSON.stringify(testResults.filter(result => result.isPublic));
                 const firstFail = testResults.find(t => !t.passed);
                 submissionStatus = isCorrect ? 'accepted' : (firstFail?.status || 'wrong_answer');
-                output = JSON.stringify(testResults.filter(r => r.isPublic).map(r => ({
-                    input: r.input,
-                    output: r.output,
-                    expected: r.expected,
-                    passed: r.passed,
-                    status: r.status,
-                    isTLE: r.isTLE,
-                    isMLE: r.isMLE
-                })));
+                output = JSON.stringify(sanitizeTestResultsForStudent(testResults));
                 console.log('[Submission] Coding test results:', testResults);
             } catch (err) {
                 console.error('[Submission] Error: Code execution failed:', err.message);
@@ -475,13 +488,19 @@ exports.submitAnswer = async (req, res) => {
         });
 
         console.log('[Submission] Successfully processed');
-        res.status(200).json({ 
-            message: 'Answer submitted successfully', 
+        const responsePayload = {
+            message: 'Answer submitted successfully',
             submission,
             passedTestCases,
             totalTestCases,
-            explanation: question.explanation
-        });
+            explanation: question.explanation,
+        };
+        if (testResultsForResponse) {
+            responsePayload.testResults = sanitizeTestResultsForStudent(testResultsForResponse);
+            responsePayload.publicTestCases = testResultsForResponse.filter((t) => t.isPublic).length;
+            responsePayload.hiddenTestCases = testResultsForResponse.filter((t) => !t.isPublic).length;
+        }
+        res.status(200).json(responsePayload);
     } catch (err) {
         console.error('[Submission] Error processing submission:', err.message);
         res.status(500).json({ error: 'Error submitting answer' });
@@ -626,10 +645,16 @@ exports.runQuestion = async (req, res) => {
         });
 
         console.log('[Run Question] Successfully processed');
+        const sanitizedRunResults = sanitizeTestResultsForStudent(testResults);
         res.status(200).json({ 
             message: 'Code run successfully', 
             submission, 
-            testResults,
+            testResults: sanitizedRunResults,
+            passedTestCases: testResults.filter(test => test.passed).length,
+            totalTestCases: testResults.length,
+            publicTestCases: testResults.filter((t) => t.isPublic).length,
+            hiddenTestCases: testResults.filter((t) => !t.isPublic).length,
+            isCorrect,
             explanation: question.explanation
         });
     } catch (err) {
@@ -875,6 +900,8 @@ exports.assignQuestion = async (req, res) => {
             }
         }
 
+        normalizeQuestionRichTextFields(questionData);
+
         const question = new Question({
             ...questionData,
             createdBy: user._id,
@@ -960,6 +987,8 @@ exports.editQuestion = async (req, res) => {
                 }
             }
         }
+
+        normalizeQuestionRichTextFields(questionData);
 
         Object.assign(question, {
             ...questionData,
@@ -1101,9 +1130,13 @@ exports.viewStatement = async (req, res) => {
 
         console.log('[View Statement] Statement fetched:', questionId);
         res.status(200).json({
+            type: question.type,
             title: question.title,
             description: question.description,
             constraints: question.constraints,
+            inputFormat: question.inputFormat,
+            outputFormat: question.outputFormat,
+            sampleIo: question.sampleIo,
             examples: question.examples,
             codeSnippet: question.codeSnippet,
             starterCode: question.starterCode,
@@ -1461,7 +1494,8 @@ exports.getQuestionsByClass = async (req, res) => {
         questions = questions.filter((q) => {
             const classEntry = getClassEntry(q);
             if (user.role === 'student') {
-                return Boolean(classEntry && classEntry.isPublished && !classEntry.isDisabled);
+                // Students see all published questions; disabled only blocks submit/run (enforced elsewhere).
+                return Boolean(classEntry && classEntry.isPublished);
             }
             return true;
         });
@@ -1713,7 +1747,7 @@ exports.viewSubmissionCode = async (req, res) => {
         }
 
         const submission = await Submission.findById(submissionId)
-            .populate('questionId', 'title')
+            .populate('questionId', 'title type testCases codeSnippet driverCode languages timeLimit memoryLimit')
             .populate('studentId', 'name email');
         if (!submission) {
             console.error('[View Submission Code] Error: Submission not found');
@@ -1722,13 +1756,18 @@ exports.viewSubmissionCode = async (req, res) => {
 
         console.log('[View Submission Code] Submission fetched:', submissionId);
         const qId = submission.questionId?._id || submission.questionId;
+        const question =
+            submission.questionId?._id
+                ? submission.questionId
+                : await Question.findById(qId);
         const isCorrect = Boolean(submission.isCorrect);
-        res.status(200).json({ 
+        const language = submission.language || 'javascript';
+        const payload = {
             questionId: qId,
             classId: submission.classId,
             code: submission.answer,
-            language: submission.language || 'javascript',
-            questionTitle: submission.questionId?.title || 'Question',
+            language,
+            questionTitle: question?.title || 'Question',
             studentName: submission.studentId?.name || 'Student',
             studentEmail: submission.studentId?.email || '',
             isCorrect,
@@ -1738,10 +1777,149 @@ exports.viewSubmissionCode = async (req, res) => {
             passedTestCases: submission.passedTestCases ?? 0,
             totalTestCases: submission.totalTestCases ?? 0,
             output: submission.output,
-        });
+            testResults: null,
+        };
+
+        const codingTypes = ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'];
+        if (
+            question &&
+            codingTypes.includes(question.type) &&
+            submission.answer &&
+            question.testCases?.length
+        ) {
+            try {
+                let codeToExecute = submission.answer;
+                if (question.type === 'fillInTheBlanksCoding' && question.codeSnippet) {
+                    codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', submission.answer);
+                } else if (shouldMergeDriverForLanguage(question, language)) {
+                    const driverCodeObj = question.driverCode?.find((d) => d.language === language);
+                    if (driverCodeObj?.code) {
+                        codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, submission.answer, {
+                            language,
+                        });
+                    }
+                }
+                const timeLimit = question.timeLimit || 2;
+                const memoryLimit = question.memoryLimit || 256;
+                const rawResults = await executeDockerCode(
+                    language,
+                    codeToExecute,
+                    question.testCases,
+                    timeLimit,
+                    memoryLimit,
+                    { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
+                );
+                payload.testResults = rawResults.map((r, index) => ({
+                    testCaseNumber: index + 1,
+                    passed: !!r.passed,
+                    isPublic: r.isPublic !== false,
+                    status: r.status,
+                    isTLE: !!r.isTLE,
+                    isMLE: !!r.isMLE,
+                    input: r.input,
+                    output: r.output,
+                    expected: r.expected,
+                    error: r.error || null,
+                }));
+            } catch (rerunErr) {
+                console.warn('[View Submission Code] Teacher full test re-run failed:', rerunErr.message);
+            }
+        }
+
+        res.status(200).json(payload);
     } catch (err) {
         console.error('[View Submission Code] Error:', err.message);
         res.status(500).json({ error: 'Error fetching submission code' });
+    }
+};
+
+exports.markSubmissionCorrect = async (req, res) => {
+    console.log('[Mark Submission Correct] Submission:', req.params.submissionId);
+    try {
+        const { submissionId } = req.params;
+        const user = req.user;
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            return res.status(403).json({ error: 'Only admin or teacher can mark submissions correct' });
+        }
+
+        const submission = await Submission.findById(submissionId).populate('questionId', 'points testCases');
+        if (!submission) {
+            return res.status(404).json({ error: 'Submission not found' });
+        }
+
+        if (submission.isRun) {
+            return res.status(400).json({ error: 'Test runs cannot be marked as correct' });
+        }
+
+        if (submission.isCorrect) {
+            return res.status(200).json({
+                message: 'Submission is already marked correct',
+                submission: {
+                    _id: submission._id,
+                    isCorrect: true,
+                    score: submission.score,
+                    status: submission.status,
+                },
+            });
+        }
+
+        const question = submission.questionId;
+        const totalTestCases =
+            submission.totalTestCases ||
+            (question?.testCases?.length ?? 0);
+
+        submission.isCorrect = true;
+        submission.score = question?.points ?? submission.score ?? 0;
+        submission.status = 'accepted';
+        if (totalTestCases > 0) {
+            submission.passedTestCases = totalTestCases;
+            submission.totalTestCases = totalTestCases;
+        }
+        await submission.save();
+
+        const leaderboard = await Leaderboard.findOne({
+            classId: submission.classId,
+            studentId: submission.studentId,
+        });
+
+        if (leaderboard) {
+            const att = leaderboard.attempts.find(
+                (a) => a.submissionId && a.submissionId.toString() === submissionId
+            );
+            if (att) {
+                att.isCorrect = true;
+                att.score = submission.score;
+                if (totalTestCases > 0) {
+                    att.passedTestCases = totalTestCases;
+                    att.totalTestCases = totalTestCases;
+                }
+            }
+            leaderboard.correctAttempts = (leaderboard.correctAttempts || 0) + 1;
+            leaderboard.wrongAttempts = Math.max(0, (leaderboard.wrongAttempts || 0) - 1);
+            await leaderboard.save();
+        }
+
+        if (req.io) {
+            req.io.to(`class:${submission.classId}`).emit('analyticsUpdated', {
+                classId: submission.classId,
+            });
+        }
+
+        res.status(200).json({
+            message: 'Submission marked as correct',
+            submission: {
+                _id: submission._id,
+                isCorrect: submission.isCorrect,
+                score: submission.score,
+                status: submission.status,
+                passedTestCases: submission.passedTestCases,
+                totalTestCases: submission.totalTestCases,
+            },
+        });
+    } catch (err) {
+        console.error('[Mark Submission Correct] Error:', err.message);
+        res.status(500).json({ error: 'Error marking submission as correct' });
     }
 };
 
@@ -1781,128 +1959,79 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
             return res.status(400).json({ error: 'Question not associated with this class' });
         }
 
-        const report = await Leaderboard.aggregate([
-            { $match: { classId: new mongoose.Types.ObjectId(classId) } },
-            {
-                $lookup: {
-                    from: 'users',
-                    localField: 'studentId',
-                    foreignField: '_id',
-                    as: 'student'
-                }
-            },
-            { $unwind: '$student' },
-            { $unwind: { path: '$attempts', preserveNullAndEmptyArrays: true } },
-            { $match: { 'attempts.questionId': new mongoose.Types.ObjectId(questionId) } },
-            {
-                $group: {
-                    _id: '$studentId',
-                    studentName: { $first: '$student.name' },
-                    studentEmail: { $first: '$student.email' },
-                    totalAttempts: { $sum: 1 },
-                    correctAttempts: { $sum: { $cond: ['$attempts.isCorrect', 1, 0] } },
-                    wrongAttempts: { $sum: { $cond: ['$attempts.isCorrect', 0, 1] } },
-                    totalRuns: { $sum: { $cond: ['$attempts.isRun', 1, 0] } },
-                    totalSubmits: { $sum: { $cond: ['$attempts.isRun', 0, 1] } },
-                    highestScore: { $max: '$attempts.score' },
-                    latestSubmission: { $max: '$attempts.submittedAt' }
-                }
-            },
-            { $sort: { highestScore: -1, latestSubmission: 1 } },
-            {
-                $group: {
-                    _id: null,
-                    studentData: {
-                        $push: {
-                            studentId: '$_id',
-                            studentName: '$studentName',
-                            studentEmail: '$studentEmail',
-                            totalAttempts: '$totalAttempts',
-                            correctAttempts: '$correctAttempts',
-                            wrongAttempts: '$wrongAttempts',
-                            totalRuns: '$totalRuns',
-                            totalSubmits: '$totalSubmits',
-                            highestScore: '$highestScore',
-                            latestSubmission: '$latestSubmission'
-                        }
-                    },
-                    totalStudentsAttempted: { $sum: { $cond: [{ $gt: ['$totalAttempts', 0] }, 1, 0] } },
-                    totalCorrect: { $sum: '$correctAttempts' },
-                    totalWrong: { $sum: '$wrongAttempts' },
-                    totalRuns: { $sum: '$totalRuns' },
-                    totalSubmits: { $sum: '$totalSubmits' },
-                    avgScore: { $avg: '$highestScore' }
-                }
-            },
-            {
-                $lookup: {
-                    from: 'questions',
-                    localField: '_id', // This will be null, so we handle it in $project
-                    foreignField: '_id',
-                    as: 'questionData'
-                }
-            },
-            { $unwind: { path: '$questionData', preserveNullAndEmptyArrays: true } },
-            {
-                $project: {
-                    _id: 0,
-                    question: {
-                        _id: question._id,
-                        title: question.title,
-                        description: question.description,
-                        difficulty: question.difficulty,
-                        type: question.type,
-                        points: question.points,
-                        tags: question.tags,
-                        isPublished: {
-                            $arrayElemAt: [
-                                {
-                                    $filter: {
-                                        input: '$questionData.classes',
-                                        as: 'class',
-                                        cond: { $eq: ['$$class.classId', new mongoose.Types.ObjectId(classId)] }
-                                    }
-                                },
-                                0
-                            ]
-                        },
-                        isDisabled: {
-                            $arrayElemAt: [
-                                {
-                                    $filter: {
-                                        input: '$questionData.classes',
-                                        as: 'class',
-                                        cond: { $eq: ['$$class.classId', new mongoose.Types.ObjectId(classId)] }
-                                    }
-                                },
-                                0
-                            ]
-                        }
-                    },
-                    class: {
-                        _id: classData._id,
-                        name: classData.name,
-                        description: classData.description
-                    },
-                    studentData: 1,
-                    totalStudentsAttempted: 1,
-                    totalCorrect: 1,
-                    totalWrong: 1,
-                    totalRuns: 1,
-                    totalSubmits: 1,
-                    avgScore: { $ifNull: ['$avgScore', 0] },
-                    totalStudentsEnrolled: classData.students.length
-                }
-            },
-            {
-                $set: {
-                    'question.isPublished': '$question.isPublished.isPublished',
-                    'question.isDisabled': '$question.isDisabled.isDisabled'
-                }
-            }
-        ]);
+        const submissions = await Submission.find({ classId, questionId })
+            .sort({ submittedAt: -1 })
+            .lean();
 
-        const reportData = report[0] || {
+        const attemptsByStudent = new Map();
+        for (const sub of submissions) {
+            const sid = sub.studentId.toString();
+            if (!attemptsByStudent.has(sid)) attemptsByStudent.set(sid, []);
+            attemptsByStudent.get(sid).push({
+                submissionId: sub._id,
+                isCorrect: Boolean(sub.isCorrect),
+                score: sub.score ?? 0,
+                submittedAt: sub.submittedAt,
+                isRun: Boolean(sub.isRun),
+                isCustomInput: Boolean(sub.isCustomInput),
+                passedTestCases: sub.passedTestCases ?? 0,
+                totalTestCases: sub.totalTestCases ?? 0,
+                status: sub.status || (sub.isCorrect ? 'accepted' : 'wrong_answer'),
+            });
+        }
+
+        const statusOrder = { correct: 0, incorrect: 1, not_attempted: 2 };
+        const studentData = classData.students.map((student) => {
+            const sid = student._id.toString();
+            const attempts = attemptsByStudent.get(sid) || [];
+            const submits = attempts.filter((a) => !a.isRun);
+
+            let status = 'not_attempted';
+            if (submits.length > 0) {
+                status = submits.some((a) => a.isCorrect) ? 'correct' : 'incorrect';
+            }
+
+            const correctAttempts = submits.filter((a) => a.isCorrect).length;
+            const wrongAttempts = submits.filter((a) => !a.isCorrect).length;
+            const totalRuns = attempts.filter((a) => a.isRun).length;
+            const highestScore = submits.length ? Math.max(...submits.map((a) => a.score)) : 0;
+
+            return {
+                studentId: student._id,
+                studentName: student.name,
+                studentEmail: student.email,
+                status,
+                totalAttempts: attempts.length,
+                correctAttempts,
+                wrongAttempts,
+                totalRuns,
+                totalSubmits: submits.length,
+                highestScore,
+                latestSubmission: attempts[0]?.submittedAt || null,
+                attempts,
+            };
+        });
+
+        studentData.sort(
+            (a, b) =>
+                statusOrder[a.status] - statusOrder[b.status] ||
+                (a.studentName || '').localeCompare(b.studentName || '')
+        );
+
+        const totalStudentsCorrect = studentData.filter((s) => s.status === 'correct').length;
+        const totalStudentsIncorrect = studentData.filter((s) => s.status === 'incorrect').length;
+        const totalStudentsNotAttempted = studentData.filter((s) => s.status === 'not_attempted').length;
+        const totalStudentsAttempted = totalStudentsCorrect + totalStudentsIncorrect;
+        const totalCorrect = studentData.reduce((sum, s) => sum + s.correctAttempts, 0);
+        const totalWrong = studentData.reduce((sum, s) => sum + s.wrongAttempts, 0);
+        const totalRuns = studentData.reduce((sum, s) => sum + s.totalRuns, 0);
+        const totalSubmits = studentData.reduce((sum, s) => sum + s.totalSubmits, 0);
+        const scored = studentData.filter((s) => s.totalSubmits > 0);
+        const avgScore = scored.length
+            ? scored.reduce((sum, s) => sum + s.highestScore, 0) / scored.length
+            : 0;
+
+        const reportData = {
             question: {
                 _id: question._id,
                 title: question.title,
@@ -1911,22 +2040,28 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
                 type: question.type,
                 points: question.points,
                 tags: question.tags,
+                inputFormat: question.inputFormat,
+                outputFormat: question.outputFormat,
+                sampleIo: question.sampleIo || [],
                 isPublished: classEntry.isPublished,
-                isDisabled: classEntry.isDisabled
+                isDisabled: classEntry.isDisabled,
             },
             class: {
                 _id: classData._id,
                 name: classData.name,
-                description: classData.description
+                description: classData.description,
             },
-            studentData: [],
-            totalStudentsAttempted: 0,
-            totalCorrect: 0,
-            totalWrong: 0,
-            totalRuns: 0,
-            totalSubmits: 0,
-            avgScore: 0,
-            totalStudentsEnrolled: classData.students.length
+            studentData,
+            totalStudentsAttempted,
+            totalStudentsCorrect,
+            totalStudentsIncorrect,
+            totalStudentsNotAttempted,
+            totalCorrect,
+            totalWrong,
+            totalRuns,
+            totalSubmits,
+            avgScore,
+            totalStudentsEnrolled: classData.students.length,
         };
 
         if (user.role === 'student') {

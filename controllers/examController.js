@@ -28,10 +28,14 @@ const sanitizeQuestionForExam = (questionDoc) => ({
     driverCode: questionDoc.driverCode,
     testCases: questionDoc.testCases,
     constraints: questionDoc.constraints,
+    inputFormat: questionDoc.inputFormat,
+    outputFormat: questionDoc.outputFormat,
+    sampleIo: questionDoc.sampleIo,
     examples: questionDoc.examples,
     languages: questionDoc.languages,
     hints: questionDoc.hints,
     solution: questionDoc.solution,
+    explanation: questionDoc.explanation,
     level: questionDoc.level,
 });
 

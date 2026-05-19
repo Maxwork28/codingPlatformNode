@@ -8,6 +8,7 @@ const Submission = require('../models/Submission');
 const Leaderboard = require('../models/Leaderboard');
 const generatePassword = require('../utils/generatePassword');
 const sendEmail = require('../utils/sendEmail');
+const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
 const mongoose = require('mongoose');
 const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'];
 
@@ -1672,6 +1673,8 @@ exports.adminCreateQuestion = async (req, res) => {
         // Check if this is a draft
         const isDraft = questionData.status === 'draft' || questionData.isDraft === true;
 
+        normalizeQuestionRichTextFields(questionData);
+
         // Create question
         const question = new Question({
             ...questionData,
@@ -1972,6 +1975,8 @@ exports.editQuestion = async (req, res) => {
             questionData.correctAnswer = undefined;
             questionData.starterCode = undefined;
         }
+
+        normalizeQuestionRichTextFields(questionData);
 
         // Update question
         Object.assign(question, {
@@ -2279,6 +2284,8 @@ exports.updateDraftQuestion = async (req, res) => {
             return res.status(404).json({ error: 'Draft not found' });
         }
 
+        normalizeQuestionRichTextFields(questionData);
+
         // Update question data
         Object.keys(questionData).forEach(key => {
             if (questionData[key] !== undefined) {
@@ -2349,6 +2356,7 @@ exports.publishDraftQuestion = async (req, res) => {
 
         // Update with final data if provided
         if (questionData) {
+            normalizeQuestionRichTextFields(questionData);
             Object.keys(questionData).forEach(key => {
                 if (questionData[key] !== undefined) {
                     question[key] = questionData[key];

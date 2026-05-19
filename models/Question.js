@@ -27,8 +27,15 @@ const questionSchema = new mongoose.Schema({
     updatedAt: { type: Date, default: Date.now },
     hints: [{ type: String }],
     solution: { type: String },
-    solutionCode: { type: String }, // Solution code for coding questions
-    solutionLanguage: { type: String }, // Language for solution code
+    solutionCode: { type: String }, // Primary solution (backward compat)
+    solutionLanguage: { type: String }, // Language for solutionCode
+    solutionCodes: [{
+        language: {
+            type: String,
+            enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']
+        },
+        code: { type: String }
+    }],
     level: { type: String, enum: ['beginner', 'intermediate', 'advanced'] },
     type: {
         type: String,
@@ -48,6 +55,14 @@ const questionSchema = new mongoose.Schema({
         code: { type: String }
     }],
     testCases: [testCaseSchema], // For coding and fillInTheBlanksCoding
+    /** Rich text (often HTML) — used only for coding-type questions in UIs */
+    inputFormat: { type: String },
+    outputFormat: { type: String },
+    /** Plain stdin/stdout samples for coding questions (replaces legacy rich-text examples for I/O) */
+    sampleIo: [{
+        input: { type: String, default: '' },
+        output: { type: String, default: '' }
+    }],
     constraints: { type: String },
     examples: [{ type: String }],
     functionSignature: { type: String },

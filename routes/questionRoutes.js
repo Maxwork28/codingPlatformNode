@@ -124,6 +124,12 @@ router.get('/submissions/:submissionId/code',
   questionController.viewSubmissionCode
 );
 
+router.post('/submissions/:submissionId/mark-correct',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  questionController.markSubmissionCorrect
+);
+
 // Teacher-specific testing routes (no leaderboard impact)
 router.post('/:questionId/teacher-test', 
   authMiddleware,
