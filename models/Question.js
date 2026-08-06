@@ -3,7 +3,8 @@ const mongoose = require('mongoose');
 const classSettingsSchema = new mongoose.Schema({
     classId: { type: mongoose.Schema.Types.ObjectId, ref: 'Class', required: true },
     isPublished: { type: Boolean, default: false },
-    isDisabled: { type: Boolean, default: false }
+    isDisabled: { type: Boolean, default: false },
+    publishedAt: { type: Date }
 });
 
 const testCaseSchema = new mongoose.Schema({

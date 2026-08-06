@@ -9,7 +9,8 @@ const userSchema = new mongoose.Schema({
     resetToken: String,
     resetTokenExpiry: Date,
     canCreateQuestion: { type: Boolean, default: false },
-    isBlocked: { type: Map, of: Boolean, default: {} }
+    isBlocked: { type: Map, of: Boolean, default: {} },
+    profilePicture: { type: String, default: null }
 }, {
     indexes: [
         { key: { name: 'text', email: 'text' } }

@@ -28,6 +28,7 @@ const io = new Server(server, {
 app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'], credentials: true }));
 app.use(express.json()); // Parse JSON bodies
 app.use(express.urlencoded({ extended: true }));
+app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 // Middleware to attach io to req
 app.use((req, res, next) => {
     req.io = io;

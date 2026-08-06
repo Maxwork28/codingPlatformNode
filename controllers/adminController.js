@@ -1055,27 +1055,43 @@ exports.blockUser = async (req, res) => {
             return res.status(400).json({ error: 'Student ID and isBlocked (boolean) are required' });
         }
 
+        if (!mongoose.Types.ObjectId.isValid(classId) || !mongoose.Types.ObjectId.isValid(studentId)) {
+            return res.status(400).json({ error: 'Invalid classId or studentId' });
+        }
+
         const classData = await Class.findById(classId);
         if (!classData) {
             console.log('Error: Class not found');
             return res.status(404).json({ error: 'Class not found' });
         }
 
-        if (!classData.students.includes(studentId)) {
-            console.log('Error: Student not enrolled in class');
+        const studentObjectId = new mongoose.Types.ObjectId(studentId);
+        const isEnrolled = classData.students.some((id) => String(id) === String(studentId));
+        if (!isEnrolled) {
+            console.log('Error: Student not enrolled in class', { studentId, students: classData.students.map(String) });
             return res.status(400).json({ error: 'Student not enrolled in class' });
         }
 
-        const student = await User.findById(studentId);
+        const student = await User.findById(studentObjectId);
         if (!student || student.role !== 'student') {
             console.log('Error: Student not found or invalid role');
             return res.status(404).json({ error: 'Student not found' });
         }
 
-        student.isBlocked.set(classId, isBlocked);
+        if (!student.isBlocked) {
+            student.isBlocked = new Map();
+        }
+        student.isBlocked.set(String(classId), isBlocked);
         await student.save();
 
-        req.io.to(`class:${classId}`).emit('userBlocked', { classId, studentId, isBlocked });
+        req.io.to(`class:${classId}`).emit('userBlocked', { classId, studentId: String(studentId), isBlocked });
+        req.io.to(`class:${classId}`).emit('studentBlockStatusUpdated', {
+            classId,
+            studentId: String(studentId),
+            isBlocked,
+            studentName: student.name,
+            studentEmail: student.email,
+        });
         console.log('blockUser:', isBlocked ? 'Blocked' : 'Unblocked', 'student:', studentId);
 
         res.status(200).json({ message: `Student ${isBlocked ? 'blocked' : 'unblocked'} successfully` });
@@ -1088,8 +1104,8 @@ exports.blockUser = async (req, res) => {
 exports.blockAllUsers = async (req, res) => {
     try {
         const { classId } = req.params;
-        const { isBlocked } = req.body;
-        console.log('blockAllUsers: Request received:', { classId, isBlocked, user: { id: req.user._id, role: req.user.role } });
+        const { isBlocked, onlyInactive, studentIds } = req.body;
+        console.log('blockAllUsers: Request received:', { classId, isBlocked, onlyInactive, studentIds, user: { id: req.user._id, role: req.user.role } });
 
         if (typeof isBlocked !== 'boolean') {
             console.log('Error: Invalid isBlocked field');
@@ -1102,15 +1118,41 @@ exports.blockAllUsers = async (req, res) => {
             return res.status(404).json({ error: 'Class not found' });
         }
 
+        let targetStudentIds = classData.students.map((id) => String(id));
+
+        // Optional: only block specific student IDs (e.g. not-attempted from question stats)
+        if (Array.isArray(studentIds) && studentIds.length > 0) {
+            const allowed = new Set(targetStudentIds);
+            targetStudentIds = studentIds.map(String).filter((id) => allowed.has(id));
+        } else if (onlyInactive) {
+            // Block only inactive students (no submissions / activityStatus inactive)
+            const Leaderboard = require('../models/Leaderboard');
+            const entries = await Leaderboard.find({ classId }).select('studentId activityStatus totalSubmits').lean();
+            const activeIds = new Set(
+                entries
+                    .filter((e) => (e.activityStatus && e.activityStatus !== 'inactive') || (e.totalSubmits || 0) > 0)
+                    .map((e) => String(e.studentId))
+            );
+            targetStudentIds = targetStudentIds.filter((id) => !activeIds.has(id));
+        }
+
+        if (targetStudentIds.length === 0) {
+            return res.status(200).json({ message: 'No matching students to update', updated: 0 });
+        }
+
         await User.updateMany(
-            { _id: { $in: classData.students }, role: 'student' },
+            { _id: { $in: targetStudentIds }, role: 'student' },
             { $set: { [`isBlocked.${classId}`]: isBlocked } }
         );
 
-        req.io.to(`class:${classId}`).emit('allUsersBlocked', { classId, isBlocked });
-        console.log('blockAllUsers:', isBlocked ? 'Blocked' : 'Unblocked', 'all students');
+        req.io.to(`class:${classId}`).emit('allUsersBlocked', { classId, isBlocked, onlyInactive: !!onlyInactive });
+        req.io.to(`class:${classId}`).emit('studentBlockStatusUpdated', { classId, isBlocked, onlyInactive: !!onlyInactive });
+        console.log('blockAllUsers:', isBlocked ? 'Blocked' : 'Unblocked', 'students:', targetStudentIds.length);
 
-        res.status(200).json({ message: `All students ${isBlocked ? 'blocked' : 'unblocked'} successfully` });
+        res.status(200).json({
+            message: `${targetStudentIds.length} student(s) ${isBlocked ? 'blocked' : 'unblocked'} successfully`,
+            updated: targetStudentIds.length,
+        });
     } catch (err) {
         console.error('blockAllUsers: Error:', err);
         res.status(500).json({ error: 'Error updating block status' });
@@ -1239,24 +1281,27 @@ exports.blockUnblockStudent = async (req, res) => {
             return res.status(404).json({ error: 'Student not found or not a student' });
         }
 
-        if (!classData.students.includes(studentId)) {
+        if (!classData.students.some((id) => String(id) === String(studentId))) {
             console.error('[blockUnblockStudent] Validation failed: Student not enrolled');
             return res.status(400).json({ error: 'Student not enrolled in class' });
         }
 
-        if (req.user.role === 'teacher' && !classData.teachers.includes(req.user._id)) {
+        if (req.user.role === 'teacher' && !classData.teachers.some((id) => String(id) === String(req.user._id))) {
             console.error('[blockUnblockStudent] Authorization failed: Teacher not assigned to class');
             return res.status(403).json({ error: 'Teacher not assigned to this class' });
         }
 
-        console.log('[blockUnblockStudent] Current isBlocked status for this class:', student.isBlocked.get(classId));
+        if (!student.isBlocked) {
+            student.isBlocked = new Map();
+        }
+        console.log('[blockUnblockStudent] Current isBlocked status for this class:', student.isBlocked.get(String(classId)));
         console.log('[blockUnblockStudent] Setting isBlocked to:', isBlocked);
         
-        student.isBlocked.set(classId, isBlocked);
+        student.isBlocked.set(String(classId), isBlocked);
         await student.save();
         
         console.log('[blockUnblockStudent] ✅ Student saved successfully!');
-        console.log('[blockUnblockStudent] Final isBlocked status:', student.isBlocked.get(classId));
+        console.log('[blockUnblockStudent] Final isBlocked status:', student.isBlocked.get(String(classId)));
         console.log('[blockUnblockStudent] Full isBlocked Map:', Object.fromEntries(student.isBlocked));
 
         if (req.io) req.io.to(`class:${classId}`).emit('analyticsUpdated', { classId });

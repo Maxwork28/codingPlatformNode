@@ -1186,6 +1186,7 @@ exports.publishQuestion = async (req, res) => {
 
         console.log('[Publish Question] Before update:', classEntry.isPublished);
         classEntry.isPublished = true;
+        classEntry.publishedAt = new Date();
         await question.save();
         console.log('[Publish Question] After update:', classEntry.isPublished);
 
@@ -1193,6 +1194,7 @@ exports.publishQuestion = async (req, res) => {
             questionId,
             classId,
             isPublished: true,
+            publishedAt: classEntry.publishedAt,
         });
 
         res.status(200).json({ message: 'Question published successfully', question });
@@ -1392,26 +1394,66 @@ exports.getLeaderboard = async (req, res) => {
         }
 
         let leaderboard = await Leaderboard.find({ classId })
-            .populate('studentId', 'name email isBlocked')
+            .populate('studentId', 'name email isBlocked profilePicture')
             .lean();
 
         console.log('[Get Leaderboard] Raw leaderboard fetched:', leaderboard.length, 'entries');
-        console.log('[Get Leaderboard] Detailed entries:');
-        leaderboard.forEach((entry, idx) => {
-            const isBlockedForClass = entry.studentId?.isBlocked ? (entry.studentId.isBlocked[classId] || false) : false;
-            console.log(`  [${idx}] Student: ${entry.studentId?.name}, needsFocus: ${entry.needsFocus}, activityStatus: ${entry.activityStatus}, isBlocked: ${isBlockedForClass}`);
-        });
-        
-        // Add isBlocked status from User model to each leaderboard entry
-        leaderboard = leaderboard.map(entry => {
-            const isBlockedForClass = entry.studentId?.isBlocked ? (entry.studentId.isBlocked[classId] || false) : false;
+
+        // Rank by first-solved: more unique correct solves first, then earlier finish time
+        const ranked = leaderboard.map((entry) => {
+            const firstSolveByQuestion = {};
+            (entry.attempts || []).forEach((attempt) => {
+                if (attempt.isRun || !attempt.isCorrect || !attempt.questionId) return;
+                const qId = String(attempt.questionId);
+                const submittedAt = attempt.submittedAt ? new Date(attempt.submittedAt).getTime() : Infinity;
+                if (!firstSolveByQuestion[qId] || submittedAt < firstSolveByQuestion[qId]) {
+                    firstSolveByQuestion[qId] = submittedAt;
+                }
+            });
+
+            // Fallback to highestScores if attempts missing first-correct data
+            (entry.highestScores || []).forEach((hs) => {
+                if (!hs.isCorrect || !hs.questionId) return;
+                const qId = String(hs.questionId);
+                const submittedAt = hs.submittedAt ? new Date(hs.submittedAt).getTime() : Infinity;
+                if (!firstSolveByQuestion[qId] || submittedAt < firstSolveByQuestion[qId]) {
+                    firstSolveByQuestion[qId] = submittedAt;
+                }
+            });
+
+            const firstSolveTimes = Object.values(firstSolveByQuestion).filter((t) => Number.isFinite(t));
+            const problemsSolved = firstSolveTimes.length;
+            // Time when the student completed their last first-solve (earlier = better for same solve count)
+            const firstSolvedAt = problemsSolved > 0 ? Math.max(...firstSolveTimes) : Infinity;
+
+            const isBlockedForClass = entry.studentId?.isBlocked
+                ? (entry.studentId.isBlocked[classId] || false)
+                : false;
+
             return {
                 ...entry,
-                isBlocked: isBlockedForClass
+                isBlocked: isBlockedForClass,
+                problemsSolved,
+                firstSolvedAt: Number.isFinite(firstSolvedAt) ? new Date(firstSolvedAt) : null,
+                firstSolvedAtMs: firstSolvedAt,
             };
         });
-        
-        console.log('[Get Leaderboard] ✅ Returning leaderboard with isBlocked fields');
+
+        ranked.sort((a, b) => {
+            if (b.problemsSolved !== a.problemsSolved) return b.problemsSolved - a.problemsSolved;
+            if (a.firstSolvedAtMs !== b.firstSolvedAtMs) return a.firstSolvedAtMs - b.firstSolvedAtMs;
+            return (b.totalScore || 0) - (a.totalScore || 0);
+        });
+
+        leaderboard = ranked.slice(0, 10).map((entry, index) => {
+            const { firstSolvedAtMs, ...rest } = entry;
+            return {
+                ...rest,
+                rank: index + 1,
+            };
+        });
+
+        console.log('[Get Leaderboard] ✅ Returning top 10 ranked by first-solved');
         res.status(200).json({ leaderboard });
     } catch (err) {
         console.error('[Get Leaderboard] Error:', err.message);
@@ -1441,7 +1483,7 @@ exports.getQuestionsByClass = async (req, res) => {
         }
 
         // Authorization checks
-        if (user.role === 'student' && !classData.students.includes(user._id)) {
+        if (user.role === 'student' && !classData.students.some((id) => String(id) === String(user._id))) {
             console.warn('[Get Questions By Class] Error: Student not enrolled');
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
@@ -1506,13 +1548,38 @@ exports.getQuestionsByClass = async (req, res) => {
             return cmp !== 0 ? cmp : String(a._id).localeCompare(String(b._id));
         });
 
-        console.log('[Get Questions By Class] Questions fetched:', questions.length, {
+        // For students: attach attempt status (attempted / wrong / not_viewed)
+        let responseQuestions = questions;
+        if (user.role === 'student') {
+            const Leaderboard = require('../models/Leaderboard');
+            const lb = await Leaderboard.findOne({ classId, studentId: user._id }).lean();
+            const statusByQuestion = {};
+            (lb?.highestScores || []).forEach((hs) => {
+                const qId = String(hs.questionId);
+                if (hs.isCorrect) statusByQuestion[qId] = 'attempted';
+                else if (!statusByQuestion[qId]) statusByQuestion[qId] = 'wrong';
+            });
+            (lb?.attempts || []).forEach((att) => {
+                if (att.isRun) return;
+                const qId = String(att.questionId);
+                if (att.isCorrect) statusByQuestion[qId] = 'attempted';
+                else if (statusByQuestion[qId] !== 'attempted') statusByQuestion[qId] = 'wrong';
+            });
+
+            responseQuestions = questions.map((q) => {
+                const obj = q.toObject ? q.toObject() : { ...q };
+                obj.studentAttemptStatus = statusByQuestion[String(q._id)] || 'not_viewed';
+                return obj;
+            });
+        }
+
+        console.log('[Get Questions By Class] Questions fetched:', responseQuestions.length, {
             classQuestionsRef: (classData.questions || []).length,
             assignments: (classData.assignments || []).length,
             linkedByQuestionClasses: linkedByClassField.length,
             uniqueIds: objectIds.length
         });
-        res.status(200).json({ questions });
+        res.status(200).json({ questions: responseQuestions });
     } catch (err) {
         console.error('[Get Questions By Class] Error:', err.message);
         res.status(500).json({ error: 'Error fetching questions' });
@@ -1936,7 +2003,7 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
             return res.status(403).json({ error: 'Not authorized to view report' });
         }
 
-        const classData = await Class.findById(classId).populate('students', 'name email');
+        const classData = await Class.findById(classId).populate('students', 'name email isBlocked');
         if (!classData) {
             console.error('[Get Question Perspective Report] Error: Class not found');
             return res.status(404).json({ error: 'Class not found' });
@@ -1996,10 +2063,20 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
             const totalRuns = attempts.filter((a) => a.isRun).length;
             const highestScore = submits.length ? Math.max(...submits.map((a) => a.score)) : 0;
 
+            let isBlocked = false;
+            if (student.isBlocked) {
+                if (typeof student.isBlocked.get === 'function') {
+                    isBlocked = Boolean(student.isBlocked.get(String(classId)));
+                } else {
+                    isBlocked = Boolean(student.isBlocked[String(classId)]);
+                }
+            }
+
             return {
                 studentId: student._id,
                 studentName: student.name,
                 studentEmail: student.email,
+                isBlocked,
                 status,
                 totalAttempts: attempts.length,
                 correctAttempts,

@@ -5,17 +5,38 @@ const secret = process.env.JWT_SECRET || 'abcdefghijkl111';
 
 exports.authMiddleware = async (req, res, next) => {
     try {
-        const token = req.header('Authorization')?.replace('Bearer ', '');
-        if (!token) throw new Error('No token provided');
+        const authHeader = req.header('Authorization');
+        const token = authHeader?.startsWith('Bearer ')
+            ? authHeader.slice(7).trim()
+            : authHeader?.replace(/^Bearer\s+/i, '').trim();
 
-        const decoded = jwt.verify(token, secret);
-        const user = await User.findById(decoded.id);
-        if (!user) throw new Error('User not found');
+        if (!token) {
+            return res.status(401).json({ error: 'Please authenticate' });
+        }
+
+        let decoded;
+        try {
+            decoded = jwt.verify(token, secret);
+        } catch (jwtErr) {
+            console.error('[authMiddleware] JWT verify failed:', jwtErr.message);
+            return res.status(401).json({ error: 'Please authenticate' });
+        }
+
+        const userId = decoded.id || decoded._id;
+        if (!userId) {
+            return res.status(401).json({ error: 'Please authenticate' });
+        }
+
+        const user = await User.findById(userId);
+        if (!user) {
+            console.error('[authMiddleware] User not found for id:', userId);
+            return res.status(401).json({ error: 'Please authenticate' });
+        }
 
         req.user = user;
-        console.log("req.user",req.user)
         next();
     } catch (err) {
+        console.error('[authMiddleware] Unexpected error:', err.message);
         res.status(401).json({ error: 'Please authenticate' });
     }
 };
