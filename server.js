@@ -15,17 +15,45 @@ const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
+
+const defaultOrigins = [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'https://algosutra.co.in',
+    'https://www.algosutra.co.in',
+];
+
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+const corsOrigins = allowedOrigins.length > 0 ? allowedOrigins : defaultOrigins;
+
+const corsOptions = {
+    origin(origin, callback) {
+        // Allow non-browser clients (no Origin) and configured frontends
+        if (!origin || corsOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        console.warn('[CORS] Blocked origin:', origin);
+        return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
 const io = new Server(server, {
     cors: {
-        // origin: 'https://www.algosutra.co.in', 
-        origin: ['http://localhost:5173', 'http://localhost:5174'],
+        origin: corsOrigins,
         credentials: true,
-        methods: ['GET', 'POST', 'PUT', 'DELETE'],
+        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     },
 });
 
-// app.use(cors({ origin: 'https://www.algosutra.co.in', credentials: true }));
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'], credentials: true }));
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json()); // Parse JSON bodies
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
@@ -84,6 +112,7 @@ const PORT = Number(process.env.PORT) || 3000;
 
 mongoose.connect(MONGO_URI).then(async () => {
     console.log('MongoDB connected:', mongoose.connection.name);
+    console.log('[CORS] Allowed origins:', corsOrigins.join(', '));
     // await createInitialAdmin();
     server.listen(PORT, () => console.log(`Server started on port ${PORT}`));
 }).catch(err => console.error('MongoDB connection error:', err));
