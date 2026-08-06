@@ -53,7 +53,6 @@ const io = new Server(server, {
 });
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
 app.use(express.json()); // Parse JSON bodies
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
