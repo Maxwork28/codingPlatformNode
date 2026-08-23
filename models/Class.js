@@ -11,7 +11,7 @@ const classSchema = new mongoose.Schema({
         questionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Question', required: true },
         assignedAt: { type: Date, default: Date.now },
         dueDate: { type: Date },
-        maxPoints: { type: Number, default: 10 }
+        maxPoints: { type: Number }
     }],
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },
     createdAt: { type: Date, default: Date.now },

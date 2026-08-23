@@ -4,6 +4,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
 const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
+const { parseOptionalPoints, resolvePoints } = require('../utils/optionalPoints');
 const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Class = require('../models/Class');
@@ -78,6 +79,71 @@ const shouldMergeDriverForLanguage = (question, language) => {
 const shouldWrapBareArrayStdinForQuestion = (question, language) =>
     question.type === 'codingWithDriver' || shouldMergeDriverForLanguage(question, language);
 
+/** Written into the bind-mounted /app dir so each test can report wall time + peak RSS. */
+const JUDGE_METRICS_SCRIPT = `#!/bin/bash
+set +e
+INFILE="$1"
+shift
+
+if command -v /usr/bin/time >/dev/null 2>&1; then
+  /usr/bin/time -f '___METRICS___ %e %M' "$@" < "$INFILE"
+  exit $?
+fi
+
+START_NS=$(date +%s%N 2>/dev/null || echo 0)
+"$@" < "$INFILE" &
+PID=$!
+PEAK=0
+while kill -0 "$PID" 2>/dev/null; do
+  RSS=$(awk '/VmHWM/{print $2}' /proc/$PID/status 2>/dev/null)
+  if [ -n "$RSS" ] && [ "$RSS" -gt "$PEAK" ] 2>/dev/null; then
+    PEAK=$RSS
+  fi
+  if [ -f /proc/$PID/task/$PID/children ]; then
+    for CPID in $(cat /proc/$PID/task/$PID/children 2>/dev/null); do
+      CRSS=$(awk '/VmHWM/{print $2}' /proc/$CPID/status 2>/dev/null)
+      if [ -n "$CRSS" ] && [ "$CRSS" -gt "$PEAK" ] 2>/dev/null; then
+        PEAK=$CRSS
+      fi
+    done
+  fi
+  sleep 0.01
+done
+wait "$PID"
+STATUS=$?
+END_NS=$(date +%s%N 2>/dev/null || echo 0)
+if [ "$START_NS" != "0" ] && [ "$END_NS" != "0" ]; then
+  ELAPSED=$(awk -v s="$START_NS" -v e="$END_NS" 'BEGIN { printf "%.6f", (e-s)/1000000000 }')
+else
+  ELAPSED="0"
+fi
+echo "___METRICS___ \${ELAPSED} \${PEAK}" >&2
+exit $STATUS
+`.replace(/\r\n/g, '\n');
+
+const METRICS_LINE_RE = /___METRICS___\s+([\d.]+)\s+(\d+)/;
+
+const roundTimeMs = (value) => Math.round(Number(value) * 10) / 10;
+
+const parseJudgeMetrics = (stderr, wallMs) => {
+    const raw = String(stderr || '');
+    const match = raw.match(METRICS_LINE_RE);
+    let timeMs = Number.isFinite(Number(wallMs)) ? roundTimeMs(wallMs) : 0;
+    let memoryKb = null;
+    const error = raw.replace(METRICS_LINE_RE, '').trim() || null;
+    if (match) {
+        const sec = parseFloat(match[1]);
+        if (Number.isFinite(sec) && sec >= 0) {
+            timeMs = roundTimeMs(sec * 1000);
+        }
+        const mem = parseInt(match[2], 10);
+        if (Number.isFinite(mem) && mem > 0) {
+            memoryKb = mem;
+        }
+    }
+    return { timeMs, memoryKb, error };
+};
+
 const executeDockerCode = async (language, code, testCases, timeLimit, memoryLimit, options = {}) => {
     const wrapBareArrayStdin = !!options.wrapBareArrayStdinForDriver;
     console.log('[executeDockerCode] Starting execution for language:', language);
@@ -92,6 +158,7 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
     console.log('[executeDockerCode] Creating temp directory:', tempDir);
     await fs.mkdir(tempDir, { recursive: true });
     await fs.writeFile(path.join(tempDir, codeFile), code);
+    await fs.writeFile(path.join(tempDir, '_judge_metrics.sh'), JUDGE_METRICS_SCRIPT, 'utf8');
 
     let container;
     try {
@@ -160,7 +227,9 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                         error: compileError,
                         status: 'compile_error',
                         isTLE: false,
-                        isMLE: false
+                        isMLE: false,
+                        timeMs: null,
+                        memoryKb: null,
                     });
                 }
                 return testResults;
@@ -174,10 +243,10 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 console.log('[executeDockerCode] Normalized bare array stdin to {"arr":[...]} for driver compatibility');
             }
             console.log('[executeDockerCode] Running test case with input:', inputStr.substring(0, 50));
-            // Pipe stdin via base64 so JSON/shell metacharacters ($, !, quotes, newlines) never break the shell
-            const inputB64 = Buffer.from(stdinPayload, 'utf8').toString('base64');
+            await fs.writeFile(path.join(tempDir, '_stdin.txt'), stdinPayload, 'utf8');
+            const startedAt = process.hrtime.bigint();
             const exec = await container.exec({
-                Cmd: ['bash', '-c', `printf '%s' '${inputB64}' | base64 -d | ${config.runCmd.join(' ')}`],
+                Cmd: ['bash', '/app/_judge_metrics.sh', '/app/_stdin.txt', ...config.runCmd],
                 AttachStdout: true,
                 AttachStderr: true,
             });
@@ -190,9 +259,11 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 );
                 stream.on('end', resolve);
             });
+            const wallMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+            const metrics = parseJudgeMetrics(error, wallMs);
             console.log('[executeDockerCode] Test output:', output.substring(0, 100));
-            const passed = output.trim() === test.expectedOutput.trim();
-            const errStr = error.trim() || null;
+            const passed = output.trim() === String(test.expectedOutput ?? '').trim();
+            const errStr = metrics.error;
             const isTLE = errStr && (errStr.toLowerCase().includes('timeout') || errStr.toLowerCase().includes('timed out'));
             const isMLE = errStr && (errStr.toLowerCase().includes('memory') || errStr.toLowerCase().includes('oom') || (errStr.toLowerCase().includes('killed') && !isTLE));
             const status = passed ? 'accepted' : (isTLE ? 'tle' : isMLE ? 'mle' : 'wrong_answer');
@@ -205,7 +276,9 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 error: errStr,
                 status,
                 isTLE: !!isTLE,
-                isMLE: !!isMLE
+                isMLE: !!isMLE,
+                timeMs: metrics.timeMs,
+                memoryKb: metrics.memoryKb,
             });
         }
     } catch (err) {
@@ -224,7 +297,9 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 error: errMsg,
                 status,
                 isTLE: !!isTLE,
-                isMLE: !!isMLE
+                isMLE: !!isMLE,
+                timeMs: null,
+                memoryKb: null,
             });
         }
     } finally {
@@ -255,6 +330,8 @@ const sanitizeTestResultsForStudent = (testResults = []) =>
         status: r.status,
         isTLE: !!r.isTLE,
         isMLE: !!r.isMLE,
+        timeMs: r.timeMs ?? null,
+        memoryKb: r.memoryKb ?? null,
         ...(r.isPublic !== false
             ? {
                 input: r.input,
@@ -264,6 +341,8 @@ const sanitizeTestResultsForStudent = (testResults = []) =>
             }
             : {}),
     }));
+
+exports.sanitizeTestResultsForStudent = sanitizeTestResultsForStudent;
 
 exports.submitAnswer = async (req, res) => {
     console.log('[Submission] New answer submission started');
@@ -341,7 +420,7 @@ exports.submitAnswer = async (req, res) => {
         console.log('[Submission] Processing question type:', question.type);
         if (question.type === 'singleCorrectMcq') {
             isCorrect = parseInt(answer) === question.correctOption;
-            score = isCorrect ? question.points : 0;
+            score = isCorrect ? resolvePoints(question.points) : 0;
             output = answer;
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
@@ -352,14 +431,14 @@ exports.submitAnswer = async (req, res) => {
             isCorrect = submittedOptions.length === correctOptions.length &&
                        submittedOptions.every(opt => correctOptions.includes(opt)) &&
                        correctOptions.every(opt => submittedOptions.includes(opt));
-            score = isCorrect ? question.points : 0;
+            score = isCorrect ? resolvePoints(question.points) : 0;
             output = JSON.stringify(submittedOptions);
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
             console.log('[Submission] multipleCorrectMcq result:', isCorrect ? 'Correct' : 'Incorrect');
         } else if (question.type === 'fillInTheBlanks') {
             isCorrect = answer.trim().toLowerCase() === question.correctAnswer.trim().toLowerCase();
-            score = isCorrect ? question.points : 0;
+            score = isCorrect ? resolvePoints(question.points) : 0;
             output = answer;
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
@@ -397,7 +476,7 @@ exports.submitAnswer = async (req, res) => {
                 totalTestCases = testResults.length;
                 passedTestCases = testResults.filter(test => test.passed).length;
                 isCorrect = testResults.every(test => test.passed);
-                score = isCorrect ? question.points : Math.floor((passedTestCases / totalTestCases) * question.points);
+                score = isCorrect ? resolvePoints(question.points) : Math.floor((passedTestCases / totalTestCases) * resolvePoints(question.points));
                 const firstFail = testResults.find(t => !t.passed);
                 submissionStatus = isCorrect ? 'accepted' : (firstFail?.status || 'wrong_answer');
                 output = JSON.stringify(sanitizeTestResultsForStudent(testResults));
@@ -725,15 +804,9 @@ exports.runWithCustomInput = async (req, res) => {
             return res.status(400).json({ error: `Language ${language} is not supported for this question` });
         }
 
-        if (!customInput || typeof customInput !== 'string') {
+        if (!customInput || typeof customInput !== 'string' || !customInput.trim()) {
             console.error('[Run With Custom Input] Error: Invalid custom input');
             return res.status(400).json({ error: 'Valid custom input is required' });
-        }
-
-        // For codingWithDriver: allow JSON. For coding/fillInTheBlanksCoding: allow array format
-        if (question.type !== 'codingWithDriver' && !customInput.match(/^\[\s*-?\d+(\s*,\s*-?\d+)*\s*\]$/)) {
-            console.error('[Run With Custom Input] Error: Invalid array format');
-            return res.status(400).json({ error: 'Custom input must be a valid array (e.g., [1, 2, 3])' });
         }
 
         if (expectedOutput && typeof expectedOutput !== 'string') {
@@ -810,10 +883,14 @@ exports.runWithCustomInput = async (req, res) => {
         });
 
         console.log('[Run With Custom Input] Successfully processed');
+        const customResult = testResults[0];
         res.status(200).json({
             message: 'Code run with custom input successfully',
             submission,
-            testResults: testResults[0],
+            testResults: customResult,
+            actualOutput: customResult.output,
+            timeMs: customResult.timeMs ?? null,
+            memoryKb: customResult.memoryKb ?? null,
             explanation: question.explanation
         });
     } catch (err) {
@@ -905,7 +982,7 @@ exports.assignQuestion = async (req, res) => {
         const question = new Question({
             ...questionData,
             createdBy: user._id,
-            points: questionData.points || (questionData.type === 'singleCorrectMcq' ? 10 : questionData.type === 'multipleCorrectMcq' ? 10 : questionData.type === 'fillInTheBlanks' ? 15 : 20),
+            points: parseOptionalPoints(questionData.points),
             classes: classes.map(c => ({ classId: c._id, isPublished: false, isDisabled: false })),
         });
         await question.save();
@@ -989,6 +1066,10 @@ exports.editQuestion = async (req, res) => {
         }
 
         normalizeQuestionRichTextFields(questionData);
+        questionData.points = parseOptionalPoints(questionData.points);
+        if (questionData.points === undefined) {
+            return res.status(400).json({ error: 'Points must be a non-negative number when provided' });
+        }
 
         Object.assign(question, {
             ...questionData,
@@ -1883,6 +1964,8 @@ exports.viewSubmissionCode = async (req, res) => {
                     status: r.status,
                     isTLE: !!r.isTLE,
                     isMLE: !!r.isMLE,
+                    timeMs: r.timeMs ?? null,
+                    memoryKb: r.memoryKb ?? null,
                     input: r.input,
                     output: r.output,
                     expected: r.expected,
@@ -1937,7 +2020,7 @@ exports.markSubmissionCorrect = async (req, res) => {
             (question?.testCases?.length ?? 0);
 
         submission.isCorrect = true;
-        submission.score = question?.points ?? submission.score ?? 0;
+        submission.score = resolvePoints(question?.points) || submission.score || 0;
         submission.status = 'accepted';
         if (totalTestCases > 0) {
             submission.passedTestCases = totalTestCases;
@@ -2533,6 +2616,8 @@ exports.teacherTestWithCustomInput = async (req, res) => {
             actualOutput: testResult.output,
             passed,
             error: testResult.error,
+            timeMs: testResult.timeMs ?? null,
+            memoryKb: testResult.memoryKb ?? null,
             explanation: question.explanation,
             teacherMode: true
         });

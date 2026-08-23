@@ -4,10 +4,12 @@ const Class = require('../models/Class');
 const Submission = require('../models/Submission');
 const Question = require('../models/Question');
 const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
+const { resolvePoints } = require('../utils/optionalPoints');
 const {
     executeDockerCode,
     shouldMergeDriverForLanguage,
-    shouldWrapBareArrayStdinForQuestion
+    shouldWrapBareArrayStdinForQuestion,
+    sanitizeTestResultsForStudent
 } = require('./questionController');
 
 const sanitizeQuestionForExam = (questionDoc) => ({
@@ -667,10 +669,11 @@ exports.submitAnswer = async (req, res) => {
         let passedTestCases = 0;
         let totalTestCases = 0;
         let output = null;
+        let codingTestResults = null;
 
         if (question.type === 'singleCorrectMcq') {
             isCorrect = parseInt(answer) === question.correctOption;
-            score = isCorrect ? (exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points) : 0;
+            score = isCorrect ? (resolvePoints(exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points)) : 0;
             output = answer;
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
@@ -680,13 +683,13 @@ exports.submitAnswer = async (req, res) => {
             isCorrect = submittedOptions.length === correctOptions.length &&
                 submittedOptions.every(opt => correctOptions.includes(opt)) &&
                 correctOptions.every(opt => submittedOptions.includes(opt));
-            score = isCorrect ? (exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points) : 0;
+            score = isCorrect ? (resolvePoints(exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points)) : 0;
             output = JSON.stringify(submittedOptions);
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
         } else if (question.type === 'fillInTheBlanks') {
             isCorrect = answer.trim().toLowerCase() === question.correctAnswer.trim().toLowerCase();
-            score = isCorrect ? (exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points) : 0;
+            score = isCorrect ? (resolvePoints(exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points)) : 0;
             output = answer;
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
@@ -714,12 +717,13 @@ exports.submitAnswer = async (req, res) => {
                     question.memoryLimit,
                     { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
                 );
+                codingTestResults = testResults;
                 totalTestCases = testResults.length;
                 passedTestCases = testResults.filter(test => test.passed).length;
                 isCorrect = testResults.every(test => test.passed);
-                const questionPoints = exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points;
+                const questionPoints = resolvePoints(exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points);
                 score = isCorrect ? questionPoints : Math.floor((passedTestCases / totalTestCases) * questionPoints);
-                output = JSON.stringify(testResults.filter(result => result.isPublic));
+                output = JSON.stringify(sanitizeTestResultsForStudent(testResults));
             } catch (err) {
                 isCorrect = false;
                 score = 0;
@@ -753,7 +757,7 @@ exports.submitAnswer = async (req, res) => {
             submissionId: submission._id,
             answer,
             score,
-            maxScore: exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points,
+            maxScore: resolvePoints(exam.questions.find(q => String(q.questionId) === String(questionId))?.points || question.points),
             isCorrect,
             language,
             passedTestCases,
@@ -768,7 +772,11 @@ exports.submitAnswer = async (req, res) => {
 
         await attempt.save();
 
-        res.json({ message: 'Answer submitted', submission, score, isCorrect, passedTestCases, totalTestCases });
+        const examSubmitPayload = { message: 'Answer submitted', submission, score, isCorrect, passedTestCases, totalTestCases };
+        if (codingTestResults) {
+            examSubmitPayload.testResults = sanitizeTestResultsForStudent(codingTestResults);
+        }
+        res.json(examSubmitPayload);
     } catch (err) {
         console.error('[ExamController] submitAnswer error:', err);
         res.status(500).json({ error: 'Failed to submit answer' });

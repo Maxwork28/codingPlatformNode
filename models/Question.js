@@ -22,7 +22,7 @@ const questionSchema = new mongoose.Schema({
     description: { type: String, required: true },
     difficulty: { type: String, enum: ['easy', 'medium', 'hard'], required: true },
     tags: [{ type: String }],
-    points: { type: Number, default: 10 },
+    points: { type: Number },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },

@@ -9,6 +9,7 @@ const Leaderboard = require('../models/Leaderboard');
 const generatePassword = require('../utils/generatePassword');
 const sendEmail = require('../utils/sendEmail');
 const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
+const { parseOptionalPoints } = require('../utils/optionalPoints');
 const mongoose = require('mongoose');
 const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'];
 
@@ -974,7 +975,7 @@ exports.createAssignment = async (req, res) => {
             questionId,
             assignedAt: new Date(),
             dueDate: dueDate ? new Date(dueDate) : undefined,
-            maxPoints,
+            maxPoints: parseOptionalPoints(maxPoints),
         };
 
         classData.assignments.push(assignment);
@@ -1594,9 +1595,10 @@ exports.adminCreateQuestion = async (req, res) => {
             console.error('[Admin Create Question] Error: Invalid difficulty');
             return res.status(400).json({ error: 'Difficulty must be easy, medium, or hard' });
         }
-        if (questionData.points && (typeof questionData.points !== 'number' || questionData.points <= 0)) {
+        questionData.points = parseOptionalPoints(questionData.points);
+        if (questionData.points === undefined) {
             console.error('[Admin Create Question] Error: Invalid points');
-            return res.status(400).json({ error: 'Points must be a positive number' });
+            return res.status(400).json({ error: 'Points must be a non-negative number when provided' });
         }
         if (questionData.maxAttempts && (typeof questionData.maxAttempts !== 'number' || questionData.maxAttempts <= 0)) {
             console.error('[Admin Create Question] Error: Invalid maxAttempts');
@@ -1724,7 +1726,7 @@ exports.adminCreateQuestion = async (req, res) => {
         const question = new Question({
             ...questionData,
             createdBy: user._id,
-            points: questionData.points || (questionData.type === 'singleCorrectMcq' ? 10 : questionData.type === 'multipleCorrectMcq' ? 10 : questionData.type === 'fillInTheBlanks' ? 15 : 20),
+            points: parseOptionalPoints(questionData.points),
             classes: [], // Admins don't assign to classes
             status: isDraft ? 'draft' : 'published',
             isDraft: isDraft,
@@ -1861,9 +1863,10 @@ exports.editQuestion = async (req, res) => {
             console.error('[Admin Edit Question] Error: Invalid difficulty');
             return res.status(400).json({ error: 'Difficulty must be easy, medium, or hard' });
         }
-        if (questionData.points && (typeof questionData.points !== 'number' || questionData.points <= 0)) {
+        questionData.points = parseOptionalPoints(questionData.points);
+        if (questionData.points === undefined) {
             console.error('[Admin Edit Question] Error: Invalid points');
-            return res.status(400).json({ error: 'Points must be a positive number' });
+            return res.status(400).json({ error: 'Points must be a non-negative number when provided' });
         }
         if (questionData.maxAttempts && (typeof questionData.maxAttempts !== 'number' || questionData.maxAttempts <= 0)) {
             console.error('[Admin Edit Question] Error: Invalid maxAttempts');
@@ -2160,7 +2163,7 @@ exports.createDraftQuestion = async (req, res) => {
             createdBy: user._id,
             status: 'draft',
             isDraft: true,
-            points: questionData.points || 10,
+            points: parseOptionalPoints(questionData.points),
             classes: [],
             createdAt: new Date(),
             updatedAt: new Date(),
