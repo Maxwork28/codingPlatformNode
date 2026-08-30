@@ -73,6 +73,13 @@ router.get(
   adminController.getAllTeachers
 );
 
+router.delete(
+  '/teachers/:teacherId',
+  authMiddleware,
+  requireRole('admin'),
+  adminController.deleteTeacher
+);
+
 router.post(
   '/classes/assign-teacher',
   authMiddleware,

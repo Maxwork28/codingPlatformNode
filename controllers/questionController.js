@@ -36,6 +36,24 @@ const ensureTeacherCanCreateQuestion = (user, actionLabel, res) => {
 };
 
 /**
+ * Store a question diagram/screenshot. The file is saved under /uploads/questions
+ * and the relative URL is returned so it can be embedded in description HTML.
+ */
+exports.uploadQuestionImage = async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No image uploaded' });
+        }
+        const url = `/uploads/questions/${req.file.filename}`;
+        console.log('[Upload Question Image]', { userId: req.user?._id, url });
+        return res.status(200).json({ url });
+    } catch (err) {
+        console.error('[Upload Question Image] Error:', err.message);
+        return res.status(500).json({ error: 'Error uploading image' });
+    }
+};
+
+/**
  * Teachers often store test stdin as a bare JSON array, e.g. [1, 5, 3, 9, 2],
  * while LeetCode-style drivers expect one JSON object with an "arr" field:
  * {"arr":[1,5,3,9,2]}. Without this, JSON.parse yields an array, data.arr is undefined,
@@ -80,46 +98,44 @@ const shouldWrapBareArrayStdinForQuestion = (question, language) =>
     question.type === 'codingWithDriver' || shouldMergeDriverForLanguage(question, language);
 
 /** Written into the bind-mounted /app dir so each test can report wall time + peak RSS. */
-const JUDGE_METRICS_SCRIPT = `#!/bin/bash
-set +e
-INFILE="$1"
-shift
-
-if command -v /usr/bin/time >/dev/null 2>&1; then
-  /usr/bin/time -f '___METRICS___ %e %M' "$@" < "$INFILE"
-  exit $?
-fi
-
-START_NS=$(date +%s%N 2>/dev/null || echo 0)
-"$@" < "$INFILE" &
-PID=$!
-PEAK=0
-while kill -0 "$PID" 2>/dev/null; do
-  RSS=$(awk '/VmHWM/{print $2}' /proc/$PID/status 2>/dev/null)
-  if [ -n "$RSS" ] && [ "$RSS" -gt "$PEAK" ] 2>/dev/null; then
-    PEAK=$RSS
-  fi
-  if [ -f /proc/$PID/task/$PID/children ]; then
-    for CPID in $(cat /proc/$PID/task/$PID/children 2>/dev/null); do
-      CRSS=$(awk '/VmHWM/{print $2}' /proc/$CPID/status 2>/dev/null)
-      if [ -n "$CRSS" ] && [ "$CRSS" -gt "$PEAK" ] 2>/dev/null; then
-        PEAK=$CRSS
-      fi
-    done
-  fi
-  sleep 0.01
-done
-wait "$PID"
-STATUS=$?
-END_NS=$(date +%s%N 2>/dev/null || echo 0)
-if [ "$START_NS" != "0" ] && [ "$END_NS" != "0" ]; then
-  ELAPSED=$(awk -v s="$START_NS" -v e="$END_NS" 'BEGIN { printf "%.6f", (e-s)/1000000000 }')
-else
-  ELAPSED="0"
-fi
-echo "___METRICS___ \${ELAPSED} \${PEAK}" >&2
-exit $STATUS
-`.replace(/\r\n/g, '\n');
+const JUDGE_METRICS_SCRIPT = [
+    '#!/bin/sh',
+    'set +e',
+    'INFILE="$1"',
+    'shift',
+    'METRICS_FILE="/app/_metrics.txt"',
+    'rm -f "$METRICS_FILE"',
+    '',
+    'if [ -x /usr/bin/time ]; then',
+    '  /usr/bin/time -f "___METRICS___ %e %M" -o "$METRICS_FILE" -- "$@" < "$INFILE"',
+    '  STATUS=$?',
+    '  if [ -s "$METRICS_FILE" ]; then',
+    '    exit $STATUS',
+    '  fi',
+    'fi',
+    '',
+    'START_NS=$(date +%s%N 2>/dev/null || echo 0)',
+    '"$@" < "$INFILE" &',
+    'PID=$!',
+    'PEAK=0',
+    'while kill -0 "$PID" 2>/dev/null; do',
+    '  RSS=$(awk "/VmHWM/{print \\$2}" /proc/$PID/status 2>/dev/null)',
+    '  if [ -n "$RSS" ] && [ "$RSS" -gt "$PEAK" ] 2>/dev/null; then',
+    '    PEAK=$RSS',
+    '  fi',
+    '  sleep 0.01',
+    'done',
+    'wait "$PID"',
+    'STATUS=$?',
+    'END_NS=$(date +%s%N 2>/dev/null || echo 0)',
+    'ELAPSED="0"',
+    'if [ "$START_NS" != "0" ] && [ "$END_NS" != "0" ]; then',
+    '  ELAPSED=$(awk -v s="$START_NS" -v e="$END_NS" \'BEGIN { printf "%.6f", (e-s)/1000000000 }\')',
+    'fi',
+    'echo "___METRICS___ $ELAPSED $PEAK" > "$METRICS_FILE"',
+    'exit $STATUS',
+    '',
+].join('\n');
 
 const METRICS_LINE_RE = /___METRICS___\s+([\d.]+)\s+(\d+)/;
 
@@ -246,7 +262,7 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
             await fs.writeFile(path.join(tempDir, '_stdin.txt'), stdinPayload, 'utf8');
             const startedAt = process.hrtime.bigint();
             const exec = await container.exec({
-                Cmd: ['bash', '/app/_judge_metrics.sh', '/app/_stdin.txt', ...config.runCmd],
+                Cmd: ['/bin/sh', '/app/_judge_metrics.sh', '/app/_stdin.txt', ...config.runCmd],
                 AttachStdout: true,
                 AttachStderr: true,
             });
@@ -260,7 +276,13 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 stream.on('end', resolve);
             });
             const wallMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
-            const metrics = parseJudgeMetrics(error, wallMs);
+            let metricsFile = '';
+            try {
+                metricsFile = await fs.readFile(path.join(tempDir, '_metrics.txt'), 'utf8');
+            } catch {
+                metricsFile = '';
+            }
+            const metrics = parseJudgeMetrics(`${metricsFile}\n${error}`, wallMs);
             console.log('[executeDockerCode] Test output:', output.substring(0, 100));
             const passed = output.trim() === String(test.expectedOutput ?? '').trim();
             const errStr = metrics.error;
@@ -1149,7 +1171,9 @@ exports.viewSolution = async (req, res) => {
             return res.status(403).json({ error: 'Only admin or teacher can view solution' });
         }
 
-        const question = await Question.findById(questionId).select('solution correctAnswer correctOption correctOptions codeSnippet templateCode starterCode');
+        const question = await Question.findById(questionId).select(
+            'solution solutionCode solutionLanguage solutionCodes correctAnswer correctOption correctOptions codeSnippet templateCode starterCode'
+        );
         if (!question) {
             console.error('[View Solution] Error: Not found');
             return res.status(404).json({ error: 'Question not found' });
@@ -1582,28 +1606,34 @@ exports.getQuestionsByClass = async (req, res) => {
 
         // Collect every question id tied to this class: Class.questions, Class.assignments, and Question.classes.
         // Assignments often list all "assigned" work while class.questions can be shorter or stale.
+        // Preserve insertion order from Class.questions (then assignments, then any extra links).
         if (!mongoose.Types.ObjectId.isValid(classId)) {
             return res.status(400).json({ error: 'Invalid class ID' });
         }
         const classOid = new mongoose.Types.ObjectId(classId);
-        const idSet = new Set();
+        const orderedIds = [];
+        const seenIds = new Set();
+        const pushOrderedId = (raw) => {
+            const id = raw && raw._id ? raw._id : raw;
+            const key = id ? String(id) : '';
+            if (!key || seenIds.has(key)) return;
+            seenIds.add(key);
+            orderedIds.push(key);
+        };
 
         for (const q of classData.questions || []) {
-            const id = q && q._id ? q._id : q;
-            if (id) idSet.add(String(id));
+            pushOrderedId(q);
         }
         for (const a of classData.assignments || []) {
-            const qid = a.questionId;
-            const id = qid && qid._id ? qid._id : qid;
-            if (id) idSet.add(String(id));
+            pushOrderedId(a.questionId);
         }
 
         const linkedByClassField = await Question.find({ 'classes.classId': classOid });
         for (const q of linkedByClassField) {
-            if (q && q._id) idSet.add(String(q._id));
+            pushOrderedId(q._id);
         }
 
-        const objectIds = [...idSet]
+        const objectIds = orderedIds
             .filter((id) => mongoose.Types.ObjectId.isValid(id))
             .map((id) => new mongoose.Types.ObjectId(id));
 
@@ -1623,10 +1653,11 @@ exports.getQuestionsByClass = async (req, res) => {
             return true;
         });
 
+        const orderIndex = new Map(orderedIds.map((id, idx) => [id, idx]));
         questions.sort((a, b) => {
-            const strip = (t) => (t || '').replace(/<[^>]*>/g, '');
-            const cmp = strip(a.title).localeCompare(strip(b.title));
-            return cmp !== 0 ? cmp : String(a._id).localeCompare(String(b._id));
+            const ai = orderIndex.get(String(a._id));
+            const bi = orderIndex.get(String(b._id));
+            return (ai ?? Number.MAX_SAFE_INTEGER) - (bi ?? Number.MAX_SAFE_INTEGER);
         });
 
         // For students: attach attempt status (attempted / wrong / not_viewed)
@@ -2114,6 +2145,7 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
             .lean();
 
         const attemptsByStudent = new Map();
+        const lastSubmitByStudent = new Map();
         for (const sub of submissions) {
             const sid = sub.studentId.toString();
             if (!attemptsByStudent.has(sid)) attemptsByStudent.set(sid, []);
@@ -2128,6 +2160,9 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
                 totalTestCases: sub.totalTestCases ?? 0,
                 status: sub.status || (sub.isCorrect ? 'accepted' : 'wrong_answer'),
             });
+            if (!sub.isRun && !lastSubmitByStudent.has(sid)) {
+                lastSubmitByStudent.set(sid, sub);
+            }
         }
 
         const statusOrder = { correct: 0, incorrect: 1, not_attempted: 2 };
@@ -2155,6 +2190,8 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
                 }
             }
 
+            const lastSubmit = lastSubmitByStudent.get(sid);
+
             return {
                 studentId: student._id,
                 studentName: student.name,
@@ -2168,6 +2205,10 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
                 totalSubmits: submits.length,
                 highestScore,
                 latestSubmission: attempts[0]?.submittedAt || null,
+                lastSubmittedAnswer: lastSubmit?.answer ?? null,
+                lastSubmittedLanguage: lastSubmit?.language ?? null,
+                lastSubmittedAt: lastSubmit?.submittedAt || null,
+                lastSubmittedIsCorrect: lastSubmit ? Boolean(lastSubmit.isCorrect) : null,
                 attempts,
             };
         });
@@ -2257,7 +2298,7 @@ exports.teacherTestQuestion = async (req, res) => {
     
     try {
         const { questionId } = req.params;
-        const { answer, classId, language } = req.body;
+        const { answer, classId, language, publicOnly } = req.body;
         const user = req.user;
 
         console.log('[Teacher Test Question] Extracted data:', {
@@ -2265,6 +2306,7 @@ exports.teacherTestQuestion = async (req, res) => {
             answer: answer ? `${answer.substring(0, 100)}... (length: ${answer.length})` : 'MISSING',
             classId: classId || 'null (draft question)',
             language,
+            publicOnly: Boolean(publicOnly),
             userId: user?._id,
             userRole: user?.role
         });
@@ -2404,14 +2446,21 @@ exports.teacherTestQuestion = async (req, res) => {
             memoryLimit
         });
 
-        // Execute with ALL test cases (public + hidden)
+        // Execute public tests only for Run; all tests for Submit
+        const testsToRun = publicOnly
+            ? (question.testCases.filter((tc) => tc.isPublic).length
+                ? question.testCases.filter((tc) => tc.isPublic)
+                : question.testCases)
+            : question.testCases;
+
         let testResults;
         try {
             console.log('[Teacher Test Question] ====== EXECUTING CODE ======');
             console.log('[Teacher Test Question] Calling executeDockerCode with:', {
                 language,
                 codeLength: codeToExecute.length,
-                testCasesCount: question.testCases.length,
+                testCasesCount: testsToRun.length,
+                publicOnly: Boolean(publicOnly),
                 timeLimit,
                 memoryLimit
             });
@@ -2419,7 +2468,7 @@ exports.teacherTestQuestion = async (req, res) => {
             testResults = await executeDockerCode(
                 language,
                 codeToExecute,
-                question.testCases, // ALL test cases
+                testsToRun,
                 timeLimit,
                 memoryLimit,
                 { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
@@ -2431,6 +2480,8 @@ exports.teacherTestQuestion = async (req, res) => {
                 results: testResults?.map((result, idx) => ({
                     index: idx,
                     passed: result.passed,
+                    timeMs: result.timeMs,
+                    memoryKb: result.memoryKb,
                     input: result.input?.substring(0, 30),
                     output: result.output?.substring(0, 30),
                     expected: result.expected?.substring(0, 30),

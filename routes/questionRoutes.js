@@ -1,7 +1,49 @@
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
 const router = express.Router();
 const questionController = require('../controllers/questionController');
 const { authMiddleware, requireRole } = require('../middleware/auth');
+
+const questionImageDir = path.join(__dirname, '..', 'uploads', 'questions');
+if (!fs.existsSync(questionImageDir)) {
+  fs.mkdirSync(questionImageDir, { recursive: true });
+}
+
+const questionImageUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, questionImageDir),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase() || '.png';
+      const safeExt = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext) ? ext : '.png';
+      cb(null, `${req.user._id}-${Date.now()}${safeExt}`);
+    },
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+    if (!file.mimetype || !allowed.includes(file.mimetype)) {
+      return cb(new Error('Only PNG, JPG, GIF, or WebP images are allowed'));
+    }
+    cb(null, true);
+  },
+});
+
+router.post(
+  '/upload-image',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  (req, res, next) => {
+    questionImageUpload.single('image')(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({ error: err.message || 'Failed to upload image' });
+      }
+      next();
+    });
+  },
+  questionController.uploadQuestionImage
+);
 
 // Search questions route must come before /:questionId to avoid misinterpretation
 router.get('/search', 

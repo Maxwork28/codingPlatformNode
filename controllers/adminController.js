@@ -383,6 +383,53 @@ exports.getAllTeachers = async (req, res) => {
     }
 };
 
+/**
+ * Remove a teacher account from the teacher list only.
+ * Does not delete classes, questions, exams, submissions, or other related records.
+ */
+exports.deleteTeacher = async (req, res) => {
+    console.log('[Delete Teacher] Deleting teacher:', req.params.teacherId);
+    try {
+        const { teacherId } = req.params;
+        const user = req.user;
+
+        if (!['admin'].includes(user.role)) {
+            console.warn('[Delete Teacher] Error: Not authorized');
+            return res.status(403).json({ error: 'Only admin can delete teachers' });
+        }
+
+        if (!isValidObjectId(teacherId)) {
+            console.error('[Delete Teacher] Error: Invalid teacherId');
+            return res.status(400).json({ error: 'Valid teacherId is required' });
+        }
+
+        const teacher = await User.findById(teacherId);
+        if (!teacher) {
+            console.error('[Delete Teacher] Error: Teacher not found');
+            return res.status(404).json({ error: 'Teacher not found' });
+        }
+
+        if (teacher.role !== 'teacher') {
+            console.error('[Delete Teacher] Error: User is not a teacher');
+            return res.status(400).json({ error: 'User is not a teacher' });
+        }
+
+        // Unassign from class teacher lists only — keep classes and created content.
+        await Class.updateMany(
+            { teachers: teacherId },
+            { $pull: { teachers: teacherId } }
+        );
+
+        await teacher.deleteOne();
+
+        console.log('[Delete Teacher] Teacher removed from list:', teacherId);
+        res.status(200).json({ message: 'Teacher deleted successfully' });
+    } catch (err) {
+        console.error('[Delete Teacher] Error:', err.message);
+        res.status(500).json({ error: 'Error deleting teacher' });
+    }
+};
+
 exports.getAllStudents = async (req, res) => {
     try {
         const { search } = req.query;
