@@ -1172,7 +1172,7 @@ exports.viewSolution = async (req, res) => {
         }
 
         const question = await Question.findById(questionId).select(
-            'solution solutionCode solutionLanguage solutionCodes correctAnswer correctOption correctOptions codeSnippet templateCode starterCode'
+            'type languages solution solutionCode solutionLanguage solutionCodes correctAnswer correctOption correctOptions'
         );
         if (!question) {
             console.error('[View Solution] Error: Not found');
@@ -1579,9 +1579,9 @@ exports.getQuestionsByClass = async (req, res) => {
             return res.status(403).json({ error: 'Not authorized to view questions' });
         }
 
-        const classData = await Class.findById(classId)
-            .populate('questions')
-            .populate('teachers', '_id');
+        // Do not populate `questions` — populate/$in can reorder docs by _id or title.
+        // Insertion order lives on the raw Class.questions ObjectId array.
+        const classData = await Class.findById(classId).populate('teachers', '_id');
         if (!classData) {
             console.error('[Get Questions By Class] Error: Class not found');
             return res.status(404).json({ error: 'Class not found' });
@@ -2538,7 +2538,6 @@ exports.teacherTestQuestion = async (req, res) => {
             publicTestCases,
             hiddenTestCases,
             isCorrect,
-            explanation: question.explanation,
             teacherMode: true
         };
 
@@ -2669,7 +2668,6 @@ exports.teacherTestWithCustomInput = async (req, res) => {
             error: testResult.error,
             timeMs: testResult.timeMs ?? null,
             memoryKb: testResult.memoryKb ?? null,
-            explanation: question.explanation,
             teacherMode: true
         });
     } catch (err) {
