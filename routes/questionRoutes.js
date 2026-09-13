@@ -64,6 +64,12 @@ router.put('/:questionId',
   questionController.editQuestion
 );
 
+router.put('/:questionId/limits',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  questionController.updateQuestionLimits
+);
+
 router.delete('/:questionId', 
   authMiddleware,
   requireRole('admin', 'teacher'),

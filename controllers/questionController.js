@@ -5,6 +5,7 @@ const path = require('path');
 const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
 const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
 const { parseOptionalPoints, resolvePoints } = require('../utils/optionalPoints');
+const { applyDefaultSolutions } = require('../utils/buildDefaultSolutions');
 const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Class = require('../models/Class');
@@ -97,6 +98,25 @@ const shouldMergeDriverForLanguage = (question, language) => {
 const shouldWrapBareArrayStdinForQuestion = (question, language) =>
     question.type === 'codingWithDriver' || shouldMergeDriverForLanguage(question, language);
 
+const looksLikeFullProgram = (code) => {
+    const s = String(code || '');
+    if (s.length > 80) return true;
+    if ((s.match(/\n/g) || []).length >= 2) return true;
+    return /^\s*(import |from |const |let |var |def |function |class |#include|public class|package )/m.test(s);
+};
+
+const resolveFillInTheBlanksCodingCode = (question, answer, language) => {
+    const snippet =
+        question.codeSnippet ||
+        question.starterCode?.find((row) => row.language === language)?.code ||
+        question.templateCode?.find((row) => row.language === language)?.code ||
+        '';
+    if (looksLikeFullProgram(answer) || !snippet || !/FILL_IN_THE_BLANK/.test(snippet)) {
+        return answer;
+    }
+    return snippet.replace(/\/\/\s*FILL_IN_THE_BLANK|\/\/\s*___FILL_IN_THE_BLANK___|#\s*___FILL_IN_THE_BLANK___/g, answer);
+};
+
 /** Written into the bind-mounted /app dir so each test can report wall time + peak RSS. */
 const JUDGE_METRICS_SCRIPT = [
     '#!/bin/sh',
@@ -140,6 +160,36 @@ const JUDGE_METRICS_SCRIPT = [
 const METRICS_LINE_RE = /___METRICS___\s+([\d.]+)\s+(\d+)/;
 
 const roundTimeMs = (value) => Math.round(Number(value) * 10) / 10;
+
+const parseOptionalJudgeLimit = (value, min, max, { integer = true } = {}) => {
+    if (value == null || value === '') return undefined;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    const rounded = integer ? Math.round(n) : Math.round(n * 10) / 10;
+    if (rounded < min || rounded > max) return null;
+    return rounded;
+};
+
+const summarizeRunCaseMetrics = (results) => {
+    const times = (results || []).map((row) => Number(row.timeMs)).filter((n) => Number.isFinite(n) && n >= 0);
+    const mems = (results || []).map((row) => Number(row.memoryKb)).filter((n) => Number.isFinite(n) && n > 0);
+    return {
+        maxTimeMs: times.length ? Math.max(...times) : null,
+        maxMemoryKb: mems.length ? Math.max(...mems) : null,
+    };
+};
+
+const averageNumbers = (values) => {
+    const nums = (values || []).filter((n) => Number.isFinite(n));
+    if (!nums.length) return null;
+    return nums.reduce((sum, n) => sum + n, 0) / nums.length;
+};
+
+const fieldLimitsFromAverages = (avgTimeMs, avgMemoryKb) => {
+    const timeLimit = Math.min(5, Math.max(0.1, Math.ceil(((Number(avgTimeMs) || 0) / 1000) * 10) / 10 || 0.1));
+    const memoryLimit = Math.min(1024, Math.max(16, Math.ceil((Number(avgMemoryKb) || 0) / 1024) || 16));
+    return { timeLimit, memoryLimit };
+};
 
 const parseJudgeMetrics = (stderr, wallMs) => {
     const raw = String(stderr || '');
@@ -1007,6 +1057,7 @@ exports.assignQuestion = async (req, res) => {
             points: parseOptionalPoints(questionData.points),
             classes: classes.map(c => ({ classId: c._id, isPublished: false, isDisabled: false })),
         });
+        applyDefaultSolutions(question);
         await question.save();
         console.log('[Question Assignment] Saved:', question._id);
 
@@ -1097,6 +1148,7 @@ exports.editQuestion = async (req, res) => {
             ...questionData,
             updatedAt: new Date(),
         });
+        applyDefaultSolutions(question);
         await question.save();
 
         for (const classEntry of question.classes) {
@@ -1111,6 +1163,38 @@ exports.editQuestion = async (req, res) => {
     } catch (err) {
         console.error('[Edit Question] Error:', err.message);
         res.status(500).json({ error: 'Error editing question' });
+    }
+};
+
+exports.updateQuestionLimits = async (req, res) => {
+    try {
+        const { questionId } = req.params;
+        const user = req.user;
+        if (!['admin', 'teacher'].includes(user.role)) {
+            return res.status(403).json({ error: 'Only admin or teacher can update limits' });
+        }
+
+        const timeLimit = parseOptionalJudgeLimit(req.body.timeLimit, 0.1, 5, { integer: false });
+        const memoryLimit = parseOptionalJudgeLimit(req.body.memoryLimit, 16, 1024, { integer: true });
+        if (timeLimit == null || memoryLimit == null) {
+            return res.status(400).json({ error: 'Time limit must be 0.1–5 seconds and memory limit must be 16–1024 MB' });
+        }
+
+        const question = await Question.findById(questionId);
+        if (!question) {
+            return res.status(404).json({ error: 'Question not found' });
+        }
+        if (!['coding', 'fillInTheBlanksCoding', 'codingWithDriver'].includes(question.type)) {
+            return res.status(400).json({ error: 'Limits can only be set on coding questions' });
+        }
+
+        question.timeLimit = timeLimit;
+        question.memoryLimit = memoryLimit;
+        await question.save();
+        res.status(200).json({ message: 'Limits updated', timeLimit, memoryLimit });
+    } catch (err) {
+        console.error('[Update Question Limits] Error:', err.message);
+        res.status(500).json({ error: 'Error updating limits' });
     }
 };
 
@@ -1172,7 +1256,7 @@ exports.viewSolution = async (req, res) => {
         }
 
         const question = await Question.findById(questionId).select(
-            'type languages solution solutionCode solutionLanguage solutionCodes correctAnswer correctOption correctOptions'
+            'type languages options solution solutionCode solutionLanguage solutionCodes correctAnswer correctOption correctOptions'
         );
         if (!question) {
             console.error('[View Solution] Error: Not found');
@@ -2298,7 +2382,8 @@ exports.teacherTestQuestion = async (req, res) => {
     
     try {
         const { questionId } = req.params;
-        const { answer, classId, language, publicOnly } = req.body;
+        const { answer, classId, publicOnly } = req.body;
+        const language = String(req.body.language || '').trim().toLowerCase();
         const user = req.user;
 
         console.log('[Teacher Test Question] Extracted data:', {
@@ -2422,11 +2507,11 @@ exports.teacherTestQuestion = async (req, res) => {
         let codeToExecute = answer;
         if (question.type === 'fillInTheBlanksCoding') {
             console.log('[Teacher Test Question] Processing fillInTheBlanksCoding question');
-            if (!question.codeSnippet) {
-                console.error('[Teacher Test Question] ERROR: Missing codeSnippet for fillInTheBlanksCoding question');
+            codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
+            if (!String(codeToExecute || '').trim()) {
+                console.error('[Teacher Test Question] ERROR: Missing code for fillInTheBlanksCoding question');
                 return res.status(400).json({ error: 'Question is missing code snippet' });
             }
-            codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Teacher Test Question] Combined code for execution (length:', codeToExecute.length, ')');
         } else if (shouldMergeDriverForLanguage(question, language)) {
             const driverCodeObj = question.driverCode.find(d => d.language === language);
@@ -2438,12 +2523,23 @@ exports.teacherTestQuestion = async (req, res) => {
             console.log('[Teacher Test Question] Processing coding question. Code length:', codeToExecute.length);
         }
 
-        // Validate time and memory limits
-        const timeLimit = question.timeLimit || 2;
-        const memoryLimit = question.memoryLimit || 256;
+        // Validate time and memory limits (optional override from Test Solution)
+        const hasTimeOverride = req.body.timeLimit != null && req.body.timeLimit !== '';
+        const hasMemoryOverride = req.body.memoryLimit != null && req.body.memoryLimit !== '';
+        const overrideTime = hasTimeOverride ? parseOptionalJudgeLimit(req.body.timeLimit, 0.1, 5, { integer: false }) : undefined;
+        const overrideMemory = hasMemoryOverride ? parseOptionalJudgeLimit(req.body.memoryLimit, 16, 1024) : undefined;
+        if (hasTimeOverride && overrideTime == null) {
+            return res.status(400).json({ error: 'Time limit must be between 0.1 and 5 seconds' });
+        }
+        if (hasMemoryOverride && overrideMemory == null) {
+            return res.status(400).json({ error: 'Memory limit must be between 16 and 1024 MB' });
+        }
+        const timeLimit = overrideTime ?? (question.timeLimit || 2);
+        const memoryLimit = overrideMemory ?? (question.memoryLimit || 256);
         console.log('[Teacher Test Question] Execution limits:', {
             timeLimit,
-            memoryLimit
+            memoryLimit,
+            overridden: hasTimeOverride || hasMemoryOverride
         });
 
         // Execute public tests only for Run; all tests for Submit
@@ -2453,7 +2549,12 @@ exports.teacherTestQuestion = async (req, res) => {
                 : question.testCases)
             : question.testCases;
 
+        let runCount = Number.parseInt(req.body.runs, 10);
+        if (!Number.isFinite(runCount) || runCount < 1) runCount = 1;
+        runCount = Math.min(10, runCount);
+
         let testResults;
+        let benchmark = null;
         try {
             console.log('[Teacher Test Question] ====== EXECUTING CODE ======');
             console.log('[Teacher Test Question] Calling executeDockerCode with:', {
@@ -2462,17 +2563,42 @@ exports.teacherTestQuestion = async (req, res) => {
                 testCasesCount: testsToRun.length,
                 publicOnly: Boolean(publicOnly),
                 timeLimit,
-                memoryLimit
-            });
-            
-            testResults = await executeDockerCode(
-                language,
-                codeToExecute,
-                testsToRun,
-                timeLimit,
                 memoryLimit,
-                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
-            );
+                runs: runCount
+            });
+
+            const runSummaries = [];
+            for (let i = 0; i < runCount; i += 1) {
+                testResults = await executeDockerCode(
+                    language,
+                    codeToExecute,
+                    testsToRun,
+                    timeLimit,
+                    memoryLimit,
+                    { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
+                );
+                const summary = summarizeRunCaseMetrics(testResults);
+                runSummaries.push({
+                    run: i + 1,
+                    maxTimeMs: summary.maxTimeMs,
+                    maxMemoryKb: summary.maxMemoryKb,
+                    passed: Array.isArray(testResults) && testResults.every((row) => row.passed),
+                });
+            }
+
+            if (runCount > 1) {
+                const avgTimeMs = averageNumbers(runSummaries.map((row) => row.maxTimeMs));
+                const avgMemoryKb = averageNumbers(runSummaries.map((row) => row.maxMemoryKb));
+                const fields = fieldLimitsFromAverages(avgTimeMs, avgMemoryKb);
+                benchmark = {
+                    runs: runCount,
+                    avgTimeMs: avgTimeMs == null ? null : Math.round(avgTimeMs * 10) / 10,
+                    avgMemoryKb: avgMemoryKb == null ? null : Math.round(avgMemoryKb),
+                    timeLimit: fields.timeLimit,
+                    memoryLimit: fields.memoryLimit,
+                    runSummaries,
+                };
+            }
             
             console.log('[Teacher Test Question] ====== CODE EXECUTION COMPLETE ======');
             console.log('[Teacher Test Question] Test results received:', {
@@ -2538,7 +2664,10 @@ exports.teacherTestQuestion = async (req, res) => {
             publicTestCases,
             hiddenTestCases,
             isCorrect,
-            teacherMode: true
+            teacherMode: true,
+            timeLimit,
+            memoryLimit,
+            ...(benchmark ? { benchmark } : {})
         };
 
         console.log('[Teacher Test Question] ====== SUCCESS ======');
@@ -2573,7 +2702,8 @@ exports.teacherTestWithCustomInput = async (req, res) => {
     console.log('[Teacher Test With Custom Input] Teacher testing with custom input');
     try {
         const { questionId } = req.params;
-        const { answer, classId, language, customInput, expectedOutput } = req.body;
+        const { answer, classId, customInput, expectedOutput } = req.body;
+        const language = String(req.body.language || '').trim().toLowerCase();
         const user = req.user;
 
         console.log('[Teacher Test With Custom Input] User:', user._id, '| Question:', questionId, '| Language:', language);
@@ -2611,11 +2741,11 @@ exports.teacherTestWithCustomInput = async (req, res) => {
 
         let codeToExecute = answer;
         if (question.type === 'fillInTheBlanksCoding') {
-            if (!question.codeSnippet) {
+            codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
+            if (!String(codeToExecute || '').trim()) {
                 console.error('[Teacher Test With Custom Input] Error: Missing codeSnippet');
                 return res.status(400).json({ error: 'Question is missing code snippet' });
             }
-            codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Teacher Test With Custom Input] Combined code for execution');
         } else if (shouldMergeDriverForLanguage(question, language)) {
             const driverCodeObj = question.driverCode.find(d => d.language === language);

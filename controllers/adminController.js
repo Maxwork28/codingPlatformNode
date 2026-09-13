@@ -10,18 +10,149 @@ const generatePassword = require('../utils/generatePassword');
 const sendEmail = require('../utils/sendEmail');
 const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
 const { parseOptionalPoints } = require('../utils/optionalPoints');
+const { applyDefaultSolutions } = require('../utils/buildDefaultSolutions');
 const mongoose = require('mongoose');
 const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'];
 
 // Helper function to validate ObjectId
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 
+const DEFAULT_USER_PASSWORD = process.env.DEFAULT_USER_PASSWORD || 'Password123!';
+
+function escapeRegex(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getRowField(entry, aliases) {
+    if (!entry) return undefined;
+    const normalized = {};
+    for (const key of Object.keys(entry)) {
+        normalized[key.trim().toLowerCase()] = entry[key];
+    }
+    for (const alias of aliases) {
+        const value = normalized[alias];
+        if (value !== undefined && value !== null && String(value).trim() !== '') {
+            return String(value).trim();
+        }
+    }
+    return undefined;
+}
+
+function nameFromEmail(email) {
+    const local = String(email).split('@')[0] || 'student';
+    const spaced = local.replace(/[._-]+/g, ' ').replace(/([a-zA-Z])(\d)/g, '$1 $2').replace(/\s+/g, ' ').trim();
+    return spaced.replace(/\b\w/g, (char) => char.toUpperCase()) || 'Student';
+}
+
+function parseExcelUserRow(entry) {
+    const emailRaw = getRowField(entry, ['email']);
+    if (!emailRaw) return null;
+    const email = emailRaw.toLowerCase();
+    return {
+        email,
+        name: getRowField(entry, ['name']) || nameFromEmail(email),
+        number: getRowField(entry, ['number', 'phone']) || '',
+    };
+}
+
 /** Case-insensitive email lookup (unique index is exact string; DB may have mixed case). */
 async function findUserByEmailInsensitive(email) {
     const trimmed = String(email).trim();
     if (!trimmed) return null;
-    const safe = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return User.findOne({ email: { $regex: new RegExp(`^${safe}$`, 'i') } });
+    return User.findOne({ email: { $regex: new RegExp(`^${escapeRegex(trimmed)}$`, 'i') } });
+}
+
+async function findUsersByEmailsInsensitive(emails) {
+    if (!emails.length) return [];
+    const pattern = `^(${emails.map(escapeRegex).join('|')})$`;
+    return User.find({ email: { $regex: pattern, $options: 'i' } });
+}
+
+/**
+ * Enroll/create users from Excel rows. Email is required; name and number are optional.
+ * Missing accounts are created as `role` with DEFAULT_USER_PASSWORD when SMTP is unset.
+ */
+async function ensureUsersFromExcelRows(data, role) {
+    const parsed = [];
+    const seen = new Set();
+    const skipped = [];
+    const invalid = [];
+
+    for (const entry of data) {
+        const row = parseExcelUserRow(entry);
+        if (!row) {
+            invalid.push({ email: '(missing)', reason: 'missing_email' });
+            continue;
+        }
+        if (seen.has(row.email)) {
+            skipped.push({ email: row.email, reason: 'duplicate_in_file' });
+            continue;
+        }
+        seen.add(row.email);
+        parsed.push(row);
+    }
+
+    const existing = await findUsersByEmailsInsensitive(parsed.map((row) => row.email));
+    const existingByEmail = new Map(existing.map((user) => [String(user.email).toLowerCase(), user]));
+
+    const smtpReady = sendEmail.isSmtpConfigured();
+    const hashedDefault = await bcrypt.hash(DEFAULT_USER_PASSWORD, 10);
+    const userIds = [];
+    const created = [];
+    const toInsert = [];
+    const generatedPasswords = [];
+
+    for (let i = 0; i < parsed.length; i++) {
+        const row = parsed[i];
+        const existingUser = existingByEmail.get(row.email);
+        if (existingUser) {
+            if (existingUser.role === role) {
+                userIds.push(existingUser._id);
+            } else {
+                skipped.push({ email: row.email, reason: 'already_registered' });
+            }
+            continue;
+        }
+
+        const password = smtpReady ? generatePassword() : DEFAULT_USER_PASSWORD;
+        const hashedPassword = smtpReady ? await bcrypt.hash(password, 10) : hashedDefault;
+        toInsert.push({
+            name: row.name,
+            email: row.email,
+            number: row.number || String(9000000000 + i),
+            role,
+            password: hashedPassword,
+            canCreateQuestion: role === 'teacher',
+            isBlocked: {},
+        });
+        generatedPasswords.push({ email: row.email, password });
+    }
+
+    if (toInsert.length) {
+        const inserted = await User.insertMany(toInsert);
+        for (const user of inserted) {
+            userIds.push(user._id);
+            created.push({ email: user.email, id: user._id });
+        }
+    }
+
+    if (smtpReady) {
+        for (const cred of generatedPasswords) {
+            try {
+                await sendEmail(
+                    cred.email,
+                    'Your Login Credentials',
+                    `Email: ${cred.email}\nPassword: ${cred.password}\nRole: ${role}`
+                );
+            } catch (emailError) {
+                console.error('Failed to send email to:', cred.email, emailError.message || emailError);
+            }
+        }
+    } else if (created.length) {
+        console.log(`${role} accounts created without SMTP; default password used for ${created.length} new user(s)`);
+    }
+
+    return { userIds, created, skipped, invalid, usedDefaultPassword: !smtpReady && created.length > 0 };
 }
 
 // Helper function to validate question data
@@ -70,75 +201,21 @@ const validateQuestion = async (questionId) => {
             return res.status(400).json({ error: 'No data found in Excel file' });
         }
 
-        const created = [];
-        const skipped = [];
-        const invalid = [];
-        const seenInFile = new Set();
-
-        for (const entry of data) {
-            console.log('uploadExcel: Processing entry:', entry);
-            
-            // Handle different column name formats (case-insensitive)
-            const name = entry.name || entry.Name || entry.NAME;
-            const email = entry.email || entry.Email || entry.EMAIL;
-            const number = entry.number || entry.Number || entry.NUMBER || entry.phone || entry.Phone || entry.PHONE;
-            
-            // Validate required fields
-            if (!name || !email || number === undefined || number === null || String(number).trim() === '') {
-                console.error('uploadExcel: Missing required fields in entry:', entry);
-                console.error('uploadExcel: Extracted fields:', { name, email, number });
-                invalid.push({ email: email || '(missing)', reason: 'missing_name_email_or_number' });
-                continue;
-            }
-
-            const emailNorm = String(email).trim().toLowerCase();
-            if (seenInFile.has(emailNorm)) {
-                skipped.push({ email: emailNorm, reason: 'duplicate_in_file' });
-                continue;
-            }
-            seenInFile.add(emailNorm);
-
-            const existing = await findUserByEmailInsensitive(email);
-            if (existing) {
-                console.log('uploadExcel: Skipping existing user:', emailNorm);
-                skipped.push({ email: emailNorm, reason: 'already_registered' });
-                continue;
-            }
-
-            const password = generatePassword();
-            console.log('uploadExcel: Generated password:', password);
-            const hashedPassword = await bcrypt.hash(password, 10);
-            console.log('uploadExcel: Password hashed');
-
-            const user = new User({
-                name: String(name).trim(),
-                email: emailNorm,
-                number: String(number),
-                role: req.body.role,
-                password: hashedPassword
-            });
-            console.log('uploadExcel: User object created:', { name: user.name, email: user.email, role: user.role });
-
-            await user.save();
-            console.log('uploadExcel: User saved:', user._id);
-            created.push({ email: emailNorm, id: user._id });
-
-            try {
-                await sendEmail(
-                    emailNorm,
-                    'Your Login Credentials',
-                    `Email: ${emailNorm}\nPassword: ${password}\nRole: ${req.body.role}`
-                );
-                console.log('uploadExcel: Email sent to:', emailNorm);
-            } catch (emailError) {
-                console.error('uploadExcel: Failed to send email to:', emailNorm, emailError);
-            }
+        const role = req.body.role;
+        if (!['student', 'teacher'].includes(role)) {
+            return res.status(400).json({ error: 'Role must be student or teacher' });
         }
+
+        const { created, skipped, invalid, usedDefaultPassword } = await ensureUsersFromExcelRows(
+            data,
+            role
+        );
 
         const parts = [];
         if (created.length) parts.push(`${created.length} user(s) created`);
         if (skipped.length) parts.push(`${skipped.length} skipped (duplicate or already registered)`);
-        if (invalid.length) parts.push(`${invalid.length} row(s) invalid (missing fields)`);
+        if (invalid.length) parts.push(`${invalid.length} row(s) invalid (missing email)`);
+        if (usedDefaultPassword) parts.push(`New users can log in with password ${DEFAULT_USER_PASSWORD}`);
         const message = parts.length ? parts.join('. ') + '.' : 'No changes made.';
 
         console.log('uploadExcel: Done.', { created: created.length, skipped: skipped.length, invalid: invalid.length });
@@ -195,38 +272,40 @@ exports.createClass = async (req, res) => {
             const workbook = xlsx.readFile(req.file.path);
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
             const data = xlsx.utils.sheet_to_json(sheet);
-            console.log('createClass: Excel data parsed:', data);
+            console.log('createClass: Excel rows parsed:', data.length);
 
-            const emailKey = Object.keys(data[0] || {}).find(key => 
-                key.trim().toLowerCase() === 'email'
+            const { userIds, created, skipped, invalid, usedDefaultPassword } = await ensureUsersFromExcelRows(
+                data,
+                'student'
             );
-            console.log('createClass: Email column key:', emailKey);
+            console.log('createClass: Excel students resolved:', {
+                enrolled: userIds.length,
+                created: created.length,
+                skipped: skipped.length,
+                invalid: invalid.length,
+            });
 
-            if (!emailKey) {
-                console.log('createClass: Validation failed: No email column found');
-                return res.status(400).json({ error: 'Excel must contain an email column' });
+            if (userIds.length === 0) {
+                console.log('createClass: Validation failed: No valid student emails in Excel');
+                return res.status(400).json({ error: 'No valid student emails found in Excel' });
             }
 
-            const emails = data
-                .map(entry => entry[emailKey]?.trim())
-                .filter(email => email && typeof email === 'string');
-            console.log('createClass: Extracted emails:', emails);
-
-            if (emails.length === 0) {
-                console.log('createClass: Validation failed: No valid emails found');
-                return res.status(400).json({ error: 'No valid emails found in Excel' });
-            }
-
-            const students = await User.find({ email: { $in: emails }, role: 'student' }).select('_id');
-            console.log('createClass: Students found in database:', students);
-
-            if (students.length === 0) {
-                console.log('createClass: Validation failed: No valid students found for emails:', emails);
-                return res.status(400).json({ error: 'No valid students found in Excel' });
-            }
-
-            newClass.students = students.map(student => student._id);
+            newClass.students = userIds;
             console.log('createClass: Students assigned to class:', newClass.students);
+
+            await newClass.save();
+            console.log('createClass: Class saved successfully:', newClass._id);
+
+            const parts = [`Class created successfully`, `enrolled ${userIds.length} student(s)`];
+            if (created.length) parts.push(`${created.length} newly created`);
+            if (usedDefaultPassword) parts.push(`new students can log in with password ${DEFAULT_USER_PASSWORD}`);
+            return res.status(201).json({
+                message: parts.join('. ') + '.',
+                class: newClass,
+                created: created.length,
+                skipped,
+                invalid,
+            });
         }
 
         await newClass.save();
@@ -236,6 +315,14 @@ exports.createClass = async (req, res) => {
     } catch (err) {
         console.error('createClass: Error:', err);
         res.status(500).json({ error: 'Error creating class' });
+    } finally {
+        if (req.file?.path) {
+            try {
+                await fs.unlink(req.file.path);
+            } catch (unlinkErr) {
+                console.warn('createClass: Could not delete temp file:', unlinkErr.message);
+            }
+        }
     }
 };
 
@@ -1783,6 +1870,7 @@ exports.adminCreateQuestion = async (req, res) => {
             updatedAt: new Date(),
         });
 
+        applyDefaultSolutions(question);
         await question.save();
         console.log('[Admin Create Question] Saved:', question._id, '| Status:', question.status);
 
@@ -2078,6 +2166,7 @@ exports.editQuestion = async (req, res) => {
             ...questionData,
             updatedAt: new Date(),
         });
+        applyDefaultSolutions(question);
         await question.save();
 
         // Emit updates to associated classes
@@ -2216,6 +2305,7 @@ exports.createDraftQuestion = async (req, res) => {
             updatedAt: new Date(),
         });
 
+        applyDefaultSolutions(draftQuestion);
         await draftQuestion.save();
         console.log('[Create Draft Question] Draft saved:', draftQuestion._id);
 

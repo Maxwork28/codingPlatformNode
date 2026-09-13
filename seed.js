@@ -3,6 +3,7 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 const { faker } = require('@faker-js/faker');
 const bcrypt = require('bcrypt');
+const { applyDefaultSolutions } = require('./utils/buildDefaultSolutions');
 
 // Define Models
 const userSchema = new mongoose.Schema({
@@ -67,6 +68,12 @@ const questionSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
   hints: [{ type: String }],
   solution: { type: String },
+  solutionCode: { type: String },
+  solutionLanguage: { type: String },
+  solutionCodes: [{
+    language: { type: String, enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'] },
+    code: { type: String }
+  }],
   level: { type: String, enum: ['beginner', 'intermediate', 'advanced'] },
   type: {
     type: String,
@@ -621,9 +628,22 @@ function buildQuestionDoc(questionData, createdById, demoClassId) {
     if (questionData.templateCode) {
       question.templateCode = questionData.templateCode;
     }
+    if (questionData.solutionCodes) {
+      question.solutionCodes = questionData.solutionCodes;
+    }
+    if (questionData.solutionCode) {
+      question.solutionCode = questionData.solutionCode;
+      question.solutionLanguage = questionData.solutionLanguage;
+    }
+    if (questionData.correctAnswer) {
+      question.correctAnswer = questionData.correctAnswer;
+    }
+    if (questionData.codeSnippet) {
+      question.codeSnippet = questionData.codeSnippet;
+    }
   }
 
-  return question;
+  return applyDefaultSolutions(question);
 }
 
 /** Pad to 10 per type: use QUESTION_DATA seeds first, then generic placeholders. */
@@ -740,7 +760,7 @@ function generateGenericQuestion(type, index, createdById, demoClassId) {
     base.languages = ['javascript', 'python'];
   }
 
-  return base;
+  return applyDefaultSolutions(base);
 }
 
 // Utility functions

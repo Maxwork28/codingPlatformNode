@@ -1,18 +1,33 @@
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-    service: 'Gmail',
-    auth: {
-        user: 'harshraj7864@gmail.com',
-        pass: 'dpqiojgltontoiav'
-    }
-});
+function isSmtpConfigured() {
+    return Boolean(process.env.SMTP_USER && process.env.SMTP_PASS);
+}
 
-module.exports = async (to, subject, text) => {
+let transporter = null;
+if (isSmtpConfigured()) {
+    transporter = nodemailer.createTransport({
+        service: process.env.SMTP_SERVICE || 'Gmail',
+        auth: {
+            user: process.env.SMTP_USER,
+            pass: process.env.SMTP_PASS,
+        },
+    });
+}
+
+async function sendEmail(to, subject, text) {
+    if (!transporter) {
+        console.warn('sendEmail: skipped (set SMTP_USER and SMTP_PASS to enable)');
+        return { skipped: true };
+    }
     await transporter.sendMail({
-        from: '"Admin" <harshraj7864@gmail.com>', // Fixed syntax
+        from: process.env.SMTP_FROM || `"Admin" <${process.env.SMTP_USER}>`,
         to,
         subject,
-        text
+        text,
     });
-};
+}
+
+sendEmail.isSmtpConfigured = isSmtpConfigured;
+module.exports = sendEmail;
+module.exports.sendEmail = sendEmail;
