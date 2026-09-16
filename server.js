@@ -32,16 +32,18 @@ const corsOrigins = allowedOrigins.length > 0 ? allowedOrigins : defaultOrigins;
 
 const corsOptions = {
     origin(origin, callback) {
-        // Allow non-browser clients (no Origin) and configured frontends
+        // Allow non-browser clients (no Origin) and configured frontends.
+        // Do not throw: a thrown CORS error becomes a 500 with no ACAO header.
         if (!origin || corsOrigins.includes(origin)) {
             return callback(null, true);
         }
         console.warn('[CORS] Blocked origin:', origin);
-        return callback(new Error(`CORS blocked for origin: ${origin}`));
+        return callback(null, false);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 204,
 };
 
 const io = new Server(server, {
@@ -53,8 +55,8 @@ const io = new Server(server, {
 });
 
 app.use(cors(corsOptions));
-app.use(express.json()); // Parse JSON bodies
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 // Middleware to attach io to req
 app.use((req, res, next) => {
@@ -109,9 +111,25 @@ io.on('connection', (socket) => {
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/education_platform';
 const PORT = Number(process.env.PORT) || 3000;
 
+// Keep CORS headers on Express errors (proxy 502/504 still need nginx `always` headers).
+app.use((err, req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && corsOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+    }
+    if (res.headersSent) return next(err);
+    const status = err.status || err.statusCode || 500;
+    res.status(status).json({ error: err.message || 'Server error' });
+});
+
 mongoose.connect(MONGO_URI).then(async () => {
     console.log('MongoDB connected:', mongoose.connection.name);
     console.log('[CORS] Allowed origins:', corsOrigins.join(', '));
-    // await createInitialAdmin();
+    server.timeout = 180000;
+    server.requestTimeout = 180000;
+    server.headersTimeout = 185000;
+    server.keepAliveTimeout = 65000;
     server.listen(PORT, () => console.log(`Server started on port ${PORT}`));
 }).catch(err => console.error('MongoDB connection error:', err));

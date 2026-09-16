@@ -191,6 +191,15 @@ const fieldLimitsFromAverages = (avgTimeMs, avgMemoryKb) => {
     return { timeLimit, memoryLimit };
 };
 
+const MAX_STREAM_CAPTURE = 256 * 1024;
+
+const appendCapped = (current, chunk) => {
+    const s = chunk.toString();
+    if (current.length >= MAX_STREAM_CAPTURE) return current;
+    if (current.length + s.length <= MAX_STREAM_CAPTURE) return current + s;
+    return current + s.slice(0, MAX_STREAM_CAPTURE - current.length);
+};
+
 const parseJudgeMetrics = (stderr, wallMs) => {
     const raw = String(stderr || '');
     const match = raw.match(METRICS_LINE_RE);
@@ -261,6 +270,9 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
     console.log('[executeDockerCode] Container started');
 
     const testResults = [];
+    let repeats = Number.parseInt(options.repeats, 10);
+    if (!Number.isFinite(repeats) || repeats < 1) repeats = 1;
+    repeats = Math.min(10, repeats);
 
     try {
         if (config.compileCmd) {
@@ -273,14 +285,14 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
             const compileStream = await compileExec.start({});
             let compileOutput = '', compileError = '';
             await new Promise((resolve) => {
-                docker.modem.demuxStream(compileStream, 
-                    { write: (data) => compileOutput += data.toString() },
-                    { write: (data) => compileError += data.toString() }
+                docker.modem.demuxStream(compileStream,
+                    { write: (data) => { compileOutput = appendCapped(compileOutput, data); } },
+                    { write: (data) => { compileError = appendCapped(compileError, data); } }
                 );
                 compileStream.on('end', resolve);
             });
-            console.log('[executeDockerCode] Compile output:', compileOutput);
-            console.log('[executeDockerCode] Compile error:', compileError);
+            console.log('[executeDockerCode] Compile output:', compileOutput.substring(0, 200));
+            console.log('[executeDockerCode] Compile error:', compileError.substring(0, 200));
             if (compileError) {
                 console.error('[executeDockerCode] Compilation failed');
                 for (const test of testCases) {
@@ -302,13 +314,9 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
             }
         }
 
-        for (const test of testCases) {
+        const runOneTestCase = async (test) => {
             const inputStr = String(test.input ?? '');
             const stdinPayload = wrapBareArrayStdin ? normalizeLeetcodeStyleStdin(inputStr) : inputStr;
-            if (wrapBareArrayStdin && stdinPayload !== inputStr) {
-                console.log('[executeDockerCode] Normalized bare array stdin to {"arr":[...]} for driver compatibility');
-            }
-            console.log('[executeDockerCode] Running test case with input:', inputStr.substring(0, 50));
             await fs.writeFile(path.join(tempDir, '_stdin.txt'), stdinPayload, 'utf8');
             const startedAt = process.hrtime.bigint();
             const exec = await container.exec({
@@ -319,9 +327,9 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
             const stream = await exec.start({});
             let output = '', error = '';
             await new Promise((resolve) => {
-                docker.modem.demuxStream(stream, 
-                    { write: (data) => output += data.toString() },
-                    { write: (data) => error += data.toString() }
+                docker.modem.demuxStream(stream,
+                    { write: (data) => { output = appendCapped(output, data); } },
+                    { write: (data) => { error = appendCapped(error, data); } }
                 );
                 stream.on('end', resolve);
             });
@@ -333,13 +341,12 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 metricsFile = '';
             }
             const metrics = parseJudgeMetrics(`${metricsFile}\n${error}`, wallMs);
-            console.log('[executeDockerCode] Test output:', output.substring(0, 100));
             const passed = output.trim() === String(test.expectedOutput ?? '').trim();
             const errStr = metrics.error;
             const isTLE = errStr && (errStr.toLowerCase().includes('timeout') || errStr.toLowerCase().includes('timed out'));
             const isMLE = errStr && (errStr.toLowerCase().includes('memory') || errStr.toLowerCase().includes('oom') || (errStr.toLowerCase().includes('killed') && !isTLE));
             const status = passed ? 'accepted' : (isTLE ? 'tle' : isMLE ? 'mle' : 'wrong_answer');
-            testResults.push({
+            return {
                 input: test.input,
                 output: output.trim(),
                 expected: test.expectedOutput,
@@ -351,7 +358,25 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
                 isMLE: !!isMLE,
                 timeMs: metrics.timeMs,
                 memoryKb: metrics.memoryKb,
-            });
+            };
+        };
+
+        for (let round = 0; round < repeats; round += 1) {
+            const roundResults = [];
+            for (const test of testCases) {
+                roundResults.push(await runOneTestCase(test));
+            }
+            if (Array.isArray(options.repeatSummaries)) {
+                const summary = summarizeRunCaseMetrics(roundResults);
+                options.repeatSummaries.push({
+                    run: round + 1,
+                    maxTimeMs: summary.maxTimeMs,
+                    maxMemoryKb: summary.maxMemoryKb,
+                    passed: roundResults.every((row) => row.passed),
+                });
+            }
+            testResults.length = 0;
+            testResults.push(...roundResults);
         }
     } catch (err) {
         console.error('[executeDockerCode] Execution error:', err.message, err.stack);
@@ -384,7 +409,7 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
             console.error('[executeDockerCode] Cleanup error:', cleanupErr.message);
         }
     }
-    console.log('[executeDockerCode] Test results:', testResults);
+    console.log('[executeDockerCode] Test results count:', testResults.length);
     return testResults;
 };
 
@@ -2323,6 +2348,7 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
                 description: question.description,
                 difficulty: question.difficulty,
                 type: question.type,
+                languages: question.languages || [],
                 points: question.points,
                 tags: question.tags,
                 inputFormat: question.inputFormat,
@@ -2370,16 +2396,16 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
 
 // Teacher-specific testing endpoint - ALL test cases visible, no leaderboard impact
 exports.teacherTestQuestion = async (req, res) => {
-    console.log('========================================');
-    console.log('[Teacher Test Question] ====== START ======');
-    console.log('[Teacher Test Question] Request received at:', new Date().toISOString());
-    console.log('[Teacher Test Question] Request params:', req.params);
-    console.log('[Teacher Test Question] Request body:', JSON.stringify(req.body, null, 2));
-    console.log('[Teacher Test Question] Request headers:', {
-        'content-type': req.headers['content-type'],
-        'authorization': req.headers['authorization'] ? 'present' : 'missing'
+    console.log('[Teacher Test Question] Request received', {
+        questionId: req.params.questionId,
+        language: req.body?.language,
+        answerLength: String(req.body?.answer || '').length,
+        runs: req.body?.runs,
+        classId: req.body?.classId || null,
+        userId: req.user?._id,
+        userRole: req.user?.role,
     });
-    
+
     try {
         const { questionId } = req.params;
         const { answer, classId, publicOnly } = req.body;
@@ -2567,38 +2593,40 @@ exports.teacherTestQuestion = async (req, res) => {
                 runs: runCount
             });
 
-            const runSummaries = [];
-            for (let i = 0; i < runCount; i += 1) {
-                testResults = await executeDockerCode(
-                    language,
-                    codeToExecute,
-                    testsToRun,
-                    timeLimit,
-                    memoryLimit,
-                    { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
-                );
-                const summary = summarizeRunCaseMetrics(testResults);
-                runSummaries.push({
-                    run: i + 1,
-                    maxTimeMs: summary.maxTimeMs,
-                    maxMemoryKb: summary.maxMemoryKb,
-                    passed: Array.isArray(testResults) && testResults.every((row) => row.passed),
-                });
-            }
+        const wrapOpts = { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) };
 
-            if (runCount > 1) {
-                const avgTimeMs = averageNumbers(runSummaries.map((row) => row.maxTimeMs));
-                const avgMemoryKb = averageNumbers(runSummaries.map((row) => row.maxMemoryKb));
-                const fields = fieldLimitsFromAverages(avgTimeMs, avgMemoryKb);
-                benchmark = {
-                    runs: runCount,
-                    avgTimeMs: avgTimeMs == null ? null : Math.round(avgTimeMs * 10) / 10,
-                    avgMemoryKb: avgMemoryKb == null ? null : Math.round(avgMemoryKb),
-                    timeLimit: fields.timeLimit,
-                    memoryLimit: fields.memoryLimit,
-                    runSummaries,
-                };
-            }
+        if (runCount > 1) {
+            const probe = testsToRun.find((tc) => tc.isPublic) || testsToRun[0];
+            const runSummaries = [];
+            testResults = await executeDockerCode(
+                language,
+                codeToExecute,
+                [probe],
+                timeLimit,
+                memoryLimit,
+                { ...wrapOpts, repeats: runCount, repeatSummaries: runSummaries }
+            );
+            const avgTimeMs = averageNumbers(runSummaries.map((row) => row.maxTimeMs));
+            const avgMemoryKb = averageNumbers(runSummaries.map((row) => row.maxMemoryKb));
+            const fields = fieldLimitsFromAverages(avgTimeMs, avgMemoryKb);
+            benchmark = {
+                runs: runCount,
+                avgTimeMs: avgTimeMs == null ? null : Math.round(avgTimeMs * 10) / 10,
+                avgMemoryKb: avgMemoryKb == null ? null : Math.round(avgMemoryKb),
+                timeLimit: fields.timeLimit,
+                memoryLimit: fields.memoryLimit,
+                runSummaries,
+            };
+        } else {
+            testResults = await executeDockerCode(
+                language,
+                codeToExecute,
+                testsToRun,
+                timeLimit,
+                memoryLimit,
+                wrapOpts
+            );
+        }
             
             console.log('[Teacher Test Question] ====== CODE EXECUTION COMPLETE ======');
             console.log('[Teacher Test Question] Test results received:', {
@@ -2619,7 +2647,7 @@ exports.teacherTestQuestion = async (req, res) => {
             console.error('[Teacher Test Question] Error type:', err.constructor.name);
             console.error('[Teacher Test Question] Error message:', err.message);
             console.error('[Teacher Test Question] Error stack:', err.stack);
-            console.error('[Teacher Test Question] Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
+            console.error('[Teacher Test Question] Execution failed:', err.message);
             
             // Provide more detailed error message
             let errorMessage = err.message || 'Unknown error';
@@ -2686,8 +2714,7 @@ exports.teacherTestQuestion = async (req, res) => {
         console.error('[Teacher Test Question] Error type:', err.constructor.name);
         console.error('[Teacher Test Question] Error message:', err.message);
         console.error('[Teacher Test Question] Error stack:', err.stack);
-        console.error('[Teacher Test Question] Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
-        console.error('========================================');
+        console.error('[Teacher Test Question] Unexpected error:', err.message);
         
         res.status(500).json({ 
             error: 'Error testing code',

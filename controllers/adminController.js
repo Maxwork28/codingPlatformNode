@@ -38,6 +38,87 @@ function getRowField(entry, aliases) {
     return undefined;
 }
 
+function parseIdentifiersFromText(text) {
+    return [...new Set(
+        String(text || '')
+            .split(/[\n,;]+/)
+            .map((value) => value.trim())
+            .filter(Boolean)
+    )];
+}
+
+function isPhoneIdentifier(value) {
+    return /^\+?\d[\d\s-]{6,}$/.test(String(value).trim());
+}
+
+async function findExistingStudentsByIdentifiers(identifiers) {
+    const unique = [...new Set((identifiers || []).map((value) => String(value).trim()).filter(Boolean))];
+    const emails = unique.filter((value) => value.includes('@')).map((value) => value.toLowerCase());
+    const numbers = unique.filter((value) => !value.includes('@') && isPhoneIdentifier(value))
+        .map((value) => value.replace(/[\s-]/g, ''));
+    const names = unique.filter((value) => !value.includes('@') && !isPhoneIdentifier(value));
+
+    const or = [];
+    if (emails.length) {
+        or.push({ email: { $regex: `^(${emails.map(escapeRegex).join('|')})$`, $options: 'i' } });
+    }
+    if (names.length) {
+        or.push({ name: { $regex: `^(${names.map(escapeRegex).join('|')})$`, $options: 'i' } });
+    }
+    if (numbers.length) {
+        or.push({ number: { $in: numbers } });
+    }
+    if (!or.length) {
+        return { userIds: [], unmatched: unique, ambiguous: [] };
+    }
+
+    const users = await User.find({ role: 'student', $or: or }).select('_id email name number');
+    const byEmail = new Map();
+    const byName = new Map();
+    const byNumber = new Map();
+    for (const user of users) {
+        byEmail.set(String(user.email).toLowerCase(), user);
+        const nameKey = String(user.name || '').trim().toLowerCase();
+        if (nameKey) {
+            if (!byName.has(nameKey)) byName.set(nameKey, []);
+            byName.get(nameKey).push(user);
+        }
+        if (user.number) byNumber.set(String(user.number).replace(/[\s-]/g, ''), user);
+    }
+
+    const userIds = [];
+    const seen = new Set();
+    const unmatched = [];
+    const ambiguous = [];
+    const addUser = (user) => {
+        const id = user._id.toString();
+        if (seen.has(id)) return;
+        seen.add(id);
+        userIds.push(user._id);
+    };
+
+    for (const raw of unique) {
+        if (raw.includes('@')) {
+            const user = byEmail.get(raw.toLowerCase());
+            if (user) addUser(user);
+            else unmatched.push(raw);
+            continue;
+        }
+        if (isPhoneIdentifier(raw)) {
+            const user = byNumber.get(raw.replace(/[\s-]/g, ''));
+            if (user) addUser(user);
+            else unmatched.push(raw);
+            continue;
+        }
+        const matches = byName.get(raw.toLowerCase()) || [];
+        if (matches.length === 1) addUser(matches[0]);
+        else if (matches.length > 1) ambiguous.push(raw);
+        else unmatched.push(raw);
+    }
+
+    return { userIds, unmatched, ambiguous };
+}
+
 function nameFromEmail(email) {
     const local = String(email).split('@')[0] || 'student';
     const spaced = local.replace(/[._-]+/g, ' ').replace(/([a-zA-Z])(\d)/g, '$1 $2').replace(/\s+/g, ' ').trim();
@@ -831,6 +912,118 @@ exports.editClass = async (req, res) => {
     } catch (err) {
         console.error('[editClass] Error:', err.message, err.stack);
         res.status(500).json({ error: 'Error updating class' });
+    }
+};
+
+exports.addStudentsToClass = async (req, res) => {
+    try {
+        const { classId } = req.params;
+        if (req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Unauthorized: Admins only' });
+        }
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid classId format' });
+        }
+
+        const classData = await Class.findById(classId);
+        if (!classData) {
+            return res.status(404).json({ error: 'Class not found' });
+        }
+
+        let emailRows = [];
+        const identifiers = parseIdentifiersFromText(req.body.emails);
+        if (req.file) {
+            const workbook = xlsx.readFile(req.file.path);
+            const sheet = workbook.Sheets[workbook.SheetNames[0]];
+            const data = xlsx.utils.sheet_to_json(sheet);
+            for (const entry of data) {
+                const email = getRowField(entry, ['email']);
+                if (email) {
+                    emailRows.push(entry);
+                    continue;
+                }
+                const name = getRowField(entry, ['name']);
+                const number = getRowField(entry, ['number', 'phone']);
+                if (name) identifiers.push(name);
+                if (number) identifiers.push(number);
+            }
+        }
+
+        if (emailRows.length === 0 && identifiers.length === 0) {
+            return res.status(400).json({ error: 'Upload an Excel file or paste student emails / names' });
+        }
+
+        const userIds = [];
+        let created = [];
+        let skipped = [];
+        let invalid = [];
+        let usedDefaultPassword = false;
+
+        if (emailRows.length) {
+            const fromExcel = await ensureUsersFromExcelRows(emailRows, 'student');
+            userIds.push(...fromExcel.userIds);
+            created = fromExcel.created;
+            skipped = fromExcel.skipped;
+            invalid = fromExcel.invalid;
+            usedDefaultPassword = fromExcel.usedDefaultPassword;
+        }
+
+        const fromIdentifiers = await findExistingStudentsByIdentifiers(identifiers);
+        userIds.push(...fromIdentifiers.userIds);
+
+        if (userIds.length === 0) {
+            return res.status(400).json({
+                error: 'No matching students found. Paste emails, exact names, or phone numbers from Data Import.',
+                skipped,
+                invalid,
+                unmatched: fromIdentifiers.unmatched,
+                ambiguous: fromIdentifiers.ambiguous,
+            });
+        }
+
+        const existingSet = new Set(classData.students.map((id) => id.toString()));
+        let addedCount = 0;
+        let alreadyInClass = 0;
+        for (const id of userIds) {
+            const sid = id.toString();
+            if (existingSet.has(sid)) {
+                alreadyInClass += 1;
+                continue;
+            }
+            classData.students.push(id);
+            existingSet.add(sid);
+            addedCount += 1;
+        }
+        await classData.save();
+
+        const parts = [`Added ${addedCount} student(s) to the class`];
+        if (alreadyInClass) parts.push(`${alreadyInClass} already enrolled`);
+        if (created.length) parts.push(`${created.length} newly created`);
+        if (fromIdentifiers.unmatched.length) parts.push(`${fromIdentifiers.unmatched.length} not found`);
+        if (fromIdentifiers.ambiguous.length) parts.push(`${fromIdentifiers.ambiguous.length} name(s) matched more than one student — use email for those`);
+        if (usedDefaultPassword) parts.push(`new students can log in with password ${DEFAULT_USER_PASSWORD}`);
+
+        res.status(200).json({
+            message: parts.join('. ') + '.',
+            added: addedCount,
+            alreadyInClass,
+            created: created.length,
+            skipped,
+            invalid,
+            unmatched: fromIdentifiers.unmatched,
+            ambiguous: fromIdentifiers.ambiguous,
+        });
+    } catch (err) {
+        console.error('[addStudentsToClass] Error:', err.message, err.stack);
+        res.status(500).json({ error: 'Error adding students to class' });
+    } finally {
+        if (req.file?.path) {
+            try {
+                await fs.unlink(req.file.path);
+            } catch (unlinkErr) {
+                console.warn('[addStudentsToClass] Could not delete temp file:', unlinkErr.message);
+            }
+        }
     }
 };
 

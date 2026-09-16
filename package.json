@@ -9,6 +9,7 @@
     "seed": "node seed.js",
     "seed:users": "node seedUsersOnly.js",
     "seed:solutions": "node backfillSolutions.js",
+    "seed:stats": "node seedQuestionStatsDemo.js",
     "get-test-ids": "node getTestIds.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "build-docker": "node scripts/build-docker-images.js",

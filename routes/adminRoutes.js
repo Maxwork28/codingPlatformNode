@@ -44,6 +44,14 @@ router.put(
   adminController.editClass
 );
 
+router.post(
+  '/classes/:classId/students',
+  authMiddleware,
+  requireRole('admin'),
+  upload.single('file'),
+  adminController.addStudentsToClass
+);
+
 router.put(
   '/classes/:classId/status',
   authMiddleware,
