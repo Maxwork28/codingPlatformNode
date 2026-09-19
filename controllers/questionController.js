@@ -6,6 +6,7 @@ const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
 const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
 const { parseOptionalPoints, resolvePoints } = require('../utils/optionalPoints');
 const { applyDefaultSolutions } = require('../utils/buildDefaultSolutions');
+const { isS3Enabled, uploadQuestionImageToS3 } = require('../utils/s3');
 const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Class = require('../models/Class');
@@ -37,20 +38,38 @@ const ensureTeacherCanCreateQuestion = (user, actionLabel, res) => {
 };
 
 /**
- * Store a question diagram/screenshot. The file is saved under /uploads/questions
- * and the relative URL is returned so it can be embedded in description HTML.
+ * Store a question diagram/screenshot.
+ * Uses S3 when AWS_S3_BUCKET is set; otherwise writes under /uploads/questions.
  */
 exports.uploadQuestionImage = async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'No image uploaded' });
         }
-        const url = `/uploads/questions/${req.file.filename}`;
-        console.log('[Upload Question Image]', { userId: req.user?._id, url });
+
+        if (isS3Enabled()) {
+            const { url } = await uploadQuestionImageToS3({
+                buffer: req.file.buffer,
+                contentType: req.file.mimetype,
+                originalName: req.file.originalname,
+                userId: req.user?._id,
+            });
+            console.log('[Upload Question Image] S3', { userId: req.user?._id, url });
+            return res.status(200).json({ url });
+        }
+
+        const ext = path.extname(req.file.originalname || '').toLowerCase() || '.png';
+        const safeExt = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext) ? ext : '.png';
+        const filename = `${req.user._id}-${Date.now()}${safeExt}`;
+        const destDir = path.join(__dirname, '..', 'uploads', 'questions');
+        await fs.mkdir(destDir, { recursive: true });
+        await fs.writeFile(path.join(destDir, filename), req.file.buffer);
+        const url = `/uploads/questions/${filename}`;
+        console.log('[Upload Question Image] local', { userId: req.user?._id, url });
         return res.status(200).json({ url });
     } catch (err) {
         console.error('[Upload Question Image] Error:', err.message);
-        return res.status(500).json({ error: 'Error uploading image' });
+        return res.status(500).json({ error: err.message || 'Error uploading image' });
     }
 };
 

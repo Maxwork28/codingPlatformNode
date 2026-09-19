@@ -12,14 +12,7 @@ if (!fs.existsSync(questionImageDir)) {
 }
 
 const questionImageUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, questionImageDir),
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname || '').toLowerCase() || '.png';
-      const safeExt = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext) ? ext : '.png';
-      cb(null, `${req.user._id}-${Date.now()}${safeExt}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];

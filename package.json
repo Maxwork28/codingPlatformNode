@@ -21,6 +21,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1136.0",
     "@faker-js/faker": "^9.6.0",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^3.0.2",
