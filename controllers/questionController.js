@@ -39,7 +39,7 @@ const ensureTeacherCanCreateQuestion = (user, actionLabel, res) => {
 
 /**
  * Store a question diagram/screenshot.
- * Uses S3 when AWS_S3_BUCKET is set; otherwise writes under /uploads/questions.
+ * Uses S3 when AWS_S3_BUCKET or AWS_S3_BUCKET_NAME is set; otherwise writes under /uploads/questions.
  */
 exports.uploadQuestionImage = async (req, res) => {
     try {

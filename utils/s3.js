@@ -8,8 +8,12 @@ function env(name) {
   return String(process.env[name] || '').trim();
 }
 
+function bucketName() {
+  return env('AWS_S3_BUCKET') || env('AWS_S3_BUCKET_NAME');
+}
+
 function isS3Enabled() {
-  return Boolean(env('AWS_S3_BUCKET'));
+  return Boolean(bucketName());
 }
 
 let cachedClient;
@@ -30,7 +34,7 @@ function getS3Client() {
 function publicUrlForKey(key) {
   const base = env('AWS_S3_PUBLIC_BASE_URL').replace(/\/$/, '');
   if (base) return `${base}/${key}`;
-  const bucket = env('AWS_S3_BUCKET');
+  const bucket = bucketName();
   const region = env('AWS_REGION') || 'ap-south-1';
   if (!region || region === 'us-east-1') {
     return `https://${bucket}.s3.amazonaws.com/${encodeURI(key)}`;
@@ -49,7 +53,7 @@ function questionImageKey(userId, originalName) {
 async function uploadQuestionImageToS3({ buffer, contentType, originalName, userId }) {
   const key = questionImageKey(userId, originalName);
   const input = {
-    Bucket: env('AWS_S3_BUCKET'),
+    Bucket: bucketName(),
     Key: key,
     Body: buffer,
     ContentType: contentType || 'application/octet-stream',
