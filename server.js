@@ -19,6 +19,7 @@ const server = http.createServer(app);
 const defaultOrigins = [
     'http://localhost:5173',
     'http://localhost:5174',
+    'http://localhost:5176',
     'https://algosutra.co.in',
     'https://www.algosutra.co.in',
 ];

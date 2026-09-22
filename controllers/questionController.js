@@ -2372,6 +2372,7 @@ exports.getQuestionPerspectiveReport = async (req, res) => {
                 tags: question.tags,
                 inputFormat: question.inputFormat,
                 outputFormat: question.outputFormat,
+                constraints: question.constraints,
                 sampleIo: question.sampleIo || [],
                 isPublished: classEntry.isPublished,
                 isDisabled: classEntry.isDisabled,

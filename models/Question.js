@@ -62,7 +62,8 @@ const questionSchema = new mongoose.Schema({
     /** Plain stdin/stdout samples for coding questions (replaces legacy rich-text examples for I/O) */
     sampleIo: [{
         input: { type: String, default: '' },
-        output: { type: String, default: '' }
+        output: { type: String, default: '' },
+        explanation: { type: String, default: '' }
     }],
     constraints: { type: String },
     examples: [{ type: String }],
