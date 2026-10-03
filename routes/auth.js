@@ -97,6 +97,7 @@ router.post('/login', async (req, res) => {
             name: matchedUser.name,
             email: matchedUser.email,
             profilePicture: matchedUser.profilePicture || null,
+            canCreateQuestion: Boolean(matchedUser.canCreateQuestion),
         });
         console.log('Login successful, response sent');
 
@@ -158,7 +159,7 @@ router.post('/forgot-password', async (req, res) => {
 router.get('/me', authMiddleware, async (req, res) => {
     try {
         // req.user is set by authMiddleware
-        const user = await User.findById(req.user._id).select('name email role profilePicture');
+        const user = await User.findById(req.user._id).select('name email role profilePicture canCreateQuestion');
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -168,6 +169,7 @@ router.get('/me', authMiddleware, async (req, res) => {
             email: user.email,
             role: user.role,
             profilePicture: user.profilePicture || null,
+            canCreateQuestion: Boolean(user.canCreateQuestion),
         });
         console.log('GET /auth/me successful:', { id: user._id, name: user.name, email: user.email, role: user.role });
     } catch (err) {

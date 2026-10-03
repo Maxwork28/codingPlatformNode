@@ -27,7 +27,7 @@ const languageConfig = {
     go: { image: 'go-compiler', ext: '.go', compileCmd: null, runCmd: ['go', 'run', '/app/code.go'] },
 };
 
-/** Only for creating a new question document (assignQuestion). Publish/edit/etc. are not gated by this flag. */
+/** Teachers need canCreateQuestion to create or edit a question. */
 const ensureTeacherCanCreateQuestion = (user, actionLabel, res) => {
     if (user.role === 'teacher' && !user.canCreateQuestion) {
         console.warn(`${actionLabel} Error: Teacher lacks permission to create questions`);
@@ -1131,6 +1131,9 @@ exports.editQuestion = async (req, res) => {
             console.warn('[Edit Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can edit' });
         }
+        if (!ensureTeacherCanCreateQuestion(user, '[Edit Question]', res)) {
+            return;
+        }
 
         const question = await Question.findById(questionId);
         if (!question) {
@@ -2229,6 +2232,200 @@ exports.markSubmissionCorrect = async (req, res) => {
     } catch (err) {
         console.error('[Mark Submission Correct] Error:', err.message);
         res.status(500).json({ error: 'Error marking submission as correct' });
+    }
+};
+
+const SHEET_COLUMNS = [
+    'Name', 'Email', 'QusID', 'QusTitle', 'QusNo', 'QusType', 'Score', 'Language',
+    'Runs', 'Submits', 'Status', 'PublishDate', 'PublishTime', 'SubmitTime', 'Delta',
+];
+
+const SHEET_LANGUAGE_LABELS = {
+    javascript: 'JavaScript',
+    java: 'Java',
+    cpp: 'CPP',
+    c: 'C',
+    python: 'Python',
+    php: 'PHP',
+    ruby: 'Ruby',
+    go: 'Go',
+};
+
+function sheetPlainText(value) {
+    return String(value || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function sheetQuestionType(type) {
+    if (type === 'singleCorrectMcq') return 'MCQ';
+    if (type === 'multipleCorrectMcq') return 'MSQ';
+    if (type === 'coding' || type === 'codingWithDriver' || type === 'fillInTheBlanksCoding') return 'Coding';
+    if (type === 'fillInTheBlanks') return 'Fill in the blanks';
+    return type || '';
+}
+
+function sheetLanguage(language) {
+    if (!language) return '';
+    return SHEET_LANGUAGE_LABELS[String(language).toLowerCase()] || language;
+}
+
+function sheetDateParts(value) {
+    if (!value) return { date: '', time: '' };
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return { date: '', time: '' };
+    const dateText = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Kolkata',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+    }).format(date);
+    const timeText = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Kolkata',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    }).format(date);
+    return { date: dateText, time: timeText };
+}
+
+function sheetPoints(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+exports.getClassSheetReport = async (req, res) => {
+    try {
+        const { classId } = req.params;
+        const user = req.user;
+        const scope = req.query.scope === 'assignment' ? 'assignment' : 'class';
+        const onlyQuestionId = req.query.questionId ? String(req.query.questionId) : '';
+
+        if (!['admin', 'teacher'].includes(user.role)) {
+            return res.status(403).json({ error: 'Only admin or teacher can download this report' });
+        }
+
+        const classData = await Class.findById(classId)
+            .populate('students', 'name email')
+            .populate('questions', 'title type points classes')
+            .populate('assignments.questionId', 'title type points classes');
+        if (!classData) {
+            return res.status(404).json({ error: 'Class not found' });
+        }
+
+        const items = [];
+        if (scope === 'assignment') {
+            (classData.assignments || []).forEach((assignment, index) => {
+                const question = assignment.questionId;
+                if (!question || !question._id) return;
+                if (onlyQuestionId && String(question._id) !== onlyQuestionId) return;
+                const points = assignment.maxPoints != null && assignment.maxPoints !== ''
+                    ? sheetPoints(assignment.maxPoints)
+                    : sheetPoints(question.points);
+                items.push({
+                    question,
+                    qusNo: index + 1,
+                    points,
+                    publishedAt: assignment.assignedAt || null,
+                });
+            });
+        } else {
+            (classData.questions || []).forEach((question, index) => {
+                if (!question || !question._id) return;
+                if (onlyQuestionId && String(question._id) !== onlyQuestionId) return;
+                const classEntry = (question.classes || []).find((entry) => String(entry.classId) === String(classId));
+                items.push({
+                    question,
+                    qusNo: index + 1,
+                    points: sheetPoints(question.points),
+                    publishedAt: classEntry?.publishedAt || null,
+                });
+            });
+        }
+
+        const questionIds = items.map((item) => item.question._id);
+        const submissions = questionIds.length
+            ? await Submission.find({
+                classId,
+                questionId: { $in: questionIds },
+                $or: [{ examAttemptId: null }, { examAttemptId: { $exists: false } }],
+            }).select('questionId studentId isRun isCorrect language submittedAt').lean()
+            : [];
+
+        const activity = new Map();
+        for (const sub of submissions) {
+            const key = `${sub.studentId}:${sub.questionId}`;
+            if (!activity.has(key)) activity.set(key, { runs: 0, submits: [] });
+            const bucket = activity.get(key);
+            if (sub.isRun) bucket.runs += 1;
+            else bucket.submits.push(sub);
+        }
+        for (const bucket of activity.values()) {
+            bucket.submits.sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
+        }
+
+        const students = [...(classData.students || [])].sort((a, b) =>
+            String(a.name || '').localeCompare(String(b.name || ''))
+        );
+
+        const rows = [];
+        for (const student of students) {
+            for (const item of items) {
+                const bucket = activity.get(`${student._id}:${item.question._id}`) || { runs: 0, submits: [] };
+                const lastSubmit = bucket.submits[0];
+                const published = sheetDateParts(item.publishedAt);
+                const base = [
+                    student.name || '',
+                    student.email || '',
+                    String(item.question._id),
+                    sheetPlainText(item.question.title),
+                    item.qusNo,
+                    sheetQuestionType(item.question.type),
+                ];
+                if (!lastSubmit) {
+                    rows.push([
+                        ...base,
+                        'Not Submitted',
+                        'Not Submitted',
+                        'Not Submitted',
+                        'Not Submitted',
+                        'Not Submitted',
+                        published.date,
+                        published.time,
+                        'Not Submitted',
+                        'Not Submitted',
+                    ]);
+                    continue;
+                }
+                const submitted = sheetDateParts(lastSubmit.submittedAt);
+                const correct = Boolean(lastSubmit.isCorrect);
+                let delta = '';
+                if (item.publishedAt && lastSubmit.submittedAt) {
+                    delta = Math.round((new Date(lastSubmit.submittedAt) - new Date(item.publishedAt)) / 1000);
+                }
+                rows.push([
+                    ...base,
+                    correct ? item.points : 0,
+                    sheetLanguage(lastSubmit.language),
+                    bucket.runs,
+                    bucket.submits.length,
+                    correct ? 'Correct' : 'Wrong',
+                    published.date,
+                    published.time,
+                    submitted.time,
+                    delta,
+                ]);
+            }
+        }
+
+        res.status(200).json({
+            scope,
+            className: classData.name || '',
+            columns: SHEET_COLUMNS,
+            rows,
+        });
+    } catch (err) {
+        console.error('[Class Sheet Report] Error:', err.message);
+        res.status(500).json({ error: 'Error building class report' });
     }
 };
 

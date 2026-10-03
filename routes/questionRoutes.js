@@ -137,6 +137,12 @@ router.get('/classes/:classId/questions/:questionId/report',
   questionController.getQuestionPerspectiveReport
 );
 
+router.get('/classes/:classId/sheet-report',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  questionController.getClassSheetReport
+);
+
 router.post('/:questionId/assign', 
   authMiddleware,
   requireRole('admin', 'teacher'),
