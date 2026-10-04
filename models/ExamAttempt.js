@@ -19,7 +19,8 @@ const answerSchema = new mongoose.Schema({
     isCorrect: { type: Boolean, default: false },
     language: { type: String }, // For coding questions
     passedTestCases: { type: Number, default: 0 },
-    totalTestCases: { type: Number, default: 0 }
+    totalTestCases: { type: Number, default: 0 },
+    savedAt: { type: Date }
 }, { _id: false });
 
 const sectionTimerSchema = new mongoose.Schema({

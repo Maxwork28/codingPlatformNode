@@ -14,6 +14,9 @@ const Leaderboard = require('../models/Leaderboard');
 
 const docker = new Docker();
 
+const studentInClass = (classData, userId) =>
+    (classData?.students || []).some((id) => String(id?._id || id) === String(userId));
+
 const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'ruby', 'php', 'go'];
 
 const languageConfig = {
@@ -507,7 +510,7 @@ exports.submitAnswer = async (req, res) => {
             return res.status(404).json({ error: 'Class not found' });
         }
 
-        if (!classData.students.includes(user._id)) {
+        if (!studentInClass(classData, user._id)) {
             console.error('[Submission] Error: Student not enrolled:', user._id);
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
@@ -565,13 +568,13 @@ exports.submitAnswer = async (req, res) => {
                 console.error('[Submission] Error: Invalid or unsupported language:', language);
                 return res.status(400).json({ error: `Language ${language} is not supported for this question` });
             }
-            if (question.type === 'fillInTheBlanksCoding' && (!question.codeSnippet || !question.correctAnswer)) {
-                console.error('[Submission] Error: Missing codeSnippet or correctAnswer');
-                return res.status(400).json({ error: 'Question is missing code snippet or correct answer' });
+            if (question.type === 'fillInTheBlanksCoding' && !question.codeSnippet && !question.starterCode?.length) {
+                console.error('[Submission] Error: Missing codeSnippet');
+                return res.status(400).json({ error: 'Question is missing code snippet' });
             }
             try {
                 if (question.type === 'fillInTheBlanksCoding') {
-                    codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
+                    codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
                     console.log('[Submission] Combined code for execution:', codeToExecute);
                 } else if (shouldMergeDriverForLanguage(question, language)) {
                     const driverCodeObj = question.driverCode.find(d => d.language === language);
@@ -748,7 +751,7 @@ exports.runQuestion = async (req, res) => {
             return res.status(404).json({ error: 'Class not found' });
         }
 
-        if (!classData.students.includes(user._id)) {
+        if (!studentInClass(classData, user._id)) {
             console.error('[Run Question] Error: Student not enrolled:', user._id);
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
@@ -765,11 +768,11 @@ exports.runQuestion = async (req, res) => {
 
         let codeToExecute = answer;
         if (question.type === 'fillInTheBlanksCoding') {
-            if (!question.codeSnippet) {
+            codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
+            if (!codeToExecute) {
                 console.error('[Run Question] Error: Missing codeSnippet');
                 return res.status(400).json({ error: 'Question is missing code snippet' });
             }
-            codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Run Question] Combined code for execution:', codeToExecute);
         } else if (shouldMergeDriverForLanguage(question, language)) {
             const driverCodeObj = question.driverCode.find(d => d.language === language);
@@ -905,7 +908,7 @@ exports.runWithCustomInput = async (req, res) => {
             return res.status(404).json({ error: 'Class not found' });
         }
 
-        if (!classData.students.includes(user._id)) {
+        if (!studentInClass(classData, user._id)) {
             console.error('[Run With Custom Input] Error: Student not enrolled:', user._id);
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }
@@ -932,11 +935,11 @@ exports.runWithCustomInput = async (req, res) => {
 
         let codeToExecute = answer;
         if (question.type === 'fillInTheBlanksCoding') {
-            if (!question.codeSnippet) {
+            codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
+            if (!codeToExecute) {
                 console.error('[Run With Custom Input] Error: Missing codeSnippet');
                 return res.status(400).json({ error: 'Question is missing code snippet' });
             }
-            codeToExecute = question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
             console.log('[Run With Custom Input] Combined code for execution:', codeToExecute);
         } else if (shouldMergeDriverForLanguage(question, language)) {
             const driverCodeObj = question.driverCode.find(d => d.language === language);
@@ -1624,7 +1627,7 @@ exports.getLeaderboard = async (req, res) => {
             return res.status(404).json({ error: 'Class not found' });
         }
 
-        if (user.role === 'student' && !classData.students.includes(user._id)) {
+        if (user.role === 'student' && !studentInClass(classData, user._id)) {
             console.warn('[Get Leaderboard] Error: Student not enrolled');
             return res.status(403).json({ error: 'Student not enrolled in class' });
         }

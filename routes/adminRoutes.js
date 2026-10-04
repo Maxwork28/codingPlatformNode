@@ -4,14 +4,36 @@ const router = express.Router();
 const adminController = require('../controllers/adminController');
 const { authMiddleware, requireRole } = require('../middleware/auth');
 
-const upload = multer({ dest: 'uploads/' });
+const path = require('path');
+
+const SPREADSHEET_EXTENSIONS = ['.xlsx', '.xls', '.csv'];
+const upload = multer({
+  dest: 'uploads/',
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (SPREADSHEET_EXTENSIONS.includes(ext)) return cb(null, true);
+    cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'file'));
+  },
+});
+
+/** Single spreadsheet upload that answers with a 400 instead of a generic 500 on bad files. */
+const spreadsheet = (req, res, next) =>
+  upload.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'File is larger than 5 MB' });
+    if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({ error: 'Upload an Excel (.xlsx, .xls) or CSV file' });
+    }
+    return next(err);
+  });
 
 // User Management Routes
 router.post(
   '/upload',
   authMiddleware,
   requireRole('admin'),
-  upload.single('file'),
+  spreadsheet,
   adminController.uploadExcel
 );
 
@@ -19,7 +41,7 @@ router.post(
 router.post(
   '/class',
   authMiddleware,
-  upload.single('file'),
+  spreadsheet,
   adminController.createClass
 );
 
@@ -40,22 +62,22 @@ router.get(
 router.put(
   '/classes/:classId',
   authMiddleware,
-  requireRole('admin'),
+  requireRole('admin', 'teacher'),
   adminController.editClass
 );
 
 router.post(
   '/classes/:classId/students',
   authMiddleware,
-  requireRole('admin'),
-  upload.single('file'),
+  requireRole('admin', 'teacher'),
+  spreadsheet,
   adminController.addStudentsToClass
 );
 
 router.put(
   '/classes/:classId/status',
   authMiddleware,
-  requireRole('admin'),
+  requireRole('admin', 'teacher'),
   adminController.changeClassStatus
 );
 
@@ -113,7 +135,7 @@ router.get(
 router.get(
   '/students',
   authMiddleware,
-  requireRole('admin', 'student'),
+  requireRole('admin'),
   adminController.getAllStudents
 );
 
@@ -127,7 +149,7 @@ router.get(
 router.post(
   '/classes/remove-student',
   authMiddleware,
-  requireRole('admin'),
+  requireRole('admin', 'teacher'),
   adminController.removeStudentFromClass
 );
 
@@ -234,25 +256,53 @@ router.get(
   adminController.getCounts
 );
 
+router.get(
+  '/classes/:classId/overview',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.getClassOverview
+);
+
+router.delete(
+  '/classes/:classId/questions/:questionId',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.removeQuestionFromClass
+);
+
+router.get(
+  '/dashboard',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.getDashboard
+);
+
+router.get(
+  '/student-dashboard',
+  authMiddleware,
+  requireRole('student'),
+  adminController.getStudentDashboard
+);
+
 // Question Management Routes
 router.post(
   '/questions',
   authMiddleware,
-  requireRole('admin'),
+  requireRole('admin', 'teacher'),
   adminController.adminCreateQuestion
 );
 
 router.get(
   '/questions/paginated',
   authMiddleware,
-  requireRole('admin'),
+  requireRole('admin', 'teacher'),
   adminController.getAllQuestionsPaginated
 );
 
 router.put(
   '/questions/:questionId',
   authMiddleware,
-  requireRole('admin'),
+  requireRole('admin', 'teacher'),
   adminController.editQuestion
 );
 
@@ -264,9 +314,16 @@ router.delete(
 );
 
 router.get(
+  '/questions/:questionId/overview',
+  authMiddleware,
+  requireRole('admin', 'teacher'),
+  adminController.getQuestionOverview
+);
+
+router.get(
   '/questions/search-by-id',
   authMiddleware,
-  requireRole('admin'),
+  requireRole('admin', 'teacher'),
   adminController.searchQuestionsById
 );
 

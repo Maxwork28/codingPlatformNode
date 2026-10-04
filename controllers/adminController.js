@@ -6,11 +6,14 @@ const Class = require('../models/Class');
 const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Leaderboard = require('../models/Leaderboard');
+const Exam = require('../models/Exam');
+const ExamAttempt = require('../models/ExamAttempt');
 const generatePassword = require('../utils/generatePassword');
 const sendEmail = require('../utils/sendEmail');
 const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
 const { parseOptionalPoints } = require('../utils/optionalPoints');
 const { applyDefaultSolutions } = require('../utils/buildDefaultSolutions');
+const { examPhase } = require('../utils/examPhase');
 const mongoose = require('mongoose');
 const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'];
 
@@ -22,6 +25,35 @@ const DEFAULT_USER_PASSWORD = process.env.DEFAULT_USER_PASSWORD || 'Password123!
 function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+const teacherClassIds = async (user) =>
+    (await Class.find({ $or: [{ teachers: user._id }, { createdBy: user._id }] }).select('_id').lean()).map((c) => c._id);
+
+const canAccessClass = async (user, classIdOrDoc) => {
+    if (!user) return false;
+    if (user.role === 'admin') return true;
+    if (user.role !== 'teacher') return false;
+    const cls =
+        classIdOrDoc && typeof classIdOrDoc === 'object' && (classIdOrDoc.teachers || classIdOrDoc.createdBy)
+            ? classIdOrDoc
+            : await Class.findById(classIdOrDoc).select('teachers createdBy').lean();
+    if (!cls) return false;
+    const uid = String(user._id);
+    return (
+        (cls.teachers || []).some((t) => String(t._id || t) === uid) ||
+        String(cls.createdBy?._id || cls.createdBy) === uid
+    );
+};
+
+const canAccessQuestion = async (user, question) => {
+    if (user.role === 'admin') return true;
+    if (user.role !== 'teacher' || !question) return false;
+    if (String(question.createdBy?._id || question.createdBy) === String(user._id)) return true;
+    const classIds = await teacherClassIds(user);
+    const owned = new Set(classIds.map(String));
+    if ((question.classes || []).some((c) => owned.has(String(c.classId?._id || c.classId)))) return true;
+    return Boolean(await Class.exists({ _id: { $in: classIds }, questions: question._id }));
+};
 
 function getRowField(entry, aliases) {
     if (!entry) return undefined;
@@ -158,23 +190,30 @@ async function ensureUsersFromExcelRows(data, role) {
     const seen = new Set();
     const skipped = [];
     const invalid = [];
+    const existing = [];
 
-    for (const entry of data) {
+    data.forEach((entry, index) => {
+        // Spreadsheet row number as the admin sees it (row 1 is the header).
+        const rowNumber = index + 2;
         const row = parseExcelUserRow(entry);
         if (!row) {
-            invalid.push({ email: '(missing)', reason: 'missing_email' });
-            continue;
+            invalid.push({ row: rowNumber, email: '(missing)', reason: 'missing_email' });
+            return;
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)) {
+            invalid.push({ row: rowNumber, email: row.email, reason: 'invalid_email' });
+            return;
         }
         if (seen.has(row.email)) {
-            skipped.push({ email: row.email, reason: 'duplicate_in_file' });
-            continue;
+            skipped.push({ row: rowNumber, email: row.email, reason: 'duplicate_in_file' });
+            return;
         }
         seen.add(row.email);
-        parsed.push(row);
-    }
+        parsed.push({ ...row, rowNumber });
+    });
 
-    const existing = await findUsersByEmailsInsensitive(parsed.map((row) => row.email));
-    const existingByEmail = new Map(existing.map((user) => [String(user.email).toLowerCase(), user]));
+    const existingUsers = await findUsersByEmailsInsensitive(parsed.map((row) => row.email));
+    const existingByEmail = new Map(existingUsers.map((user) => [String(user.email).toLowerCase(), user]));
 
     const smtpReady = sendEmail.isSmtpConfigured();
     const hashedDefault = await bcrypt.hash(DEFAULT_USER_PASSWORD, 10);
@@ -189,8 +228,9 @@ async function ensureUsersFromExcelRows(data, role) {
         if (existingUser) {
             if (existingUser.role === role) {
                 userIds.push(existingUser._id);
+                existing.push({ row: row.rowNumber, email: row.email, name: existingUser.name });
             } else {
-                skipped.push({ email: row.email, reason: 'already_registered' });
+                skipped.push({ row: row.rowNumber, email: row.email, reason: 'already_registered', role: existingUser.role });
             }
             continue;
         }
@@ -211,9 +251,10 @@ async function ensureUsersFromExcelRows(data, role) {
 
     if (toInsert.length) {
         const inserted = await User.insertMany(toInsert);
+        const rowByEmail = new Map(parsed.map((row) => [row.email, row.rowNumber]));
         for (const user of inserted) {
             userIds.push(user._id);
-            created.push({ email: user.email, id: user._id });
+            created.push({ row: rowByEmail.get(user.email), email: user.email, name: user.name, id: user._id });
         }
     }
 
@@ -233,7 +274,44 @@ async function ensureUsersFromExcelRows(data, role) {
         console.log(`${role} accounts created without SMTP; default password used for ${created.length} new user(s)`);
     }
 
-    return { userIds, created, skipped, invalid, usedDefaultPassword: !smtpReady && created.length > 0 };
+    return { userIds, created, existing, skipped, invalid, usedDefaultPassword: !smtpReady && created.length > 0 };
+}
+
+/** Fields a publish request may never overwrite on a draft. */
+const DRAFT_PROTECTED_FIELDS = new Set([
+    '_id', 'createdBy', 'createdAt', 'status', 'isDraft', 'publishedAt', 'publishedBy', 'classes', 'examId', 'isExamOnly',
+]);
+
+const hasText = (value) => typeof value === 'string' && value.replace(/<[^>]*>/g, '').trim() !== '';
+
+/** Human-readable list of what a draft still needs before it can be published (empty = ready). */
+function getDraftIssues(question) {
+    const issues = [];
+    if (!hasText(question.title)) issues.push('title');
+    if (!hasText(question.description)) issues.push('description');
+    const options = (question.options || []).filter((o) => hasText(o));
+    switch (question.type) {
+        case 'singleCorrectMcq':
+            if (options.length < 2) issues.push('at least 2 options');
+            if (typeof question.correctOption !== 'number') issues.push('correct option');
+            break;
+        case 'multipleCorrectMcq':
+            if (options.length < 2) issues.push('at least 2 options');
+            if (!question.correctOptions?.length) issues.push('correct options');
+            break;
+        case 'fillInTheBlanks':
+            if (!hasText(question.correctAnswer)) issues.push('correct answer');
+            break;
+        case 'coding':
+        case 'codingWithDriver':
+        case 'fillInTheBlanksCoding':
+            if (!question.languages?.length) issues.push('a language');
+            if (!question.testCases?.length) issues.push('a test case');
+            break;
+        default:
+            issues.push('question type');
+    }
+    return issues;
 }
 
 // Helper function to validate question data
@@ -246,40 +324,8 @@ const validateQuestion = async (questionId) => {
 
  exports.uploadExcel = async (req, res) => {
     try {
-        console.log('uploadExcel: Starting, file:', req.file?.path, 'role:', req.body.role);
-        
-        // Check if file exists
-        if (!req.file) {
-            console.error('uploadExcel: No file uploaded');
+        if (!req.file?.path) {
             return res.status(400).json({ error: 'No file uploaded' });
-        }
-
-        // Check if file path exists
-        if (!req.file.path) {
-            console.error('uploadExcel: No file path');
-            return res.status(400).json({ error: 'File upload failed' });
-        }
-
-        console.log('uploadExcel: File details:', {
-            originalname: req.file.originalname,
-            mimetype: req.file.mimetype,
-            size: req.file.size,
-            path: req.file.path
-        });
-
-        const workbook = xlsx.readFile(req.file.path);
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        const data = xlsx.utils.sheet_to_json(sheet);
-        console.log('uploadExcel: Excel data parsed:', data);
-        
-        // Log the first entry to see available columns
-        if (data.length > 0) {
-            console.log('uploadExcel: Available columns in first entry:', Object.keys(data[0]));
-        }
-
-        if (!data || data.length === 0) {
-            console.error('uploadExcel: No data found in Excel file');
-            return res.status(400).json({ error: 'No data found in Excel file' });
         }
 
         const role = req.body.role;
@@ -287,28 +333,47 @@ const validateQuestion = async (questionId) => {
             return res.status(400).json({ error: 'Role must be student or teacher' });
         }
 
-        const { created, skipped, invalid, usedDefaultPassword } = await ensureUsersFromExcelRows(
-            data,
-            role
-        );
+        let data;
+        try {
+            const workbook = xlsx.readFile(req.file.path);
+            const sheet = workbook.Sheets[workbook.SheetNames[0]];
+            data = sheet ? xlsx.utils.sheet_to_json(sheet) : [];
+        } catch {
+            return res.status(400).json({ error: 'Could not read the file. Save it as .xlsx or .csv and try again.' });
+        }
 
-        const parts = [];
-        if (created.length) parts.push(`${created.length} user(s) created`);
-        if (skipped.length) parts.push(`${skipped.length} skipped (duplicate or already registered)`);
-        if (invalid.length) parts.push(`${invalid.length} row(s) invalid (missing email)`);
-        if (usedDefaultPassword) parts.push(`New users can log in with password ${DEFAULT_USER_PASSWORD}`);
-        const message = parts.length ? parts.join('. ') + '.' : 'No changes made.';
+        if (data.length === 0) {
+            return res.status(400).json({ error: 'The first sheet has no data rows' });
+        }
+        const hasEmailColumn = data.some((row) => Object.keys(row).some((key) => key.trim().toLowerCase() === 'email'));
+        if (!hasEmailColumn) {
+            return res.status(400).json({ error: 'No "email" column found. Add a header row with an email column.' });
+        }
 
-        console.log('uploadExcel: Done.', { created: created.length, skipped: skipped.length, invalid: invalid.length });
+        const { created, existing, skipped, invalid, usedDefaultPassword } = await ensureUsersFromExcelRows(data, role);
+
+        const label = role === 'teacher' ? 'teacher' : 'student';
+        const plural = (n) => `${n} ${label}${n === 1 ? '' : 's'}`;
+        const message = created.length
+            ? `${plural(created.length)} added`
+            : 'No new accounts were created';
+
+        console.log('uploadExcel: done', { role, rows: data.length, created: created.length, existing: existing.length, skipped: skipped.length, invalid: invalid.length });
         res.status(200).json({
             message,
+            role,
+            totalRows: data.length,
             created: created.length,
+            createdUsers: created.map(({ row, email, name }) => ({ row, email, name })),
+            existing,
             skipped,
-            invalid
+            invalid,
+            defaultPassword: usedDefaultPassword ? DEFAULT_USER_PASSWORD : null,
+            credentialsEmailed: created.length > 0 && !usedDefaultPassword,
         });
     } catch (err) {
         console.error('uploadExcel: Error:', err);
-        res.status(500).json({ error: 'Error processing file: ' + err.message });
+        res.status(500).json({ error: 'Something went wrong while importing the file' });
     } finally {
         if (req.file?.path) {
             try {
@@ -422,8 +487,11 @@ exports.manageTeacherPermission = async (req, res) => {
             return res.status(400).json({ error: 'Teacher ID and canCreateQuestion (boolean) are required' });
         }
 
+        if (!isValidObjectId(teacherId)) {
+            return res.status(400).json({ error: 'Invalid teacherId format' });
+        }
+
         const teacher = await User.findById(teacherId);
-        console.log('manageTeacherPermission: Teacher lookup:', teacher ? { id: teacher._id, role: teacher.role } : 'Not found');
 
         if (!teacher || teacher.role !== 'teacher') {
             console.log('manageTeacherPermission: Validation failed: Teacher not found or invalid role');
@@ -449,8 +517,7 @@ exports.getAllClasses = async (req, res) => {
         const { search } = req.query;
         const userRole = req.user.role;
         const userId = req.user._id;
-        console.log('getAllClasses: Request received, user:', { id: userId, role: userRole, userIdType: typeof userId }, 'search:', search);
-        
+
         // Build query
         let query = {};
         
@@ -463,18 +530,16 @@ exports.getAllClasses = async (req, res) => {
                     { createdBy: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId }
                 ]
             };
-            console.log('getAllClasses: Filtering classes for teacher:', userId.toString(), 'Query:', JSON.stringify(query));
         } else if (userRole === 'student') {
             query = {
                 students: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId
             };
-            console.log('getAllClasses: Filtering classes for student:', userId.toString());
         }
         // Admin sees all classes (no additional filter)
         
         // If search parameter is provided, add search filter
         if (search && search.trim()) {
-            const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
+            const searchRegex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
             
             // First, find users whose names match the search
             const matchingUsers = await User.find({ name: searchRegex }).select('_id');
@@ -499,21 +564,25 @@ exports.getAllClasses = async (req, res) => {
             } else {
                 query = searchFilter;
             }
-            console.log('getAllClasses: Applying search filter:', { search, matchingUsersCount: matchingUserIds.length });
         }
         
-        console.log('getAllClasses: Final query:', JSON.stringify(query, null, 2));
-        const classes = await Class.find(query)
+        const classDocs = await Class.find(query)
+            .sort({ createdAt: -1 })
             .populate('createdBy', 'name email')
             .populate('students', 'name email')
             .populate('teachers', 'name email')
             .populate('questions', 'title type description points classes');
-        
-        console.log('getAllClasses: Classes fetched:', classes.length, 'for role:', userRole);
-        if (userRole === 'teacher' && classes.length > 0) {
-            console.log('getAllClasses: Sample class teachers:', classes[0].teachers?.map(t => t._id?.toString()));
-            console.log('getAllClasses: Sample class createdBy:', classes[0].createdBy?._id?.toString());
-        }
+
+        const examCounts = await Exam.aggregate([
+            { $match: { classId: { $in: classDocs.map((c) => c._id) }, 'template.isTemplate': { $ne: true } } },
+            { $group: { _id: '$classId', count: { $sum: 1 } } },
+        ]);
+        const examCountByClass = new Map(examCounts.map((e) => [e._id.toString(), e.count]));
+
+        const classes = classDocs.map((c) => ({
+            ...c.toObject(),
+            examCount: examCountByClass.get(c._id.toString()) || 0,
+        }));
         res.status(200).json({ classes });
     } catch (err) {
         console.error('getAllClasses: Error:', err);
@@ -524,14 +593,10 @@ exports.getAllClasses = async (req, res) => {
 exports.getAllTeachers = async (req, res) => {
     try {
         const { search } = req.query;
-        console.log('getAllTeachers: Request received, user:', { id: req.user._id, role: req.user.role }, 'search:', search);
-        
-        // Build query
         let query = { role: 'teacher' };
-        
-        // If search parameter is provided, search by teacher name or email
+
         if (search && search.trim()) {
-            const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
+            const searchRegex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
             query = {
                 role: 'teacher',
                 $or: [
@@ -539,11 +604,33 @@ exports.getAllTeachers = async (req, res) => {
                     { email: searchRegex }
                 ]
             };
-            console.log('getAllTeachers: Applying search filter:', { search });
         }
-        
-        const teachers = await User.find(query).select('name email canCreateQuestion');
-        console.log('getAllTeachers: Teachers fetched:', teachers.length);
+
+        const teacherDocs = await User.find(query).select('name email canCreateQuestion').sort({ name: 1 }).lean();
+        if (req.user.role !== 'admin' || teacherDocs.length === 0) {
+            return res.status(200).json({ teachers: teacherDocs });
+        }
+
+        const teacherIds = teacherDocs.map((t) => t._id);
+        const [classDocs, questionCounts] = await Promise.all([
+            Class.find({ teachers: { $in: teacherIds } }).select('name status teachers').lean(),
+            Question.aggregate([
+                { $match: { createdBy: { $in: teacherIds }, status: { $ne: 'archived' } } },
+                { $group: { _id: '$createdBy', count: { $sum: 1 } } },
+            ]),
+        ]);
+        const questionCountBy = new Map(questionCounts.map((q) => [q._id.toString(), q.count]));
+
+        const teachers = teacherDocs.map((t) => {
+            const id = t._id.toString();
+            return {
+                ...t,
+                classes: classDocs
+                    .filter((c) => c.teachers.some((tid) => tid.toString() === id))
+                    .map(({ _id, name, status }) => ({ _id, name, status })),
+                questionCount: questionCountBy.get(id) || 0,
+            };
+        });
         res.status(200).json({ teachers });
     } catch (err) {
         console.error('getAllTeachers: Error:', err);
@@ -601,14 +688,10 @@ exports.deleteTeacher = async (req, res) => {
 exports.getAllStudents = async (req, res) => {
     try {
         const { search } = req.query;
-        console.log('getAllStudents: Request received, user:', { id: req.user._id, role: req.user.role }, 'search:', search);
-        
-        // Build query
         let query = { role: 'student' };
-        
-        // If search parameter is provided, search by student name, email, or number
+
         if (search && search.trim()) {
-            const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
+            const searchRegex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
             query = {
                 role: 'student',
                 $or: [
@@ -617,12 +700,41 @@ exports.getAllStudents = async (req, res) => {
                     { number: searchRegex }
                 ]
             };
-            console.log('getAllStudents: Applying search filter:', { search });
         }
-        
-        const students = await User.find(query).select('name email number');
-        console.log('getAllStudents: Students fetched:', students.length);
-        
+
+        const studentDocs = await User.find(query).select('name email number isBlocked').sort({ name: 1 }).lean();
+        if (studentDocs.length === 0) return res.status(200).json({ students: [] });
+
+        const studentIds = studentDocs.map((s) => s._id);
+        const [classDocs, activity] = await Promise.all([
+            Class.find({ students: { $in: studentIds } }).select('name status students').lean(),
+            Submission.aggregate([
+                { $match: { studentId: { $in: studentIds } } },
+                {
+                    $group: {
+                        _id: '$studentId',
+                        submits: { $sum: { $cond: ['$isRun', 0, 1] } },
+                        lastActiveAt: { $max: '$submittedAt' },
+                    },
+                },
+            ]),
+        ]);
+        const activityBy = new Map(activity.map((a) => [a._id.toString(), a]));
+
+        const students = studentDocs.map(({ isBlocked, ...s }) => {
+            const id = s._id.toString();
+            const blocked = isBlocked || {};
+            const classes = classDocs
+                .filter((c) => c.students.some((sid) => sid.toString() === id))
+                .map(({ _id, name, status }) => ({ _id, name, status, isBlocked: Boolean(blocked[_id.toString()]) }));
+            const stats = activityBy.get(id);
+            return {
+                ...s,
+                classes,
+                submissionCount: stats?.submits || 0,
+                lastActiveAt: stats?.lastActiveAt || null,
+            };
+        });
         res.status(200).json({ students });
     } catch (err) {
         console.error('getAllStudents: Error:', err);
@@ -728,7 +840,7 @@ exports.assignTeacherToClass = async (req, res) => {
             return res.status(404).json({ error: 'Teacher not found' });
         }
 
-        if (classData.teachers.includes(teacherId)) {
+        if (classData.teachers.some((id) => String(id) === String(teacherId))) {
             console.error('[assignTeacherToClass] Validation failed: Teacher already assigned');
             return res.status(400).json({ error: 'Teacher already assigned to class' });
         }
@@ -760,7 +872,7 @@ exports.removeTeacherFromClass = async (req, res) => {
             return res.status(404).json({ error: 'Class not found' });
         }
 
-        if (!classData.teachers.includes(teacherId)) {
+        if (!classData.teachers.some((id) => String(id) === String(teacherId))) {
             console.error('[removeTeacherFromClass] Validation failed: Teacher not assigned');
             return res.status(400).json({ error: 'Teacher not assigned to class' });
         }
@@ -791,8 +903,11 @@ exports.removeStudentFromClass = async (req, res) => {
             console.error('[removeStudentFromClass] Validation failed: Class not found');
             return res.status(404).json({ error: 'Class not found' });
         }
+        if (!(await canAccessClass(req.user, classData))) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
+        }
 
-        if (!classData.students.includes(studentId)) {
+        if (!classData.students.some((id) => String(id) === String(studentId))) {
             console.error('[removeStudentFromClass] Validation failed: Student not enrolled');
             return res.status(400).json({ error: 'Student not enrolled in class' });
         }
@@ -802,8 +917,11 @@ exports.removeStudentFromClass = async (req, res) => {
         console.log('[removeStudentFromClass] Student removed:', studentId);
 
         // Remove student-related data
-        await Submission.deleteMany({ classId, studentId });
-        await Leaderboard.deleteMany({ classId, studentId });
+        await Promise.all([
+            Submission.deleteMany({ classId, studentId }),
+            Leaderboard.deleteMany({ classId, studentId }),
+            User.updateOne({ _id: studentId }, { $unset: { [`isBlocked.${classId}`]: '' } }),
+        ]);
         console.log('[removeStudentFromClass] Cleared submissions and leaderboard for student:', studentId);
 
         res.status(200).json({ message: 'Student removed from class', class: classData });
@@ -819,11 +937,6 @@ exports.editClass = async (req, res) => {
         const { name, description, studentIds, teacherIds, questionIds } = req.body;
         console.log('[editClass] Request received:', { classId, name, description, studentIds, teacherIds, questionIds, user: { id: req.user._id, role: req.user.role } });
 
-        if (req.user.role !== 'admin') {
-            console.error('[editClass] Authorization failed: User is not admin');
-            return res.status(403).json({ error: 'Unauthorized: Admins only' });
-        }
-
         if (!isValidObjectId(classId)) {
             console.error('[editClass] Validation failed: Invalid classId');
             return res.status(400).json({ error: 'Invalid classId format' });
@@ -834,9 +947,19 @@ exports.editClass = async (req, res) => {
             console.error('[editClass] Validation failed: Class not found');
             return res.status(404).json({ error: 'Class not found' });
         }
+        if (!(await canAccessClass(req.user, classData))) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
+        }
+        if (req.user.role !== 'admin' && (studentIds || teacherIds || questionIds)) {
+            return res.status(403).json({ error: 'Teachers can only update class name and description' });
+        }
 
-        if (name) classData.name = name;
-        if (description) classData.description = description;
+        if (name !== undefined) {
+            const trimmedName = String(name).trim();
+            if (!trimmedName) return res.status(400).json({ error: 'Class name cannot be empty' });
+            classData.name = trimmedName;
+        }
+        if (typeof description === 'string') classData.description = description.trim();
 
         if (studentIds && Array.isArray(studentIds)) {
             if (!studentIds.every(isValidObjectId)) {
@@ -918,9 +1041,6 @@ exports.editClass = async (req, res) => {
 exports.addStudentsToClass = async (req, res) => {
     try {
         const { classId } = req.params;
-        if (req.user.role !== 'admin') {
-            return res.status(403).json({ error: 'Unauthorized: Admins only' });
-        }
         if (!isValidObjectId(classId)) {
             return res.status(400).json({ error: 'Invalid classId format' });
         }
@@ -928,6 +1048,9 @@ exports.addStudentsToClass = async (req, res) => {
         const classData = await Class.findById(classId);
         if (!classData) {
             return res.status(404).json({ error: 'Class not found' });
+        }
+        if (!(await canAccessClass(req.user, classData))) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
         }
 
         let emailRows = [];
@@ -1033,27 +1156,25 @@ exports.changeClassStatus = async (req, res) => {
         const { status } = req.body;
         console.log('changeClassStatus: Request received:', { classId, status, user: { id: req.user._id, role: req.user.role } });
 
-        if (req.user.role !== 'admin') {
-            console.log('changeClassStatus: Authorization failed: User is not admin');
-            return res.status(403).json({ error: 'Unauthorized: Admins only' });
-        }
-
         if (!['active', 'inactive'].includes(status)) {
-            console.log('changeClassStatus: Validation failed: Invalid status');
             return res.status(400).json({ error: 'Status must be active or inactive' });
+        }
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid classId format' });
         }
 
         const classData = await Class.findById(classId);
-        console.log('changeClassStatus: Class lookup:', classData ? { id: classData._id, name: classData.name } : 'Not found');
 
         if (!classData) {
             console.log('changeClassStatus: Validation failed: Class not found');
             return res.status(404).json({ error: 'Class not found' });
         }
+        if (!(await canAccessClass(req.user, classData))) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
+        }
 
         classData.status = status;
         await classData.save();
-        console.log('changeClassStatus: Class status updated:', classData);
 
         res.status(200).json({ message: `Class status changed to ${status}`, class: classData });
     } catch (err) {
@@ -1087,8 +1208,14 @@ exports.deleteClass = async (req, res) => {
             { 'classes.classId': classId },
             { $pull: { classes: { classId } } }
         );
-        await Submission.deleteMany({ classId });
-        await Leaderboard.deleteMany({ classId });
+        const examIds = await Exam.find({ classId }).distinct('_id');
+        await Promise.all([
+            Submission.deleteMany({ classId }),
+            Leaderboard.deleteMany({ classId }),
+            ExamAttempt.deleteMany({ examId: { $in: examIds } }),
+            Exam.deleteMany({ _id: { $in: examIds } }),
+            User.updateMany({ [`isBlocked.${classId}`]: { $exists: true } }, { $unset: { [`isBlocked.${classId}`]: '' } }),
+        ]);
         await Class.deleteOne({ _id: classId });
         console.log('[deleteClass] Class and related data deleted:', classId);
 
@@ -1102,8 +1229,9 @@ exports.deleteClass = async (req, res) => {
 exports.getClassDetails = async (req, res) => {
     try {
         const { classId } = req.params;
-        const userId = req.user._id;
-        console.log('getClassDetails: Request received:', { classId, user: { id: userId, role: req.user.role } });
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid class ID' });
+        }
 
         const classData = await Class.findById(classId)
             .populate('teachers', 'name email canCreateQuestion')
@@ -1293,9 +1421,13 @@ exports.createAssignment = async (req, res) => {
             return res.status(400).json({ error: err.message });
         }
 
-        if (!classData.questions.includes(questionId)) {
+        if (!classData.questions.some((id) => String(id) === String(questionId))) {
             console.error('[createAssignment] Validation failed: Question not associated with class');
             return res.status(400).json({ error: 'Question is not associated with this class' });
+        }
+
+        if (classData.assignments.some((a) => String(a.questionId) === String(questionId))) {
+            return res.status(409).json({ error: 'This question already has a deadline. Clear it before setting a new one.' });
         }
 
         const assignment = {
@@ -1320,18 +1452,19 @@ exports.createAssignment = async (req, res) => {
 exports.getAssignments = async (req, res) => {
     try {
         const { classId } = req.params;
-        console.log('getAssignments: Request received:', { classId, user: { id: req.user._id, role: req.user.role } });
-
         const classData = await Class.findById(classId)
-            .populate('assignments.questionId', 'title')
+            .populate('assignments.questionId', 'title type difficulty')
             .lean();
-        if (!classData) {
-            console.log('Error: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
+        if (!classData) return res.status(404).json({ error: 'Class not found' });
+
+        if (req.user.role === 'student') {
+            const enrolled = (classData.students || []).some((s) => String(s._id || s) === String(req.user._id));
+            if (!enrolled) return res.status(403).json({ error: 'You are not enrolled in this class' });
+        } else if (req.user.role === 'teacher' && !(await canAccessClass(req.user, classData))) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
         }
 
-        console.log('getAssignments: Assignments retrieved:', classData.assignments.length);
-        res.status(200).json({ assignments: classData.assignments });
+        res.status(200).json({ assignments: classData.assignments || [] });
     } catch (err) {
         console.error('getAssignments: Error:', err);
         res.status(500).json({ error: 'Error retrieving assignments' });
@@ -1433,7 +1566,9 @@ exports.blockAllUsers = async (req, res) => {
     try {
         const { classId } = req.params;
         const { isBlocked, onlyInactive, studentIds } = req.body;
-        console.log('blockAllUsers: Request received:', { classId, isBlocked, onlyInactive, studentIds, user: { id: req.user._id, role: req.user.role } });
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid class ID' });
+        }
 
         if (typeof isBlocked !== 'boolean') {
             console.log('Error: Invalid isBlocked field');
@@ -1489,17 +1624,14 @@ exports.blockAllUsers = async (req, res) => {
 
 exports.searchLeaderboard = async (req, res) => {
     try {
-        console.log('searchLeaderboard: Controller invoked');
         const { classId } = req.params;
-        console.log('searchLeaderboard: Request params:', { classId, query: req.query });
 
         if (!mongoose.Types.ObjectId.isValid(classId)) {
             console.log('searchLeaderboard: Error: Invalid classId format');
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
-        const classData = await Class.findById(classId);
-        console.log('searchLeaderboard: Class data:', classData);
+        const classData = await Class.findById(classId).select('_id');
         if (!classData) {
             console.log('searchLeaderboard: Error: Class not found');
             return res.status(404).json({ error: 'Class not found' });
@@ -1535,29 +1667,13 @@ exports.searchLeaderboard = async (req, res) => {
             return res.status(400).json({ error: 'maxAttempts must be a number' });
         }
 
-        console.log('searchLeaderboard: Query:', query);
         let leaderboard = await Leaderboard.find(query)
             .populate('studentId', 'name email isBlocked')
             .lean();
-        console.log('searchLeaderboard: Raw leaderboard count:', leaderboard.length);
-        console.log('searchLeaderboard: Detailed leaderboard entries:');
-        leaderboard.forEach((entry, idx) => {
-            const isBlockedForClass = entry.studentId?.isBlocked ? entry.studentId.isBlocked[classId] || false : false;
-            console.log(`  [${idx}] Student: ${entry.studentId?.name}, needsFocus: ${entry.needsFocus}, activityStatus: ${entry.activityStatus}, totalSubmits: ${entry.totalSubmits}, isBlocked: ${isBlockedForClass}`);
-        });
 
         if (name) {
-            const studentIds = await User.find(
-                { name: { $regex: name, $options: 'i' }, role: 'student' },
-                { _id: 1 }
-            ).lean();
-            console.log('searchLeaderboard: Matching student IDs:', studentIds);
-            leaderboard = leaderboard.filter(entry =>
-                studentIds.some(sid => sid._id.toString() === entry.studentId._id.toString())
-            );
-            if (studentIds.length === 0) {
-                console.log('searchLeaderboard: No students found for name:', name);
-            }
+            const pattern = new RegExp(escapeRegex(String(name).trim()), 'i');
+            leaderboard = leaderboard.filter((entry) => pattern.test(entry.studentId?.name || ''));
         }
 
         // Add isBlocked status from User model to each leaderboard entry
@@ -1568,12 +1684,7 @@ exports.searchLeaderboard = async (req, res) => {
                 isBlocked: isBlockedForClass
             };
         });
-        
-        console.log('searchLeaderboard: Final leaderboard count:', leaderboard.length);
-        console.log('searchLeaderboard: Returning to frontend:');
-        leaderboard.forEach((entry, idx) => {
-            console.log(`  [${idx}] Returning - Student: ${entry.studentId?.name}, needsFocus: ${entry.needsFocus}, activityStatus: ${entry.activityStatus}, isBlocked: ${entry.isBlocked}`);
-        });
+
         res.status(200).json({ leaderboard });
     } catch (err) {
         console.error('searchLeaderboard: Error:', err.message, err.stack);
@@ -1679,12 +1790,12 @@ exports.focusUnfocusStudent = async (req, res) => {
             return res.status(404).json({ error: 'Student not found or not a student' });
         }
 
-        if (!classData.students.includes(studentId)) {
+        if (!classData.students.some((id) => String(id) === String(studentId))) {
             console.error('[focusUnfocusStudent] Validation failed: Student not enrolled');
             return res.status(400).json({ error: 'Student not enrolled in class' });
         }
 
-        if (req.user.role === 'teacher' && !classData.teachers.includes(req.user._id)) {
+        if (req.user.role === 'teacher' && !classData.teachers.some((id) => String(id) === String(req.user._id))) {
             console.error('[focusUnfocusStudent] Authorization failed: Teacher not assigned to class');
             return res.status(403).json({ error: 'Teacher not assigned to this class' });
         }
@@ -1885,6 +1996,859 @@ exports.getCounts = async (req, res) => {
     }
 };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ACTIVITY_DAYS = 14;
+
+function safeTimeZone(tz) {
+    if (!tz || typeof tz !== 'string' || tz.length > 64) return 'UTC';
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: tz });
+        return tz;
+    } catch {
+        return 'UTC';
+    }
+}
+
+function dayKey(date, timeZone) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+}
+
+// Admin dashboard: KPIs, 14-day activity, exams in motion, items needing attention, recent submissions, busiest classes.
+exports.getDashboard = async (req, res) => {
+    try {
+        const now = new Date();
+        const timeZone = safeTimeZone(req.query.tz);
+        const weekAgo = new Date(now.getTime() - 7 * DAY_MS);
+        const twoWeeksAgo = new Date(now.getTime() - 14 * DAY_MS);
+        const activityStart = new Date(now.getTime() - ACTIVITY_DAYS * DAY_MS);
+        const weekAgoId = mongoose.Types.ObjectId.createFromTime(Math.floor(weekAgo.getTime() / 1000));
+        const realSubmission = { isRun: { $ne: true }, isCustomInput: { $ne: true } };
+        const isTeacher = req.user.role === 'teacher';
+        const ownClassIds = isTeacher ? await teacherClassIds(req.user) : null;
+        const classQuery = ownClassIds ? { _id: { $in: ownClassIds } } : {};
+        const examQuery = { 'template.isTemplate': { $ne: true }, ...(ownClassIds ? { classId: { $in: ownClassIds } } : {}) };
+        const submissionQuery = { ...realSubmission, ...(ownClassIds ? { classId: { $in: ownClassIds } } : {}) };
+        const questionQuery = ownClassIds
+            ? {
+                  status: { $ne: 'draft' },
+                  isDraft: { $ne: true },
+                  $or: [{ createdBy: req.user._id }, { 'classes.classId': { $in: ownClassIds } }],
+              }
+            : { status: { $ne: 'draft' }, isDraft: { $ne: true } };
+
+        const [
+            studentCount,
+            newStudentCount,
+            teacherCount,
+            creatorCount,
+            classes,
+            bankQuestionCount,
+            myDraftCount,
+            templateCount,
+            subsThisWeek,
+            subsLastWeek,
+            activeStudentIds,
+            dailyRaw,
+            exams,
+            recentRaw,
+            classActivity,
+            blockedStudentCount,
+        ] = await Promise.all([
+            isTeacher
+                ? Class.aggregate([
+                      { $match: classQuery },
+                      { $unwind: { path: '$students', preserveNullAndEmptyArrays: false } },
+                      { $group: { _id: '$students' } },
+                      { $count: 'n' },
+                  ]).then((rows) => rows[0]?.n || 0)
+                : User.countDocuments({ role: 'student' }),
+            isTeacher
+                ? Class.aggregate([
+                      { $match: classQuery },
+                      { $unwind: { path: '$students', preserveNullAndEmptyArrays: false } },
+                      { $match: { students: { $gte: weekAgoId } } },
+                      { $group: { _id: '$students' } },
+                      { $count: 'n' },
+                  ]).then((rows) => rows[0]?.n || 0)
+                : User.countDocuments({ role: 'student', _id: { $gte: weekAgoId } }),
+            isTeacher ? 0 : User.countDocuments({ role: 'teacher' }),
+            isTeacher ? 0 : User.countDocuments({ role: 'teacher', canCreateQuestion: true }),
+            Class.find(classQuery).select('name status students teachers').lean(),
+            Question.countDocuments(questionQuery),
+            Question.countDocuments({ status: 'draft', isDraft: true, createdBy: req.user._id }),
+            Exam.countDocuments({ 'template.isTemplate': true }),
+            Submission.countDocuments({ ...submissionQuery, submittedAt: { $gte: weekAgo } }),
+            Submission.countDocuments({ ...submissionQuery, submittedAt: { $gte: twoWeeksAgo, $lt: weekAgo } }),
+            Submission.distinct('studentId', { ...submissionQuery, submittedAt: { $gte: weekAgo } }),
+            Submission.aggregate([
+                { $match: { ...submissionQuery, submittedAt: { $gte: activityStart } } },
+                {
+                    $group: {
+                        _id: { $dateToString: { format: '%Y-%m-%d', date: '$submittedAt', timezone: timeZone } },
+                        total: { $sum: 1 },
+                        correct: { $sum: { $cond: ['$isCorrect', 1, 0] } },
+                    },
+                },
+            ]),
+            Exam.find(examQuery)
+                .select('title classId status proctoring scoring createdAt')
+                .lean(),
+            Submission.find(submissionQuery)
+                .sort({ submittedAt: -1 })
+                .limit(8)
+                .populate('studentId', 'name')
+                .populate('questionId', 'title type')
+                .populate('classId', 'name')
+                .select('studentId questionId classId isCorrect status submittedAt examAttemptId')
+                .lean(),
+            Submission.aggregate([
+                { $match: { ...submissionQuery, submittedAt: { $gte: weekAgo } } },
+                { $group: { _id: '$classId', total: { $sum: 1 }, correct: { $sum: { $cond: ['$isCorrect', 1, 0] } } } },
+            ]),
+            isTeacher
+                ? Promise.resolve(0)
+                : User.countDocuments({
+                      role: 'student',
+                      $expr: {
+                          $in: [true, { $map: { input: { $objectToArray: { $ifNull: ['$isBlocked', {}] } }, in: '$$this.v' } }],
+                      },
+                  }),
+        ]);
+
+        const classById = new Map(classes.map((c) => [String(c._id), c]));
+        const enrolled = new Set(classes.flatMap((c) => (c.students || []).map(String)));
+        const unenrolledStudentCount = isTeacher
+            ? 0
+            : await User.countDocuments({
+                  role: 'student',
+                  _id: { $nin: [...enrolled].map((id) => new mongoose.Types.ObjectId(id)) },
+              });
+        let teacherBlockedCount = blockedStudentCount;
+        if (isTeacher && enrolled.size && ownClassIds?.length) {
+            teacherBlockedCount = await User.countDocuments({
+                role: 'student',
+                _id: { $in: [...enrolled].map((id) => new mongoose.Types.ObjectId(id)) },
+                $or: ownClassIds.map((id) => ({ [`isBlocked.${id}`]: true })),
+            });
+        }
+
+        // Exams by effective phase
+        const phaseCounts = { draft: 0, scheduled: 0, live: 0, completed: 0, archived: 0 };
+        const examsByClass = new Map();
+        const phased = exams.map((exam) => {
+            const phase = examPhase(exam, now);
+            phaseCounts[phase] += 1;
+            const key = String(exam.classId);
+            examsByClass.set(key, (examsByClass.get(key) || 0) + 1);
+            return { ...exam, phase };
+        });
+
+        const inMotion = phased
+            .filter((e) => e.phase === 'live' || e.phase === 'scheduled')
+            .sort((a, b) => {
+                if (a.phase !== b.phase) return a.phase === 'live' ? -1 : 1;
+                const at = a.proctoring?.startTime ? new Date(a.proctoring.startTime).getTime() : Infinity;
+                const bt = b.proctoring?.startTime ? new Date(b.proctoring.startTime).getTime() : Infinity;
+                return at - bt;
+            })
+            .slice(0, 6);
+
+        const completedUnreleased = phased.filter(
+            (e) => e.phase === 'completed' && e.scoring?.releaseStatus !== 'released' && !e.scoring?.immediateScoreRelease,
+        );
+
+        const attemptIds = [...inMotion, ...completedUnreleased].map((e) => e._id);
+        const attemptStats = attemptIds.length
+            ? await ExamAttempt.aggregate([
+                  { $match: { examId: { $in: attemptIds } } },
+                  {
+                      $group: {
+                          _id: '$examId',
+                          started: { $sum: { $cond: [{ $ne: ['$status', 'not_started'] }, 1, 0] } },
+                          submitted: {
+                              $sum: { $cond: [{ $in: ['$status', ['submitted', 'auto_submitted', 'terminated', 'expired']] }, 1, 0] },
+                          },
+                      },
+                  },
+              ])
+            : [];
+        const attemptsByExam = new Map(attemptStats.map((a) => [String(a._id), a]));
+        const awaitingRelease = completedUnreleased.filter((e) => attemptsByExam.get(String(e._id))?.submitted > 0);
+
+        const upcomingExams = inMotion.map((e) => {
+            const cls = classById.get(String(e.classId));
+            const stats = attemptsByExam.get(String(e._id));
+            return {
+                _id: e._id,
+                title: e.title,
+                phase: e.phase,
+                classId: e.classId,
+                className: cls?.name || null,
+                startTime: e.proctoring?.startTime || null,
+                endTime: e.proctoring?.endTime || null,
+                durationMinutes: e.proctoring?.durationMinutes || null,
+                enrolled: cls?.students?.length || 0,
+                started: stats?.started || 0,
+                submitted: stats?.submitted || 0,
+            };
+        });
+
+        // Fill every day in the window so the chart has no gaps
+        const dailyMap = new Map(dailyRaw.map((d) => [d._id, d]));
+        const activity = [];
+        for (let i = ACTIVITY_DAYS - 1; i >= 0; i -= 1) {
+            const key = dayKey(new Date(now.getTime() - i * DAY_MS), timeZone);
+            const row = dailyMap.get(key);
+            activity.push({ date: key, total: row?.total || 0, correct: row?.correct || 0 });
+        }
+
+        const activityByClass = new Map(classActivity.map((a) => [String(a._id), a]));
+        const topClasses = classes
+            .map((c) => {
+                const act = activityByClass.get(String(c._id));
+                return {
+                    _id: c._id,
+                    name: c.name,
+                    status: c.status,
+                    students: c.students?.length || 0,
+                    teachers: c.teachers?.length || 0,
+                    exams: examsByClass.get(String(c._id)) || 0,
+                    submissions7d: act?.total || 0,
+                    accuracy7d: act?.total ? Math.round((act.correct / act.total) * 100) : null,
+                };
+            })
+            .sort((a, b) => b.submissions7d - a.submissions7d || b.students - a.students)
+            .slice(0, 6);
+
+        const recentSubmissions = recentRaw.map((s) => ({
+            _id: s._id,
+            studentId: s.studentId?._id || null,
+            studentName: s.studentId?.name || 'Deleted student',
+            questionId: s.questionId?._id || null,
+            questionTitle: s.questionId?.title || 'Deleted question',
+            questionType: s.questionId?.type || null,
+            className: s.classId?.name || null,
+            isCorrect: Boolean(s.isCorrect),
+            status: s.status,
+            inExam: Boolean(s.examAttemptId),
+            submittedAt: s.submittedAt,
+        }));
+
+        const activeClassCount = classes.filter((c) => c.status === 'active').length;
+
+        res.json({
+            generatedAt: now,
+            scope: isTeacher ? 'teacher' : 'admin',
+            kpis: {
+                students: studentCount,
+                newStudents7d: newStudentCount,
+                activeStudents7d: activeStudentIds.length,
+                teachers: teacherCount,
+                teacherCreators: creatorCount,
+                classes: classes.length,
+                activeClasses: activeClassCount,
+                questions: bankQuestionCount,
+                templates: templateCount,
+                submissions7d: subsThisWeek,
+                submissionsPrev7d: subsLastWeek,
+            },
+            exams: { total: exams.length, ...phaseCounts },
+            activity,
+            upcomingExams,
+            attention: {
+                drafts: myDraftCount,
+                classesWithoutTeacher: classes.filter((c) => c.status === 'active' && !c.teachers?.length).length,
+                inactiveClasses: classes.length - activeClassCount,
+                unenrolledStudents: unenrolledStudentCount,
+                blockedStudents: teacherBlockedCount,
+                scoresAwaitingRelease: awaitingRelease.length,
+                firstAwaitingRelease: awaitingRelease[0] ? { _id: awaitingRelease[0]._id, classId: awaitingRelease[0].classId } : null,
+            },
+            recentSubmissions,
+            topClasses,
+        });
+    } catch (err) {
+        console.error('getDashboard error:', err);
+        res.status(500).json({ error: 'Failed to load dashboard' });
+    }
+};
+
+const stripPlain = (html) =>
+    String(html || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+exports.getStudentDashboard = async (req, res) => {
+    try {
+        const studentId = req.user._id;
+        const now = new Date();
+        const classes = await Class.find({ students: studentId })
+            .select('name description status students questions assignments teachers createdBy')
+            .populate('assignments.questionId', 'title type difficulty')
+            .populate('teachers', 'name')
+            .populate('createdBy', 'name')
+            .lean();
+        const classIds = classes.map((c) => c._id);
+        const classById = new Map(classes.map((c) => [String(c._id), c]));
+        const realSubmission = { studentId, classId: { $in: classIds }, isRun: { $ne: true }, isCustomInput: { $ne: true } };
+
+        const [exams, recentRaw, statsAgg] = await Promise.all([
+            classIds.length
+                ? Exam.find({
+                      classId: { $in: classIds },
+                      'template.isTemplate': { $ne: true },
+                      status: { $nin: ['draft', 'archived'] },
+                  })
+                      .select('title classId status proctoring scoring createdAt')
+                      .lean()
+                : [],
+            classIds.length
+                ? Submission.find(realSubmission)
+                      .sort({ submittedAt: -1 })
+                      .limit(8)
+                      .populate('questionId', 'title')
+                      .populate('classId', 'name')
+                      .select('questionId classId isCorrect submittedAt')
+                      .lean()
+                : [],
+            classIds.length
+                ? Submission.aggregate([
+                      { $match: realSubmission },
+                      {
+                          $group: {
+                              _id: null,
+                              total: { $sum: 1 },
+                              correct: { $sum: { $cond: ['$isCorrect', 1, 0] } },
+                              solved: { $addToSet: { $cond: ['$isCorrect', '$questionId', '$$REMOVE'] } },
+                          },
+                      },
+                  ])
+                : [],
+        ]);
+
+        const attempts = exams.length
+            ? await ExamAttempt.find({ studentId, examId: { $in: exams.map((e) => e._id) } })
+                  .select('examId status totalScore maxScore submittedAt')
+                  .lean()
+            : [];
+        const attemptByExam = new Map(attempts.map((a) => [String(a.examId), a]));
+
+        const upcomingExams = exams
+            .map((exam) => {
+                const phase = examPhase(exam, now);
+                const attempt = attemptByExam.get(String(exam._id));
+                return {
+                    _id: exam._id,
+                    title: exam.title,
+                    classId: exam.classId,
+                    className: classById.get(String(exam.classId))?.name || null,
+                    phase,
+                    startTime: exam.proctoring?.startTime || null,
+                    endTime: exam.proctoring?.endTime || null,
+                    durationMinutes: exam.proctoring?.durationMinutes || null,
+                    attemptStatus: attempt?.status || null,
+                };
+            })
+            .filter((exam) => exam.phase === 'live' || exam.phase === 'scheduled')
+            .sort((a, b) => {
+                if (a.phase !== b.phase) return a.phase === 'live' ? -1 : 1;
+                const at = a.startTime ? new Date(a.startTime).getTime() : Infinity;
+                const bt = b.startTime ? new Date(b.startTime).getTime() : Infinity;
+                return at - bt;
+            })
+            .slice(0, 6);
+
+        const assignments = classes
+            .flatMap((cls) =>
+                (cls.assignments || []).map((assignment) => ({
+                    _id: assignment._id,
+                    classId: cls._id,
+                    className: cls.name,
+                    questionId: assignment.questionId?._id || assignment.questionId,
+                    questionTitle: stripPlain(assignment.questionId?.title) || 'Untitled question',
+                    dueDate: assignment.dueDate || null,
+                    maxPoints: assignment.maxPoints ?? null,
+                }))
+            )
+            .filter((row) => row.questionId)
+            .sort((a, b) => {
+                const ad = a.dueDate ? new Date(a.dueDate).getTime() : 0;
+                const bd = b.dueDate ? new Date(b.dueDate).getTime() : 0;
+                return bd - ad;
+            })
+            .slice(0, 8);
+
+        const statsRow = statsAgg[0] || {};
+        const totalSubmissions = statsRow.total || 0;
+
+        res.json({
+            generatedAt: now,
+            classes: classes.map((cls) => ({
+                _id: cls._id,
+                name: cls.name,
+                description: cls.description || '',
+                status: cls.status,
+                studentCount: cls.students?.length || 0,
+                questionCount: cls.questions?.length || 0,
+                assignmentCount: cls.assignments?.length || 0,
+                teacherName: cls.teachers?.[0]?.name || cls.createdBy?.name || null,
+            })),
+            upcomingExams,
+            assignments,
+            stats: {
+                problemsSolved: (statsRow.solved || []).length,
+                totalSubmissions,
+                successRate: totalSubmissions ? Math.round(((statsRow.correct || 0) / totalSubmissions) * 100) : 0,
+            },
+            recentActivity: recentRaw.map((row) => ({
+                id: String(row._id),
+                questionId: row.questionId?._id || row.questionId,
+                questionTitle: stripPlain(row.questionId?.title) || 'Question',
+                classId: row.classId?._id || row.classId,
+                className: row.classId?.name || null,
+                isCorrect: Boolean(row.isCorrect),
+                submittedAt: row.submittedAt,
+            })),
+        });
+    } catch (err) {
+        console.error('getStudentDashboard error:', err);
+        res.status(500).json({ error: 'Failed to load dashboard' });
+    }
+};
+
+// Everything the admin class workspace needs in one round trip.
+exports.getClassOverview = async (req, res) => {
+    try {
+        const { classId } = req.params;
+        if (!isValidObjectId(classId)) return res.status(400).json({ error: 'Invalid class ID' });
+
+        const classObjectId = new mongoose.Types.ObjectId(classId);
+        const classData = await Class.findById(classId)
+            .populate('teachers', 'name email canCreateQuestion')
+            .populate('createdBy', 'name email')
+            .populate('students', 'name email number isBlocked')
+            .lean();
+        if (!classData) return res.status(404).json({ error: 'Class not found' });
+        if (!(await canAccessClass(req.user, classData))) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
+        }
+
+        const now = new Date();
+        const timeZone = safeTimeZone(req.query.tz);
+        const weekAgo = new Date(now.getTime() - 7 * DAY_MS);
+        const activityStart = new Date(now.getTime() - ACTIVITY_DAYS * DAY_MS);
+        const practice = { classId: classObjectId, isRun: { $ne: true }, isCustomInput: { $ne: true }, examAttemptId: { $exists: false } };
+        const linkedQuestionIds = (classData.questions || []).map((id) => new mongoose.Types.ObjectId(String(id)));
+
+        const [leaderboards, questionDocs, pairs, dailyRaw, exams] = await Promise.all([
+            Leaderboard.find({ classId }).select('studentId totalScore totalRuns totalSubmits activityStatus needsFocus updatedAt').lean(),
+            Question.find({ $or: [{ 'classes.classId': classObjectId }, { _id: { $in: linkedQuestionIds } }] })
+                .select('title type difficulty points tags classes isExamOnly createdBy updatedAt')
+                .lean(),
+            Submission.aggregate([
+                { $match: practice },
+                {
+                    $group: {
+                        _id: { studentId: '$studentId', questionId: '$questionId' },
+                        submissions: { $sum: 1 },
+                        correctSubmissions: { $sum: { $cond: ['$isCorrect', 1, 0] } },
+                        lastAt: { $max: '$submittedAt' },
+                    },
+                },
+            ]),
+            Submission.aggregate([
+                { $match: { ...practice, submittedAt: { $gte: activityStart } } },
+                {
+                    $group: {
+                        _id: { $dateToString: { format: '%Y-%m-%d', date: '$submittedAt', timezone: timeZone } },
+                        total: { $sum: 1 },
+                        correct: { $sum: { $cond: ['$isCorrect', 1, 0] } },
+                        students: { $addToSet: '$studentId' },
+                    },
+                },
+            ]),
+            Exam.find({ classId, 'template.isTemplate': { $ne: true } })
+                .select('title description status proctoring scoring questions createdAt')
+                .lean(),
+        ]);
+
+        // Per-student and per-question practice stats from the (student, question) pairs
+        const byStudent = new Map();
+        const byQuestion = new Map();
+        for (const p of pairs) {
+            const sid = String(p._id.studentId);
+            const qid = String(p._id.questionId);
+            const solved = p.correctSubmissions > 0;
+            const s = byStudent.get(sid) || { attempted: 0, solved: 0, submissions: 0, correctSubmissions: 0, lastSubmittedAt: null };
+            s.attempted += 1;
+            s.solved += solved ? 1 : 0;
+            s.submissions += p.submissions;
+            s.correctSubmissions += p.correctSubmissions;
+            if (!s.lastSubmittedAt || p.lastAt > s.lastSubmittedAt) s.lastSubmittedAt = p.lastAt;
+            byStudent.set(sid, s);
+
+            const q = byQuestion.get(qid) || { attempted: 0, solved: 0, submissions: 0 };
+            q.attempted += 1;
+            q.solved += solved ? 1 : 0;
+            q.submissions += p.submissions;
+            byQuestion.set(qid, q);
+        }
+        const boardByStudent = new Map(leaderboards.map((l) => [String(l.studentId), l]));
+
+        const assignmentsByQuestion = new Map(
+            (classData.assignments || []).map((a) => [String(a.questionId), a]),
+        );
+        const questions = questionDocs
+            .map((q) => {
+                const setting = (q.classes || []).find((c) => String(c.classId) === classId) || {};
+                const stats = byQuestion.get(String(q._id)) || { attempted: 0, solved: 0, submissions: 0 };
+                const assignment = assignmentsByQuestion.get(String(q._id));
+                return {
+                    _id: q._id,
+                    title: q.title,
+                    type: q.type,
+                    difficulty: q.difficulty || null,
+                    points: q.points ?? null,
+                    tags: q.tags || [],
+                    isPublished: Boolean(setting.isPublished),
+                    isDisabled: Boolean(setting.isDisabled),
+                    publishedAt: setting.publishedAt || null,
+                    assignment: assignment
+                        ? { _id: assignment._id, dueDate: assignment.dueDate || null, maxPoints: assignment.maxPoints ?? null, assignedAt: assignment.assignedAt }
+                        : null,
+                    attempted: stats.attempted,
+                    solved: stats.solved,
+                    submissions: stats.submissions,
+                    solveRate: stats.attempted ? Math.round((stats.solved / stats.attempted) * 100) : null,
+                };
+            })
+            .sort((a, b) => a.title.localeCompare(b.title));
+        const publishedCount = questions.filter((q) => q.isPublished && !q.isDisabled).length;
+
+        const students = (classData.students || [])
+            .map((st) => {
+                const s = byStudent.get(String(st._id)) || { attempted: 0, solved: 0, submissions: 0, correctSubmissions: 0, lastSubmittedAt: null };
+                const board = boardByStudent.get(String(st._id));
+                return {
+                    _id: st._id,
+                    name: st.name,
+                    email: st.email,
+                    number: st.number || null,
+                    isBlocked: Boolean(st.isBlocked?.[classId]),
+                    needsFocus: Boolean(board?.needsFocus),
+                    activityStatus: board?.activityStatus || 'inactive',
+                    score: board?.totalScore || 0,
+                    runs: board?.totalRuns || 0,
+                    submissions: s.submissions,
+                    attempted: s.attempted,
+                    solved: s.solved,
+                    accuracy: s.submissions ? Math.round((s.correctSubmissions / s.submissions) * 100) : null,
+                    lastActiveAt: s.lastSubmittedAt || null,
+                    activeThisWeek: Boolean(s.lastSubmittedAt && s.lastSubmittedAt >= weekAgo),
+                };
+            })
+            .sort((a, b) => b.score - a.score || b.solved - a.solved || a.name.localeCompare(b.name));
+        students.forEach((s, i) => {
+            s.rank = s.submissions || s.score ? i + 1 : null;
+        });
+
+        // Exams with time-based phase and attempt progress
+        const attemptStats = exams.length
+            ? await ExamAttempt.aggregate([
+                  { $match: { examId: { $in: exams.map((e) => e._id) } } },
+                  {
+                      $group: {
+                          _id: '$examId',
+                          started: { $sum: { $cond: [{ $ne: ['$status', 'not_started'] }, 1, 0] } },
+                          submitted: { $sum: { $cond: [{ $in: ['$status', ['submitted', 'auto_submitted', 'terminated', 'expired']] }, 1, 0] } },
+                          scored: { $sum: '$totalScore' },
+                          maxScored: { $sum: '$maxScore' },
+                      },
+                  },
+              ])
+            : [];
+        const attemptsByExam = new Map(attemptStats.map((a) => [String(a._id), a]));
+        const phaseOrder = { live: 0, scheduled: 1, draft: 2, completed: 3, archived: 4 };
+        const examList = exams
+            .map((e) => {
+                const a = attemptsByExam.get(String(e._id));
+                return {
+                    _id: e._id,
+                    title: e.title,
+                    phase: examPhase(e, now),
+                    startTime: e.proctoring?.startTime || null,
+                    endTime: e.proctoring?.endTime || null,
+                    durationMinutes: e.proctoring?.durationMinutes || null,
+                    questionCount: e.questions?.length || 0,
+                    started: a?.started || 0,
+                    submitted: a?.submitted || 0,
+                    averagePercent: a?.maxScored ? Math.round((a.scored / a.maxScored) * 100) : null,
+                    scoresReleased: e.scoring?.releaseStatus === 'released' || Boolean(e.scoring?.immediateScoreRelease),
+                    createdAt: e.createdAt,
+                };
+            })
+            .sort((a, b) => {
+                if (phaseOrder[a.phase] !== phaseOrder[b.phase]) return phaseOrder[a.phase] - phaseOrder[b.phase];
+                const at = new Date(a.startTime || a.createdAt).getTime();
+                const bt = new Date(b.startTime || b.createdAt).getTime();
+                return a.phase === 'completed' ? bt - at : at - bt;
+            });
+
+        const dailyMap = new Map(dailyRaw.map((d) => [d._id, d]));
+        const activity = [];
+        for (let i = ACTIVITY_DAYS - 1; i >= 0; i -= 1) {
+            const key = dayKey(new Date(now.getTime() - i * DAY_MS), timeZone);
+            const row = dailyMap.get(key);
+            activity.push({ date: key, total: row?.total || 0, correct: row?.correct || 0, students: row?.students?.length || 0 });
+        }
+
+        const totalSubmissions = students.reduce((sum, s) => sum + s.submissions, 0);
+        const totalCorrect = [...byStudent.values()].reduce((sum, s) => sum + s.correctSubmissions, 0);
+        const solvedTotal = students.reduce((sum, s) => sum + s.solved, 0);
+
+        res.json({
+            generatedAt: now,
+            class: {
+                _id: classData._id,
+                name: classData.name,
+                description: classData.description || '',
+                status: classData.status,
+                createdAt: classData.createdAt,
+                createdBy: classData.createdBy ? { _id: classData.createdBy._id, name: classData.createdBy.name, email: classData.createdBy.email } : null,
+            },
+            counts: {
+                students: students.length,
+                teachers: classData.teachers?.length || 0,
+                questions: questions.length,
+                publishedQuestions: publishedCount,
+                assignments: classData.assignments?.length || 0,
+                exams: examList.length,
+            },
+            aggregates: {
+                activeStudents7d: students.filter((s) => s.activeThisWeek).length,
+                neverActive: students.filter((s) => s.submissions === 0).length,
+                needsFocus: students.filter((s) => s.needsFocus).length,
+                blocked: students.filter((s) => s.isBlocked).length,
+                submissions: totalSubmissions,
+                accuracy: totalSubmissions ? Math.round((totalCorrect / totalSubmissions) * 100) : null,
+                avgSolved: students.length ? Math.round((solvedTotal / students.length) * 10) / 10 : 0,
+                totalRuns: students.reduce((sum, s) => sum + s.runs, 0),
+            },
+            teachers: (classData.teachers || []).map((t) => ({ _id: t._id, name: t.name, email: t.email, canCreateQuestion: Boolean(t.canCreateQuestion) })),
+            students,
+            questions,
+            exams: examList,
+            activity,
+        });
+    } catch (err) {
+        console.error('getClassOverview error:', err);
+        res.status(500).json({ error: 'Failed to load class overview' });
+    }
+};
+
+// Detach a question from one class. Past submissions are kept for history.
+exports.removeQuestionFromClass = async (req, res) => {
+    try {
+        const { classId, questionId } = req.params;
+        if (!isValidObjectId(classId) || !isValidObjectId(questionId)) {
+            return res.status(400).json({ error: 'Invalid class or question ID' });
+        }
+        const [classData, linkedOnQuestion] = await Promise.all([
+            Class.findById(classId).select('questions'),
+            Question.exists({ _id: questionId, 'classes.classId': classId }),
+        ]);
+        if (!classData) return res.status(404).json({ error: 'Class not found' });
+        if (!(await canAccessClass(req.user, classId))) {
+            return res.status(403).json({ error: 'Not authorized for this class' });
+        }
+        const linkedOnClass = classData.questions.some((id) => String(id) === questionId);
+        if (!linkedOnClass && !linkedOnQuestion) return res.status(404).json({ error: 'Question is not in this class' });
+
+        await Promise.all([
+            Class.updateOne({ _id: classId }, { $pull: { questions: questionId, assignments: { questionId } } }),
+            Question.updateOne({ _id: questionId }, { $pull: { classes: { classId } } }),
+        ]);
+        res.json({ message: 'Question removed from class' });
+    } catch (err) {
+        console.error('removeQuestionFromClass error:', err);
+        res.status(500).json({ error: 'Failed to remove question from class' });
+    }
+};
+
+// Everything the admin question page needs: the full question, where it is used and how students do on it.
+exports.getQuestionOverview = async (req, res) => {
+    try {
+        const { questionId } = req.params;
+        if (!isValidObjectId(questionId)) return res.status(400).json({ error: 'Invalid question ID' });
+
+        const question = await Question.findById(questionId)
+            .populate('createdBy', 'name email role')
+            .populate('publishedBy', 'name email')
+            .lean();
+        if (!question) return res.status(404).json({ error: 'Question not found' });
+
+        const now = new Date();
+        const qid = question._id;
+        const settingIds = (question.classes || []).map((c) => String(c.classId));
+        const practice = { questionId: qid, isRun: { $ne: true }, isCustomInput: { $ne: true }, examAttemptId: { $exists: false } };
+        const examFilter = { 'questions.questionId': qid };
+
+        // Teachers only see their own questions or ones used in their classes, and only their classes' data.
+        let classScope = { $or: [{ _id: { $in: settingIds } }, { questions: qid }] };
+        if (req.user.role !== 'admin') {
+            const ownClassIds = (
+                await Class.find({ $or: [{ teachers: req.user._id }, { createdBy: req.user._id }] }).select('_id').lean()
+            ).map((c) => c._id);
+            const ownSet = new Set(ownClassIds.map(String));
+            const isAuthor = String(question.createdBy?._id || question.createdBy) === String(req.user._id);
+            const inOwnClass = settingIds.some((id) => ownSet.has(id)) || (await Class.exists({ _id: { $in: ownClassIds }, questions: qid }));
+            if (!isAuthor && !inOwnClass) return res.status(403).json({ error: 'You do not have access to this question' });
+            classScope = { $and: [classScope, { _id: { $in: ownClassIds } }] };
+            practice.classId = { $in: ownClassIds };
+            examFilter.classId = { $in: ownClassIds };
+        }
+
+        const [classDocs, pairs, statusRaw, languageRaw, recentRaw, exams, templateCount, examSubmissions] = await Promise.all([
+            Class.find(classScope)
+                .select('name status students assignments')
+                .lean(),
+            Submission.aggregate([
+                { $match: practice },
+                {
+                    $group: {
+                        _id: { classId: '$classId', studentId: '$studentId' },
+                        submissions: { $sum: 1 },
+                        correct: { $sum: { $cond: ['$isCorrect', 1, 0] } },
+                        lastAt: { $max: '$submittedAt' },
+                    },
+                },
+            ]),
+            Submission.aggregate([{ $match: practice }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+            Submission.aggregate([
+                { $match: { ...practice, language: { $exists: true, $ne: null } } },
+                { $group: { _id: '$language', count: { $sum: 1 }, correct: { $sum: { $cond: ['$isCorrect', 1, 0] } } } },
+                { $sort: { count: -1 } },
+            ]),
+            Submission.find(practice)
+                .sort({ submittedAt: -1 })
+                .limit(12)
+                .select('studentId classId isCorrect status language score passedTestCases totalTestCases submittedAt')
+                .populate('studentId', 'name email')
+                .populate('classId', 'name')
+                .lean(),
+            Exam.find({ ...examFilter, 'template.isTemplate': { $ne: true } })
+                .select('title classId status proctoring questions createdAt')
+                .populate('classId', 'name')
+                .lean(),
+            Exam.countDocuments({ ...examFilter, 'template.isTemplate': true }),
+            Submission.countDocuments({
+                questionId: qid,
+                examAttemptId: { $exists: true },
+                isRun: { $ne: true },
+                ...(practice.classId ? { classId: practice.classId } : {}),
+            }),
+        ]);
+
+        const statsByClass = new Map();
+        const students = new Map();
+        let submissions = 0;
+        let correct = 0;
+        let lastSubmittedAt = null;
+        for (const p of pairs) {
+            const cid = String(p._id.classId);
+            const sid = String(p._id.studentId);
+            const solved = p.correct > 0;
+            const c = statsByClass.get(cid) || { attempted: 0, solved: 0, submissions: 0 };
+            c.attempted += 1;
+            c.solved += solved ? 1 : 0;
+            c.submissions += p.submissions;
+            statsByClass.set(cid, c);
+            students.set(sid, (students.get(sid) || false) || solved);
+            submissions += p.submissions;
+            correct += p.correct;
+            if (!lastSubmittedAt || p.lastAt > lastSubmittedAt) lastSubmittedAt = p.lastAt;
+        }
+        const solvedStudents = [...students.values()].filter(Boolean).length;
+
+        const settingByClass = new Map((question.classes || []).map((c) => [String(c.classId), c]));
+        const classes = classDocs
+            .map((cls) => {
+                const cid = String(cls._id);
+                const setting = settingByClass.get(cid) || {};
+                const assignment = (cls.assignments || []).find((a) => String(a.questionId) === String(qid));
+                const stats = statsByClass.get(cid) || { attempted: 0, solved: 0, submissions: 0 };
+                return {
+                    _id: cls._id,
+                    name: cls.name,
+                    status: cls.status,
+                    studentCount: cls.students?.length || 0,
+                    isPublished: Boolean(setting.isPublished),
+                    isDisabled: Boolean(setting.isDisabled),
+                    publishedAt: setting.publishedAt || null,
+                    assignment: assignment
+                        ? { _id: assignment._id, dueDate: assignment.dueDate || null, maxPoints: assignment.maxPoints ?? null, assignedAt: assignment.assignedAt }
+                        : null,
+                    ...stats,
+                    solveRate: stats.attempted ? Math.round((stats.solved / stats.attempted) * 100) : null,
+                };
+            })
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        const examList = exams
+            .map((e) => {
+                const entry = (e.questions || []).find((x) => String(x.questionId) === String(qid));
+                return {
+                    _id: e._id,
+                    title: e.title,
+                    classId: e.classId?._id || e.classId || null,
+                    className: e.classId?.name || null,
+                    phase: examPhase(e, now),
+                    startTime: e.proctoring?.startTime || null,
+                    endTime: e.proctoring?.endTime || null,
+                    points: entry?.points ?? null,
+                    questionCount: e.questions?.length || 0,
+                };
+            })
+            .sort((a, b) => new Date(b.startTime || 0) - new Date(a.startTime || 0));
+
+        delete question.classes;
+        res.json({
+            question,
+            classes,
+            exams: examList,
+            templateCount,
+            stats: {
+                students: students.size,
+                solvedStudents,
+                submissions,
+                correct,
+                accuracy: submissions ? Math.round((correct / submissions) * 100) : null,
+                solveRate: students.size ? Math.round((solvedStudents / students.size) * 100) : null,
+                examSubmissions,
+                lastSubmittedAt,
+                byStatus: Object.fromEntries(statusRaw.filter((s) => s._id).map((s) => [s._id, s.count])),
+                byLanguage: languageRaw.map((l) => ({ language: l._id, count: l.count, correct: l.correct })),
+            },
+            recentSubmissions: recentRaw.map((s) => ({
+                _id: s._id,
+                student: s.studentId ? { _id: s.studentId._id, name: s.studentId.name, email: s.studentId.email } : null,
+                className: s.classId?.name || null,
+                isCorrect: Boolean(s.isCorrect),
+                status: s.status || null,
+                language: s.language || null,
+                score: s.score ?? null,
+                passedTestCases: s.passedTestCases || 0,
+                totalTestCases: s.totalTestCases || 0,
+                submittedAt: s.submittedAt,
+            })),
+        });
+    } catch (err) {
+        console.error('getQuestionOverview error:', err);
+        res.status(500).json({ error: 'Failed to load question' });
+    }
+};
+
 // Updated Question Management Functions
 exports.adminCreateQuestion = async (req, res) => {
     console.log('[Admin Create Question] Started');
@@ -1894,10 +2858,9 @@ exports.adminCreateQuestion = async (req, res) => {
 
         console.log('[Admin Create Question] User:', user._id, '| Role:', user.role);
 
-        // Authorization check
-        if (!['admin'].includes(user.role)) {
+        if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Admin Create Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin can create questions' });
+            return res.status(403).json({ error: 'Only admin or teacher can create questions' });
         }
 
         // Basic validation
@@ -2076,64 +3039,80 @@ exports.adminCreateQuestion = async (req, res) => {
 };
 
 exports.getAllQuestionsPaginated = async (req, res) => {
-    console.log('[Get All Questions Paginated] Fetching questions with pagination');
     try {
         const user = req.user;
-        const { page = 1, limit = 10, includeDrafts = false } = req.query;
+        const { page = 1, limit = 10, includeDrafts = false, q, type, difficulty, usage, sort } = req.query;
 
-        console.log('[Get All Questions Paginated] User:', user._id, '| Page:', page, '| Limit:', limit, '| IncludeDrafts:', includeDrafts);
-
-        if (!['admin'].includes(user.role)) {
-            console.warn('[Get All Questions Paginated] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin can view all questions' });
+        if (!['admin', 'teacher'].includes(user.role)) {
+            return res.status(403).json({ error: 'Only admin or teacher can view questions' });
         }
 
         const pageNum = parseInt(page, 10);
-        const limitNum = parseInt(limit, 10);
+        const limitNum = Math.min(parseInt(limit, 10), 100);
 
         if (isNaN(pageNum) || pageNum < 1) {
-            console.error('[Get All Questions Paginated] Error: Invalid page number');
             return res.status(400).json({ error: 'Invalid page number' });
         }
-
         if (isNaN(limitNum) || limitNum < 1) {
-            console.error('[Get All Questions Paginated] Error: Invalid limit');
             return res.status(400).json({ error: 'Invalid limit' });
         }
 
-        // Build query - exclude drafts by default
-        const query = includeDrafts === 'true' ? {} : { status: { $ne: 'draft' }, isDraft: { $ne: true } };
+        const filters = [];
+        if (includeDrafts !== 'true') filters.push({ status: { $ne: 'draft' }, isDraft: { $ne: true } });
 
-        console.log('[Get All Questions Paginated] ===== ADMIN MODE =====');
-        console.log('[Get All Questions Paginated] Query filter:', JSON.stringify(query));
-        
-        // Count total questions matching query
-        const totalQuestions = await Question.countDocuments(query);
-        console.log('[Get All Questions Paginated] Total questions matching query:', totalQuestions);
-        
-        // Count all questions in database (no filter)
-        const totalAllQuestions = await Question.countDocuments({});
-        console.log('[Get All Questions Paginated] Total questions in database (all):', totalAllQuestions);
-
-        const questions = await Question.find(query)
-            .populate('createdBy', 'name email _id')
-            .sort({ updatedAt: -1 })
-            .skip((pageNum - 1) * limitNum)
-            .limit(limitNum)
-            .lean();
-
-        console.log('[Get All Questions Paginated] ✅ Questions fetched for page:', questions.length, 'out of', totalQuestions, 'total');
-        
-        // Log sample questions with creator info
-        if (questions.length > 0) {
-            console.log('[Get All Questions Paginated] 📋 Questions on this page:');
-            questions.forEach((q, idx) => {
-                const creatorId = q.createdBy?._id?.toString() || q.createdBy?.toString() || 'N/A';
-                const creatorName = q.createdBy?.name || 'N/A';
-                console.log(`  [${idx + 1}] ID: ${q._id}, Title: ${q.title?.substring(0, 40)}..., CreatedBy: ${creatorId} (${creatorName}), Type: ${q.type}`);
+        const search = typeof q === 'string' ? q.trim() : '';
+        if (search) {
+            const regex = new RegExp(escapeRegex(search), 'i');
+            const or = [{ title: regex }, { tags: regex }];
+            if (isValidObjectId(search) && /^[0-9a-f]{24}$/i.test(search)) or.push({ _id: new mongoose.Types.ObjectId(search) });
+            filters.push({ $or: or });
+        }
+        if (type) filters.push({ type });
+        if (difficulty) filters.push({ difficulty });
+        if (usage === 'bank') filters.push({ isExamOnly: { $ne: true }, 'classes.0': { $exists: false } });
+        if (usage === 'classes') filters.push({ 'classes.0': { $exists: true } });
+        if (usage === 'exam') filters.push({ isExamOnly: true });
+        if (user.role !== 'admin') {
+            const classIds = await teacherClassIds(user);
+            filters.push({
+                $or: [
+                    { createdBy: user._id },
+                    { 'classes.classId': { $in: classIds } },
+                    { _id: { $in: await Class.distinct('questions', { _id: { $in: classIds } }) } },
+                ],
             });
         }
-        
+
+        const query = filters.length ? { $and: filters } : {};
+        const sortBy = {
+            title: { title: 1 },
+            points: { points: -1, updatedAt: -1 },
+            oldest: { updatedAt: 1 },
+        }[sort] || { updatedAt: -1 };
+
+        const [totalQuestions, questions] = await Promise.all([
+            Question.countDocuments(query),
+            Question.find(query)
+                .select('title type difficulty points tags createdBy classes status isExamOnly updatedAt createdAt')
+                .populate('createdBy', 'name email _id')
+                .sort(sortBy)
+                .skip((pageNum - 1) * limitNum)
+                .limit(limitNum)
+                .lean(),
+        ]);
+
+        const examUsage = await Exam.aggregate([
+            { $match: { 'questions.questionId': { $in: questions.map((x) => x._id) }, 'template.isTemplate': { $ne: true } } },
+            { $unwind: '$questions' },
+            { $group: { _id: '$questions.questionId', count: { $sum: 1 } } },
+        ]);
+        const examCountBy = new Map(examUsage.map((e) => [e._id.toString(), e.count]));
+        for (const question of questions) {
+            question.classCount = question.classes?.length || 0;
+            question.examCount = examCountBy.get(question._id.toString()) || 0;
+            delete question.classes;
+        }
+
         res.status(200).json({
             questions,
             pagination: {
@@ -2154,20 +3133,27 @@ exports.editQuestion = async (req, res) => {
     console.log('[Admin Edit Question] Editing Question:', req.params.questionId);
     try {
         const { questionId } = req.params;
-        const questionData = req.body;
         const user = req.user;
 
-        console.log('[Admin Edit Question] User:', user._id);
-
-        if (!['admin'].includes(user.role)) {
+        if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Admin Edit Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin can edit questions' });
+            return res.status(403).json({ error: 'Only admin or teacher can edit questions' });
         }
+        if (!isValidObjectId(questionId)) return res.status(400).json({ error: 'Invalid question ID' });
+        if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'Question data is required' });
+
+        // Ownership, publish state and class links are managed by their own endpoints.
+        const questionData = Object.fromEntries(
+            Object.entries(req.body).filter(([key]) => !DRAFT_PROTECTED_FIELDS.has(key) && key !== 'classIds' && key !== 'updatedAt'),
+        );
 
         const question = await Question.findById(questionId);
         if (!question) {
             console.error('[Admin Edit Question] Error: Not found');
             return res.status(404).json({ error: 'Question not found' });
+        }
+        if (!(await canAccessQuestion(user, question))) {
+            return res.status(403).json({ error: 'You do not have access to this question' });
         }
 
         // Basic validation
@@ -2379,22 +3365,30 @@ exports.editQuestion = async (req, res) => {
 };
 
 exports.deleteQuestion = async (req, res) => {
-    console.log('[Admin Delete Question] Deleting:', req.params.questionId);
     try {
         const { questionId } = req.params;
         const user = req.user;
 
-        console.log('[Admin Delete Question] User:', user._id);
-
         if (!['admin'].includes(user.role)) {
-            console.warn('[Admin Delete Question] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin can delete questions' });
+        }
+        if (!isValidObjectId(questionId)) {
+            return res.status(400).json({ error: 'Invalid questionId format' });
         }
 
         const question = await Question.findById(questionId);
         if (!question) {
-            console.error('[Admin Delete Question] Error: Not found');
             return res.status(404).json({ error: 'Question not found' });
+        }
+
+        const exams = await Exam.find({ 'questions.questionId': question._id, 'template.isTemplate': { $ne: true } })
+            .select('title')
+            .lean();
+        if (exams.length) {
+            const names = exams.slice(0, 3).map((e) => `"${e.title}"`).join(', ');
+            return res.status(409).json({
+                error: `This question is used in ${exams.length} exam${exams.length === 1 ? '' : 's'} (${names}${exams.length > 3 ? ', …' : ''}). Remove it from those exams first.`,
+            });
         }
 
         // Update related documents
@@ -2432,9 +3426,9 @@ exports.searchQuestionsById = async (req, res) => {
 
         console.log('[Search Questions By ID] User:', user._id);
 
-        if (!['admin'].includes(user.role)) {
+        if (!['admin', 'teacher'].includes(user.role)) {
             console.warn('[Search Questions By ID] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin can search questions' });
+            return res.status(403).json({ error: 'Only admin or teacher can search questions' });
         }
 
         if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
@@ -2446,6 +3440,9 @@ exports.searchQuestionsById = async (req, res) => {
         if (!question) {
             console.error('[Search Questions By ID] Error: Question not found');
             return res.status(404).json({ error: 'Question not found' });
+        }
+        if (!(await canAccessQuestion(user, question))) {
+            return res.status(403).json({ error: 'You do not have access to this question' });
         }
 
         console.log('[Search Questions By ID] Question found:', questionId);
@@ -2516,41 +3513,39 @@ exports.getDrafts = async (req, res) => {
         const user = req.user;
         const { page = 1, limit = 20, search = '' } = req.query;
 
-        console.log('[Get Drafts] User:', user._id, '| Page:', page, '| Limit:', limit, '| Search:', search);
-
         if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Get Drafts] Error: Not authorized');
             return res.status(403).json({ error: 'Only admin or teacher can view drafts' });
         }
 
-        const pageNum = parseInt(page, 10);
-        const limitNum = parseInt(limit, 10);
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
 
-        // Build query
         const query = {
             status: 'draft',
             isDraft: true,
             createdBy: user._id
         };
 
-        // Add search if provided
-        if (search && search.trim()) {
-            query.$or = [
-                { title: { $regex: search, $options: 'i' } },
-                { tags: { $regex: search, $options: 'i' } }
-            ];
+        if (typeof search === 'string' && search.trim()) {
+            const regex = new RegExp(escapeRegex(search.trim()), 'i');
+            query.$or = [{ title: regex }, { tags: regex }];
         }
 
-        const drafts = await Question.find(query)
-            .sort({ updatedAt: -1 })
-            .skip((pageNum - 1) * limitNum)
-            .limit(limitNum)
-            .select('title type description difficulty tags points createdAt updatedAt status')
-            .lean();
+        const [docs, totalDrafts] = await Promise.all([
+            Question.find(query)
+                .sort({ updatedAt: -1 })
+                .skip((pageNum - 1) * limitNum)
+                .limit(limitNum)
+                .select('title type description difficulty tags points createdAt updatedAt status languages testCases options correctOption correctOptions correctAnswer')
+                .lean(),
+            Question.countDocuments(query),
+        ]);
 
-        const totalDrafts = await Question.countDocuments(query);
+        const drafts = docs.map(({ languages, testCases, options, correctOption, correctOptions, correctAnswer, ...draft }) => ({
+            ...draft,
+            issues: getDraftIssues({ ...draft, languages, testCases, options, correctOption, correctOptions, correctAnswer }),
+        }));
 
-        console.log('[Get Drafts] Drafts fetched:', drafts.length, 'Total:', totalDrafts);
         res.status(200).json({
             drafts,
             pagination: {
@@ -2702,44 +3697,33 @@ exports.publishDraftQuestion = async (req, res) => {
             return res.status(400).json({ error: 'Valid questionId is required' });
         }
 
+        if (user.role === 'teacher' && !user.canCreateQuestion) {
+            return res.status(403).json({ error: 'You do not have permission to publish questions' });
+        }
+
         const question = await Question.findOne({
             _id: questionId,
             status: 'draft',
             isDraft: true,
-            createdBy: user._id
+            ...(user.role === 'admin' ? {} : { createdBy: user._id }),
         });
 
         if (!question) {
-            console.error('[Publish Draft Question] Error: Draft not found');
             return res.status(404).json({ error: 'Draft not found' });
         }
 
-        // Validate question before publishing (full validation)
-        if (!question.title || question.title.trim() === '') {
-            return res.status(400).json({ error: 'Title is required to publish' });
-        }
-        if (!question.description || question.description.trim() === '') {
-            return res.status(400).json({ error: 'Description is required to publish' });
-        }
-
-        // Type-specific validation
-        if (question.type === 'coding' || question.type === 'fillInTheBlanksCoding') {
-            if (!question.languages || question.languages.length === 0) {
-                return res.status(400).json({ error: 'At least one language is required' });
-            }
-            if (!question.testCases || question.testCases.length === 0) {
-                return res.status(400).json({ error: 'At least one test case is required' });
-            }
-        }
-
-        // Update with final data if provided
-        if (questionData) {
+        if (questionData && typeof questionData === 'object') {
             normalizeQuestionRichTextFields(questionData);
-            Object.keys(questionData).forEach(key => {
-                if (questionData[key] !== undefined) {
+            Object.keys(questionData).forEach((key) => {
+                if (!DRAFT_PROTECTED_FIELDS.has(key) && questionData[key] !== undefined) {
                     question[key] = questionData[key];
                 }
             });
+        }
+
+        const issues = getDraftIssues(question);
+        if (issues.length) {
+            return res.status(400).json({ error: `Can't publish yet: ${issues.join(', ')}`, issues });
         }
 
         // Publish the question
@@ -2831,20 +3815,24 @@ exports.editStudent = async (req, res) => {
             return res.status(400).json({ error: 'User is not a student' });
         }
 
-        // Check if email is already taken by another user
-        if (email && email !== student.email) {
-            const existingUser = await User.findOne({ email, _id: { $ne: studentId } });
+        const cleanName = typeof name === 'string' ? name.trim() : undefined;
+        const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : undefined;
+        if (cleanName === '') return res.status(400).json({ error: 'Name cannot be empty' });
+        if (cleanEmail !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+            return res.status(400).json({ error: 'Enter a valid email address' });
+        }
+
+        if (cleanEmail && cleanEmail !== student.email) {
+            const existingUser = await User.findOne({ email: cleanEmail, _id: { $ne: studentId } });
             if (existingUser) {
-                console.error('[Edit Student] Error: Email already exists');
-                return res.status(400).json({ error: 'Email already exists' });
+                return res.status(409).json({ error: 'Another account already uses this email' });
             }
         }
 
-        // Update student fields
         const updateData = {};
-        if (name) updateData.name = name;
-        if (email) updateData.email = email;
-        if (number !== undefined) updateData.number = number;
+        if (cleanName) updateData.name = cleanName;
+        if (cleanEmail) updateData.email = cleanEmail;
+        if (number !== undefined) updateData.number = String(number).trim();
 
         Object.assign(student, updateData);
         await student.save();
@@ -2900,14 +3888,11 @@ exports.deleteStudent = async (req, res) => {
             { $pull: { students: studentId } }
         );
 
-        // Delete student's submissions
-        await Submission.deleteMany({ userId: studentId });
-
-        // Remove student from leaderboards
-        await Leaderboard.updateMany(
-            { 'attempts.userId': studentId },
-            { $pull: { attempts: { userId: studentId } } }
-        );
+        await Promise.all([
+            Submission.deleteMany({ studentId }),
+            Leaderboard.deleteMany({ studentId }),
+            ExamAttempt.deleteMany({ studentId }),
+        ]);
 
         // Delete the student
         await student.deleteOne();
