@@ -139,19 +139,24 @@ const resolveFillInTheBlanksCodingCode = (question, answer, language) => {
     return snippet.replace(/\/\/\s*FILL_IN_THE_BLANK|\/\/\s*___FILL_IN_THE_BLANK___|#\s*___FILL_IN_THE_BLANK___/g, answer);
 };
 
-/** Written into the bind-mounted /app dir so each test can report wall time + peak RSS. */
+/**
+ * Runs inside the container. Metrics go to /tmp (always writable) and stderr
+ * so the host does not depend on bind-mount permissions. On EC2 the image user
+ * (appuser) often cannot create files in the ubuntu-owned /app mount.
+ */
 const JUDGE_METRICS_SCRIPT = [
     '#!/bin/sh',
     'set +e',
     'INFILE="$1"',
     'shift',
-    'METRICS_FILE="/app/_metrics.txt"',
+    'METRICS_FILE="/tmp/_metrics.txt"',
     'rm -f "$METRICS_FILE"',
     '',
     'if [ -x /usr/bin/time ]; then',
     '  /usr/bin/time -f "___METRICS___ %e %M" -o "$METRICS_FILE" -- "$@" < "$INFILE"',
     '  STATUS=$?',
     '  if [ -s "$METRICS_FILE" ]; then',
+    '    cat "$METRICS_FILE" >&2',
     '    exit $STATUS',
     '  fi',
     'fi',
@@ -175,6 +180,7 @@ const JUDGE_METRICS_SCRIPT = [
     '  ELAPSED=$(awk -v s="$START_NS" -v e="$END_NS" \'BEGIN { printf "%.6f", (e-s)/1000000000 }\')',
     'fi',
     'echo "___METRICS___ $ELAPSED $PEAK" > "$METRICS_FILE"',
+    'cat "$METRICS_FILE" >&2',
     'exit $STATUS',
     '',
 ].join('\n');
@@ -227,7 +233,12 @@ const parseJudgeMetrics = (stderr, wallMs) => {
     const match = raw.match(METRICS_LINE_RE);
     let timeMs = Number.isFinite(Number(wallMs)) ? roundTimeMs(wallMs) : 0;
     let memoryKb = null;
-    const error = raw.replace(METRICS_LINE_RE, '').trim() || null;
+    const error =
+        raw
+            .replace(METRICS_LINE_RE, '')
+            .replace(/\/app\/_judge_metrics\.sh:[^\n]*/g, '')
+            .replace(/cannot create \/tmp\/_metrics\.txt[^\n]*/gi, '')
+            .trim() || null;
     if (match) {
         const sec = parseFloat(match[1]);
         if (Number.isFinite(sec) && sec >= 0) {
@@ -254,8 +265,10 @@ const executeDockerCode = async (language, code, testCases, timeLimit, memoryLim
     const tempDir = path.join(__dirname, '../temp', Date.now().toString());
     console.log('[executeDockerCode] Creating temp directory:', tempDir);
     await fs.mkdir(tempDir, { recursive: true });
+    await fs.chmod(tempDir, 0o777);
     await fs.writeFile(path.join(tempDir, codeFile), code);
     await fs.writeFile(path.join(tempDir, '_judge_metrics.sh'), JUDGE_METRICS_SCRIPT, 'utf8');
+    await fs.chmod(path.join(tempDir, '_judge_metrics.sh'), 0o755);
 
     let container;
     try {
