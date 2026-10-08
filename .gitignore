@@ -38,3 +38,6 @@ docker-compose.override.yml
 
 # Local seed account passwords
 .seed-credentials
+
+# Live Run/Submit test output (scripts/live-judge-test.js)
+scripts/live-judge-results-*.json

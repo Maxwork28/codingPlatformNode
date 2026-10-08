@@ -532,7 +532,26 @@ const dockerHealthy = async () => {
     }
 };
 
+/**
+ * Judge results as stored on Submission / ExamAttempt. A test's full stdin and expected output
+ * already live on the question; copying multi-MB test data into every submission bloats MongoDB
+ * and can exceed the 16 MB document limit, so large values keep only a preview.
+ */
+const STORED_TEXT_CAP = 4096;
+const capStoredText = (value) =>
+    typeof value === 'string' && value.length > STORED_TEXT_CAP
+        ? `${value.slice(0, STORED_TEXT_CAP)}\n... [truncated: ${value.length} characters]`
+        : value;
+const compactTestResultsForStorage = (results) =>
+    (Array.isArray(results) ? results : []).map((r) => ({
+        ...r,
+        ...('input' in r ? { input: capStoredText(r.input) } : {}),
+        ...('expected' in r ? { expected: capStoredText(r.expected) } : {}),
+        ...('output' in r ? { output: capStoredText(r.output) } : {}),
+    }));
+
 module.exports = {
+    compactTestResultsForStorage,
     executeDockerCode,
     runJudgeDirect,
     estimateJudgeDeadlineMs,

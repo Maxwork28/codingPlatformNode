@@ -7,6 +7,7 @@ const { parseOptionalPoints, resolvePoints } = require('../utils/optionalPoints'
 const { applyDefaultSolutions } = require('../utils/buildDefaultSolutions');
 const { isS3Enabled, uploadQuestionImageToS3 } = require('../utils/s3');
 const {
+    compactTestResultsForStorage,
     executeDockerCode,
     supportedLanguages,
     parseOptionalJudgeLimit,
@@ -342,7 +343,7 @@ exports.submitAnswer = async (req, res) => {
                     : (totalTestCases ? Math.floor((passedTestCases / totalTestCases) * resolvePoints(question.points)) : 0);
                 const firstFail = testResults.find(t => !t.passed);
                 submissionStatus = isCorrect ? 'accepted' : (firstFail?.status || 'wrong_answer');
-                output = JSON.stringify(sanitizeTestResultsForStudent(testResults));
+                output = JSON.stringify(compactTestResultsForStorage(sanitizeTestResultsForStudent(testResults)));
                 console.log('[Submission] Judged:', passedTestCases, '/', totalTestCases, 'passed');
             } catch (err) {
                 // Judge saturated (429) or other client-facing judge error: do not record an attempt.
@@ -373,7 +374,7 @@ exports.submitAnswer = async (req, res) => {
             passedTestCases,
             totalTestCases,
             status: submissionStatus || (isCorrect ? 'accepted' : 'wrong_answer'),
-            testResults: testResultsForResponse || undefined,
+            testResults: testResultsForResponse ? compactTestResultsForStorage(testResultsForResponse) : undefined,
         });
         await submission.save();
         console.log('[Submission] Saved submission:', submission._id);
@@ -495,12 +496,12 @@ exports.runQuestion = async (req, res) => {
             language,
             isCorrect,
             score: 0, // No score for run
-            output: JSON.stringify(sanitizedRunResults),
+            output: JSON.stringify(compactTestResultsForStorage(sanitizedRunResults)),
             isRun: true,
             passedTestCases: passedCount,
             totalTestCases: testResults.length,
             status: runStatus,
-            testResults: sanitizedRunResults,
+            testResults: compactTestResultsForStorage(sanitizedRunResults),
         });
         await submission.save();
         console.log('[Run Question] Saved run:', submission._id, passedCount, '/', testResults.length, 'passed');
@@ -611,12 +612,12 @@ exports.runWithCustomInput = async (req, res) => {
             language,
             isCorrect: Boolean(customResult?.passed) && expectedOutput !== undefined,
             score: 0, // No score for custom input run
-            output: JSON.stringify(testResults),
+            output: JSON.stringify(compactTestResultsForStorage(testResults)),
             isRun: true,
             isCustomInput: true,
             passedTestCases: customResult?.passed ? 1 : 0,
             totalTestCases: 1,
-            testResults,
+            testResults: compactTestResultsForStorage(testResults),
         });
         await submission.save();
         console.log('[Run With Custom Input] Saved custom run:', submission._id);
@@ -1479,7 +1480,7 @@ exports.viewSubmissionCode = async (req, res) => {
             return res.status(200).json(payload);
         }
 
-        await Submission.updateOne({ _id: submission._id }, { $set: { testResults: rawResults } });
+        await Submission.updateOne({ _id: submission._id }, { $set: { testResults: compactTestResultsForStorage(rawResults) } });
         payload.testResults = staffTestResultRows(rawResults);
         res.status(200).json(payload);
     } catch (err) {

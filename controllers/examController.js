@@ -17,6 +17,8 @@ const {
     sanitizeTestResultsForStudent
 } = require('./questionController');
 
+const { compactTestResultsForStorage } = require('../utils/judge');
+
 const CODING_TYPES = ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'];
 const CLOSED_STATUSES = ['submitted', 'auto_submitted', 'terminated', 'expired'];
 const VIOLATION_TYPES = ['tab_switch', 'fullscreen_exit', 'copy_paste', 'network_loss', 'heartbeat'];
@@ -464,8 +466,8 @@ const gradeAnswer = async (question, answer, language, maxScore) => {
                     score: isCorrect ? maxScore : total ? Math.floor((passed / total) * maxScore) : 0,
                     passedTestCases: passed,
                     totalTestCases: total,
-                    output: JSON.stringify(sanitizeTestResultsForStudent(tests)),
-                    testResults: sanitizeTestResultsForStudent(tests),
+                    output: JSON.stringify(compactTestResultsForStorage(sanitizeTestResultsForStudent(tests))),
+                    testResults: compactTestResultsForStorage(sanitizeTestResultsForStudent(tests)),
                 };
             } catch (err) {
                 if (err?.status === 429) throw err; // judge saturated: tell the student to retry, don't record a zero
