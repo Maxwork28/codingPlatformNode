@@ -35,3 +35,6 @@ build/
 
 # Docker
 docker-compose.override.yml
+
+# Local seed account passwords
+.seed-credentials
