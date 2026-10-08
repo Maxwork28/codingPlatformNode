@@ -7,7 +7,8 @@ const violationSchema = new mongoose.Schema({
         required: true
     },
     timestamp: { type: Date, default: Date.now },
-    details: { type: mongoose.Schema.Types.Mixed }
+    /** Short, bounded string only; the client used to be able to push arbitrary 2 MB objects. */
+    details: { type: String, maxlength: 512 }
 }, { _id: false });
 
 const answerSchema = new mongoose.Schema({
@@ -23,16 +24,32 @@ const answerSchema = new mongoose.Schema({
     savedAt: { type: Date }
 }, { _id: false });
 
+/**
+ * Section / question timers are anchored to the server clock (see "Timers" in examController):
+ *  - remainingSeconds: budget left as of the last stop (null = untimed). While running, the live value
+ *    is remainingSeconds - (now - startedAt).
+ *  - startedAt: when the timer last started counting; null while paused. Only the current section and
+ *    the current question run. Attempts created before this field existed have it unset (= paused).
+ *  - stoppedAt: when it last paused (requests in flight at that moment get a short grace period).
+ *  - endedAt: when it became unusable: the instant its budget ran out, or when the student left a
+ *    section that does not allow revisits.
+ */
+const timerFields = {
+    remainingSeconds: { type: Number, default: null },
+    startedAt: { type: Date, default: null },
+    stoppedAt: { type: Date, default: null },
+    endedAt: { type: Date, default: null },
+    completed: { type: Boolean, default: false }
+};
+
 const sectionTimerSchema = new mongoose.Schema({
     sectionId: { type: String, required: true },
-    remainingSeconds: { type: Number, default: 0 },
-    completed: { type: Boolean, default: false }
+    ...timerFields
 }, { _id: false });
 
 const questionTimerSchema = new mongoose.Schema({
     questionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Question', required: true },
-    remainingSeconds: { type: Number },
-    completed: { type: Boolean, default: false }
+    ...timerFields
 }, { _id: false });
 
 const examAttemptSchema = new mongoose.Schema({
@@ -67,7 +84,7 @@ const examAttemptSchema = new mongoose.Schema({
     feedback: { type: String },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
-});
+}, { optimisticConcurrency: true });
 
 examAttemptSchema.pre('save', function (next) {
     this.updatedAt = Date.now();

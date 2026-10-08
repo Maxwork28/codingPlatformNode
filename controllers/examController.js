@@ -6,6 +6,10 @@ const Question = require('../models/Question');
 const { mergeDriverWithUserAnswer } = require('../utils/codingDriverMerge');
 const { parseOptionalPoints } = require('../utils/optionalPoints');
 const { examPhase } = require('../utils/examPhase');
+const { typedAnswerMatches, buildFillTheCodeProgram, fillTemplateFor } = require('../utils/answerText');
+const { scheduleAiCheck } = require('../utils/aiDetection');
+const seb = require('../utils/seb');
+const SebEntryThrottle = require('../models/SebEntryThrottle');
 const {
     executeDockerCode,
     shouldMergeDriverForLanguage,
@@ -32,14 +36,41 @@ const clampInt = (value, min, max, fallback) => {
     const n = Math.round(Number(value));
     return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 };
+// Strings must carry an explicit zone ("Z" or "+05:30"); an offset-less "2026-10-07T10:00" would be
+// read in the server's zone (UTC on EC2) while the author meant local time.
+const HAS_ZONE = /(Z|[+-]\d{2}:?\d{2})$/i;
 const parseDate = (value) => {
     if (value === undefined || value === null || value === '') return null;
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && !HAS_ZONE.test(value)) return undefined;
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? undefined : date;
 };
-const clientError = (message, status = 400) => Object.assign(new Error(message), { status });
+
+/**
+ * Save an attempt, retrying on optimistic-concurrency conflicts by re-reading the document and
+ * re-applying `apply(fresh)`. Returns the saved document.
+ */
+const saveAttemptWithRetry = async (attempt, apply, tries = 3) => {
+    let doc = attempt;
+    for (let i = 0; i < tries; i += 1) {
+        try {
+            await doc.save();
+            return doc;
+        } catch (err) {
+            if (err?.name !== 'VersionError' || i === tries - 1) throw err;
+            doc = await ExamAttempt.findById(attempt._id);
+            if (!doc) throw clientError('Attempt not found', 404);
+            apply(doc);
+        }
+    }
+    return doc;
+};
+const clientError = (message, status = 400, extra = {}) => Object.assign(new Error(message), { status }, extra);
 const sendError = (res, err, fallback, tag) => {
-    if (err.status) return res.status(err.status).json({ error: err.message });
+    if (err.status) {
+        if (err.retryAfterSeconds) res.set('Retry-After', String(err.retryAfterSeconds));
+        return res.status(err.status).json({ error: err.message, ...(err.body || {}) });
+    }
     console.error(`[ExamController] ${tag}:`, err.message);
     return res.status(500).json({ error: fallback });
 };
@@ -159,7 +190,27 @@ const normalizeSections = (input, questions, examSeconds) => {
     return sections;
 };
 
-const readExamBody = async (body, base) => {
+/**
+ * Safe Exam Browser settings from the request. Secrets are never taken from the client: they are kept
+ * from `base` (only when editing that same exam) and generated whenever SEB is on and one is missing.
+ */
+const readSebSettings = (p, base, keepSecrets) => {
+    const baseP = (keepSecrets && toPlain(base?.proctoring)) || {};
+    const sebRequired = bool(p.sebRequired, false);
+    const override = seb.normalizeConfigKeyOverride(p.sebConfigKeyOverride);
+    if (override === null) throw clientError('The Config Key override must be the 64-character key shown by Safe Exam Browser');
+    const out = {
+        sebRequired,
+        sebVerifyMode: p.sebVerifyMode === 'strict' ? 'strict' : 'basic',
+        sebConfigKeyOverride: override,
+        sebEntryPassword: baseP.sebEntryPassword || undefined,
+        sebExitPassword: baseP.sebExitPassword || undefined,
+        sebConfigToken: baseP.sebConfigToken || undefined,
+    };
+    return sebRequired ? seb.ensureSecrets(out) : out;
+};
+
+const readExamBody = async (body, base, { keepSebSecrets = false } = {}) => {
     const title = String(body.title ?? base?.title ?? '').trim();
     if (!title) throw clientError('Title is required');
     if (title.length > 200) throw clientError('Title must be 200 characters or fewer');
@@ -193,6 +244,7 @@ const readExamBody = async (body, base) => {
             fullscreenRequired: bool(p.fullscreenRequired, true),
             internetRequired: bool(p.internetRequired, true),
             allowRunCode: bool(p.allowRunCode, true),
+            ...readSebSettings(p, base, keepSebSecrets),
         },
         scoring: {
             immediateScoreRelease: bool(s.immediateScoreRelease, false),
@@ -264,6 +316,8 @@ const studentExamSummary = (exam, now = new Date()) => {
             internetRequired: exam.proctoring?.internetRequired,
             autoSubmitOnEnd: exam.proctoring?.autoSubmitOnEnd,
             allowRunCode: exam.proctoring?.allowRunCode,
+            // Only the flag: SEB passwords / token / mode never go to students.
+            sebRequired: Boolean(exam.proctoring?.sebRequired),
         },
         scoring: {
             immediateScoreRelease: exam.scoring?.immediateScoreRelease,
@@ -274,7 +328,7 @@ const studentExamSummary = (exam, now = new Date()) => {
     };
 };
 
-const studentAttempt = (attempt, { released = false, codingIds = new Set() } = {}) => {
+const studentAttempt = (attempt, { released = false, codingIds = new Set(), exam = null, now = Date.now() } = {}) => {
     if (!attempt) return null;
     const showScore = released && isClosed(attempt);
     return {
@@ -284,10 +338,8 @@ const studentAttempt = (attempt, { released = false, codingIds = new Set() } = {
         startedAt: attempt.startedAt,
         endsAt: attempt.endsAt,
         submittedAt: attempt.submittedAt,
-        currentSectionId: attempt.currentSectionId,
-        currentQuestionId: attempt.currentQuestionId,
-        sectionTimers: attempt.sectionTimers,
-        questionTimers: attempt.questionTimers,
+        // Timer state is computed on the server clock at `now` (sent along as serverTime).
+        ...timerState(exam, attempt, now),
         tabSwitchCount: attempt.tabSwitchCount,
         violationCount: attempt.violationCount,
         answers: (attempt.answers || []).map((a) => {
@@ -318,16 +370,21 @@ const codingIdsFor = async (exam) => {
 
 const finalizeAttempt = async (exam, attempt, status, remark) => {
     const points = new Map(exam.questions.map((q) => [idOf(q.questionId), Number(q.points) || 0]));
-    attempt.answers = (attempt.answers || []).filter((a) => points.has(idOf(a.questionId)));
-    attempt.totalScore = attempt.answers.reduce((sum, a) => sum + (Number(a.score) || 0), 0);
-    attempt.maxScore = [...points.values()].reduce((sum, p) => sum + p, 0);
-    attempt.status = status;
-    attempt.autoSubmitted = status === 'auto_submitted';
-    attempt.manualSubmitted = status === 'submitted';
-    attempt.submittedAt = new Date();
-    if (remark) attempt.remark = remark;
-    await attempt.save();
-    return attempt;
+    const apply = (doc) => {
+        if (isClosed(doc)) return; // a concurrent request already closed it; keep that result
+        doc.answers = (doc.answers || []).filter((a) => points.has(idOf(a.questionId)));
+        doc.totalScore = doc.answers.reduce((sum, a) => sum + (Number(a.score) || 0), 0);
+        doc.maxScore = [...points.values()].reduce((sum, p) => sum + p, 0);
+        doc.status = status;
+        doc.autoSubmitted = status === 'auto_submitted';
+        doc.manualSubmitted = status === 'submitted';
+        doc.submittedAt = new Date();
+        if (remark) doc.remark = remark;
+    };
+    apply(attempt);
+    const saved = await saveAttemptWithRetry(attempt, apply);
+    if (saved !== attempt) Object.assign(attempt, saved.toObject());
+    return saved;
 };
 
 const closeIfExpired = async (exam, attempt, now = Date.now()) => {
@@ -345,8 +402,8 @@ const examEndsAt = (exam, from) => {
 
 const runnableCode = (question, answer, language) => {
     if (question.type === 'fillInTheBlanksCoding') {
-        if (!question.codeSnippet) throw clientError('This question is missing its code snippet');
-        return question.codeSnippet.replace('// FILL_IN_THE_BLANK', answer);
+        if (!fillTemplateFor(question, language)) throw clientError('This question is missing its code template');
+        return buildFillTheCodeProgram(question, answer, language);
     }
     if (shouldMergeDriverForLanguage(question, language)) {
         const driver = question.driverCode.find((d) => d.language === language);
@@ -389,8 +446,7 @@ const gradeAnswer = async (question, answer, language, maxScore) => {
         }
         case 'fillInTheBlanks': {
             if (typeof answer !== 'string' || !answer.trim()) throw clientError('Answer cannot be empty');
-            const expected = String(question.correctAnswer || '').trim().toLowerCase();
-            return result(answer.trim().toLowerCase() === expected, answer);
+            return result(typedAnswerMatches(answer, question.correctAnswer), answer);
         }
         default: {
             assertCodingInput(question, answer, language);
@@ -412,6 +468,7 @@ const gradeAnswer = async (question, answer, language, maxScore) => {
                     testResults: sanitizeTestResultsForStudent(tests),
                 };
             } catch (err) {
+                if (err?.status === 429) throw err; // judge saturated: tell the student to retry, don't record a zero
                 return {
                     answer,
                     isCorrect: false,
@@ -426,21 +483,317 @@ const gradeAnswer = async (question, answer, language, maxScore) => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Timers (sections and questions), anchored to the server clock
+//
+// Each timer stores the budget left when it last stopped (remainingSeconds) and, while it runs, the
+// moment it started (startedAt). The current section's timer runs while the student is on any of its
+// questions; the current question's timer runs while that question is open. Everything else is
+// paused. The client only tells the server where the student is (POST /navigate); it never reports
+// time. A section with allowRevisit=false locks (completed) as soon as the student leaves it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Tolerance for requests in flight when a section/question timer stops or runs out. Same cap as the
+ * exam clock (GRACE_MS), but never more than 10% of the timer itself (min 1 s): a 15 s grace on a
+ * 30 s question would hand out 50% extra time.
+ */
+const timerGraceMs = (limitSeconds) => Math.min(GRACE_MS, Math.max(1000, (Number(limitSeconds) || 0) * 100));
+const round3 = (n) => Math.round(n * 1000) / 1000;
+const msOf = (date) => (date ? new Date(date).getTime() : null);
+
+const sectionConf = (exam, sectionId) => (exam.sections || []).find((s) => s.sectionId === sectionId) || null;
+const questionMeta = (exam, questionId) => (exam.questions || []).find((q) => sameId(q.questionId, questionId)) || null;
+/** The section a question belongs to (questions with an unknown sectionId fall into the first section). */
+const sectionIdOf = (exam, meta) => {
+    if (!meta) return null;
+    if (meta.sectionId && sectionConf(exam, meta.sectionId)) return meta.sectionId;
+    return exam.sections?.[0]?.sectionId || null;
+};
+/** Questions in the order the student sees them: by section order, then question order. */
+const orderedQuestions = (exam) => {
+    const sectionRank = new Map((exam.sections || []).map((s, i) => [s.sectionId, s.order ?? i]));
+    return [...(exam.questions || [])].sort((a, b) => {
+        const sa = sectionRank.get(sectionIdOf(exam, a)) ?? 0;
+        const sb = sectionRank.get(sectionIdOf(exam, b)) ?? 0;
+        return sa - sb || (a.order ?? 0) - (b.order ?? 0);
+    });
+};
+
+const findSectionTimer = (doc, sectionId) => (doc.sectionTimers || []).find((t) => t.sectionId === sectionId) || null;
+const findQuestionTimer = (doc, questionId) => (doc.questionTimers || []).find((t) => sameId(t.questionId, questionId)) || null;
+
+/** Every timer slot of the exam with its limit (0 = untimed) and the stored timer (may be null). */
+const timerSlots = (exam, doc) => [
+    ...(exam.sections || []).map((s) => ({
+        kind: 'section',
+        key: s.sectionId,
+        limit: Number(s.durationSeconds) || 0,
+        timer: findSectionTimer(doc, s.sectionId),
+    })),
+    ...(exam.questions || []).map((q) => ({
+        kind: 'question',
+        key: idOf(q.questionId),
+        limit: Number(q.timeLimitSeconds) || 0,
+        timer: findQuestionTimer(doc, q.questionId),
+    })),
+];
+
+/** Budget left in ms at `now` (negative once overrun), or null for an untimed slot. */
+const timerLeftMs = (timer, limit, now) => {
+    if (!limit) return null;
+    const base = (timer.remainingSeconds ?? limit) * 1000;
+    return timer.startedAt ? base - (now - msOf(timer.startedAt)) : base;
+};
+
+/** Pause a running timer, folding the elapsed time into remainingSeconds. Completes it if it ran out. */
+const stopTimer = (timer, limit, now) => {
+    if (!timer?.startedAt) return;
+    const left = timerLeftMs(timer, limit, now);
+    const ranOutAt = limit ? msOf(timer.startedAt) + (timer.remainingSeconds ?? limit) * 1000 : null;
+    timer.startedAt = null;
+    timer.stoppedAt = new Date(now);
+    if (left === null) return;
+    if (left <= 0) {
+        timer.remainingSeconds = 0;
+        timer.completed = true;
+        timer.endedAt = new Date(ranOutAt);
+    } else {
+        timer.remainingSeconds = round3(left / 1000);
+    }
+};
+
+/** Lock a timer for good (student left a no-revisit section, or asked to finish it). */
+const completeTimer = (timer, limit, now) => {
+    if (!timer) return;
+    stopTimer(timer, limit, now);
+    if (timer.completed) return;
+    timer.completed = true;
+    timer.endedAt = new Date(now);
+};
+
+/** Start counting, unless the timer is untimed, locked or out of budget. */
+const startTimer = (timer, limit, now) => {
+    if (!timer || !limit || timer.completed || timer.startedAt) return;
+    if (timer.remainingSeconds === null || timer.remainingSeconds === undefined) timer.remainingSeconds = limit;
+    if (timer.remainingSeconds <= 0) {
+        timer.remainingSeconds = 0;
+        timer.completed = true;
+        timer.endedAt = timer.endedAt || timer.stoppedAt || new Date(now);
+        return;
+    }
+    timer.startedAt = new Date(now);
+};
+
+/** Find a slot's timer, creating it if the attempt predates it. */
+const ensureTimer = (doc, kind, key, limit) => {
+    if (kind === 'section') {
+        if (!findSectionTimer(doc, key)) doc.sectionTimers.push({ sectionId: key, remainingSeconds: limit || null, completed: false });
+        return findSectionTimer(doc, key);
+    }
+    if (!findQuestionTimer(doc, key)) doc.questionTimers.push({ questionId: key, remainingSeconds: limit || null, completed: false });
+    return findQuestionTimer(doc, key);
+};
+
+/** The current question (falls back to the first question) and its section. */
+const currentPosition = (exam, doc) => {
+    const meta = (doc.currentQuestionId && questionMeta(exam, doc.currentQuestionId)) || orderedQuestions(exam)[0] || null;
+    return { meta, sectionId: meta ? sectionIdOf(exam, meta) : doc.currentSectionId || exam.sections?.[0]?.sectionId || null };
+};
+
+/**
+ * Bring the stored timers in line with the server clock at `now`: timers that ran out are completed,
+ * timers that are not current are paused, and the current section/question timers are running.
+ * Also starts timers of attempts created before timers were server-driven (startedAt unset).
+ * Mutates `doc`; callers save it when it is modified.
+ */
+const reconcileTimers = (exam, doc, now) => {
+    if (isClosed(doc)) return;
+    const { meta, sectionId } = currentPosition(exam, doc);
+    const questionKey = meta ? idOf(meta.questionId) : null;
+    if (meta && !sameId(doc.currentQuestionId, questionKey)) doc.currentQuestionId = questionKey;
+    if (sectionId && doc.currentSectionId !== sectionId) doc.currentSectionId = sectionId;
+
+    timerSlots(exam, doc).forEach(({ kind, key, limit, timer }) => {
+        if (!timer?.startedAt) return;
+        const current = kind === 'section' ? key === sectionId : key === questionKey;
+        const left = timerLeftMs(timer, limit, now);
+        if (!current || (left !== null && left <= 0)) stopTimer(timer, limit, now);
+    });
+
+    if (!sectionId) return;
+    const section = sectionConf(exam, sectionId);
+    const sectionLimit = Number(section?.durationSeconds) || 0;
+    const sTimer = ensureTimer(doc, 'section', sectionId, sectionLimit);
+    startTimer(sTimer, sectionLimit, now);
+    if (!meta) return;
+    const questionLimit = Number(meta.timeLimitSeconds) || 0;
+    if (!questionLimit) return;
+    const qTimer = ensureTimer(doc, 'question', questionKey, questionLimit);
+    // A locked section freezes its questions' timers too.
+    if (sTimer.completed) stopTimer(qTimer, questionLimit, now);
+    else startTimer(qTimer, questionLimit, now);
+};
+
+/**
+ * Move the student to `questionId`: pause what was running, lock the section being left if it does
+ * not allow revisits, then start the new section/question timers. A locked target can still be
+ * viewed; its timers simply do not start and its answers cannot change.
+ */
+const navigateTimers = (exam, doc, questionId, now) => {
+    const target = questionMeta(exam, questionId);
+    if (!target) throw clientError('This question is not part of the exam');
+    const { meta: fromMeta, sectionId: fromSection } = currentPosition(exam, doc);
+    const toSection = sectionIdOf(exam, target);
+    if (fromMeta && sameId(fromMeta.questionId, questionId)) return reconcileTimers(exam, doc, now);
+
+    timerSlots(exam, doc).forEach(({ limit, timer }) => stopTimer(timer, limit, now));
+    const leaving = fromSection && fromSection !== toSection ? sectionConf(exam, fromSection) : null;
+    if (leaving && leaving.allowRevisit === false) {
+        completeTimer(ensureTimer(doc, 'section', leaving.sectionId, Number(leaving.durationSeconds) || 0), Number(leaving.durationSeconds) || 0, now);
+    }
+    doc.currentQuestionId = idOf(target.questionId);
+    doc.currentSectionId = toSection;
+    return reconcileTimers(exam, doc, now);
+};
+
+/** Client view of one timer at `now`. `endsAt` is set while it runs: the client counts down to it. */
+const timerView = (timer, limit, now) => {
+    const left = timer ? timerLeftMs(timer, limit, now) : limit ? limit * 1000 : null;
+    const expired = left !== null && left <= 0;
+    const running = Boolean(timer?.startedAt) && !timer?.completed && !expired;
+    return {
+        limitSeconds: limit || null,
+        remainingSeconds: left === null ? null : round3(Math.max(0, left) / 1000),
+        running,
+        completed: Boolean(timer?.completed) || expired,
+        endsAt: running ? new Date(now + left) : null,
+    };
+};
+
+const timerState = (exam, attempt, now = Date.now()) => {
+    const sectionTimers = [];
+    const questionTimers = [];
+    if (exam) {
+        timerSlots(exam, attempt).forEach(({ kind, key, limit, timer }) => {
+            if (kind === 'section') sectionTimers.push({ sectionId: key, ...timerView(timer, limit, now) });
+            else questionTimers.push({ questionId: key, ...timerView(timer, limit, now) });
+        });
+    }
+    return { currentSectionId: attempt.currentSectionId, currentQuestionId: attempt.currentQuestionId, sectionTimers, questionTimers };
+};
+
+/** Reconcile the timers at `now` and persist if anything changed. Returns the saved attempt. */
+const syncAttemptTimers = async (exam, attempt, now = Date.now()) => {
+    if (isClosed(attempt)) return attempt;
+    reconcileTimers(exam, attempt, now);
+    if (!attempt.isModified()) return attempt;
+    return saveAttemptWithRetry(attempt, (doc) => reconcileTimers(exam, doc, now));
+};
+
+/** Throws unless a timer slot still accepts answers at `now`. */
+const assertSlotOpen = (timer, limit, now, label) => {
+    const grace = timerGraceMs(limit);
+    if (timer?.completed) {
+        if (timer.endedAt && now < msOf(timer.endedAt) + grace) return;
+        const timedOut = limit && !(timer.remainingSeconds > 0);
+        throw clientError(timedOut ? `Time for this ${label} is over` : `You have left this ${label}, so its answers are locked`, 403);
+    }
+    if (!limit) return;
+    if (!timer) throw clientError(`Open this ${label} before answering it`, 403);
+    const left = timerLeftMs(timer, limit, now);
+    if (left <= -grace || (!timer.startedAt && left <= 0)) throw clientError(`Time for this ${label} is over`, 403);
+    // A paused timed slot only accepts requests that were in flight when the student moved away;
+    // otherwise its clock could be stopped by navigating elsewhere while answering through the API.
+    if (!timer.startedAt && !(timer.stoppedAt && now < msOf(timer.stoppedAt) + grace)) {
+        throw clientError(`Go back to this ${label} to change its answer`, 403);
+    }
+};
+
 /** Throws when the student may no longer change this question (timer ran out or section closed). */
-const assertQuestionOpen = (exam, attempt, questionId) => {
-    const meta = exam.questions.find((q) => sameId(q.questionId, questionId));
+const assertQuestionOpen = (exam, attempt, questionId, now = Date.now()) => {
+    const meta = questionMeta(exam, questionId);
     if (!meta) throw clientError('This question is not part of the exam');
-    const qTimer = (attempt.questionTimers || []).find((t) => sameId(t.questionId, questionId));
-    if (meta.timeLimitSeconds && qTimer && qTimer.remainingSeconds === 0) throw clientError('Time for this question is over', 403);
-    const section = (exam.sections || []).find((s) => s.sectionId === meta.sectionId);
-    const sTimer = (attempt.sectionTimers || []).find((t) => t.sectionId === meta.sectionId);
-    if (section?.durationSeconds && sTimer && sTimer.remainingSeconds === 0) throw clientError('Time for this section is over', 403);
+    const sectionId = sectionIdOf(exam, meta);
+    const section = sectionConf(exam, sectionId);
+    assertSlotOpen(sectionId ? findSectionTimer(attempt, sectionId) : null, Number(section?.durationSeconds) || 0, now, 'section');
+    assertSlotOpen(findQuestionTimer(attempt, questionId), Number(meta.timeLimitSeconds) || 0, now, 'question');
     return meta;
 };
 
 const assertAttemptOpen = async (exam, attempt) => {
     if (await closeIfExpired(exam, attempt)) throw clientError('Time is up. Your exam has been submitted.', 409);
     if (isClosed(attempt)) throw clientError('This attempt is already closed', 409);
+};
+
+// ---------------------------------------------------------------------------
+// Safe Exam Browser: entry password with a per-student throttle
+// ---------------------------------------------------------------------------
+
+const sebLockedError = (untilMs) => {
+    const seconds = Math.max(1, Math.ceil((untilMs - Date.now()) / 1000));
+    const minutes = Math.ceil(seconds / 60);
+    return clientError(`Too many wrong entry passwords. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`, 429, {
+        retryAfterSeconds: seconds,
+        body: { code: 'SEB_ENTRY_LOCKED', retryAfterSeconds: seconds },
+    });
+};
+
+/** Atomically counts one wrong password (window of ENTRY_WINDOW_MS) and locks after ENTRY_MAX_FAILURES. */
+const recordSebEntryFailure = async (key) => {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - seb.ENTRY_WINDOW_MS);
+    return SebEntryThrottle.findOneAndUpdate(
+        key,
+        [
+            { $set: { inWindow: { $gt: ['$windowStart', cutoff] } } },
+            {
+                $set: {
+                    failures: { $cond: ['$inWindow', { $add: [{ $ifNull: ['$failures', 0] }, 1] }, 1] },
+                    windowStart: { $cond: ['$inWindow', '$windowStart', now] },
+                    expiresAt: new Date(now.getTime() + seb.ENTRY_WINDOW_MS + seb.ENTRY_LOCK_MS),
+                },
+            },
+            {
+                $set: {
+                    lockedUntil: {
+                        $cond: [{ $gte: ['$failures', seb.ENTRY_MAX_FAILURES] }, new Date(now.getTime() + seb.ENTRY_LOCK_MS), '$lockedUntil'],
+                    },
+                },
+            },
+            { $unset: 'inWindow' },
+        ],
+        { upsert: true, new: true }
+    ).lean();
+};
+
+/**
+ * POST /start on a SEB exam: body.entryPassword must match (trimmed, case-insensitive, timing-safe).
+ * 5 wrong tries within 10 minutes lock this student out of this exam's start for 10 minutes (429).
+ */
+const checkSebEntryPassword = async (exam, req) => {
+    const key = { examId: exam._id, studentId: req.user._id };
+    const throttle = await SebEntryThrottle.findOne(key).lean();
+    const lockedUntil = throttle?.lockedUntil ? new Date(throttle.lockedUntil).getTime() : 0;
+    if (lockedUntil > Date.now()) throw sebLockedError(lockedUntil);
+
+    const given = req.body?.entryPassword;
+    if (typeof given !== 'string' || !given.trim()) {
+        throw clientError('Enter the entry password your teacher announced.', 403, { body: { code: 'SEB_ENTRY_PASSWORD' } });
+    }
+    if (seb.entryPasswordMatches(given, exam.proctoring?.sebEntryPassword)) {
+        if (throttle) await SebEntryThrottle.deleteOne(key);
+        return;
+    }
+    const doc = await recordSebEntryFailure(key);
+    const lockedNow = doc?.lockedUntil ? new Date(doc.lockedUntil).getTime() : 0;
+    if (lockedNow > Date.now()) throw sebLockedError(lockedNow);
+    const triesLeft = Math.max(0, seb.ENTRY_MAX_FAILURES - (doc?.failures || 0));
+    throw clientError(
+        `That entry password is not correct. Check it with your teacher (${triesLeft} ${triesLeft === 1 ? 'try' : 'tries'} left).`,
+        403,
+        { body: { code: 'SEB_ENTRY_PASSWORD', triesLeft } }
+    );
 };
 
 // ---------------------------------------------------------------------------
@@ -715,7 +1068,7 @@ exports.getExamDetails = async (req, res) => {
         ]);
         const plain = exam.toObject();
         res.json({
-            exam: { ...plain, phase: examPhase(plain), totalPoints: totalPoints(plain) },
+            exam: { ...plain, phase: examPhase(plain), totalPoints: totalPoints(plain), seb: seb.staffSebView(plain, req) },
             attemptCount,
             className: cls?.name || null,
         });
@@ -741,7 +1094,7 @@ exports.editExam = async (req, res) => {
         const exam = await loadManagedExam(req);
         const isTemplate = Boolean(exam.template?.isTemplate);
         const attemptCount = isTemplate ? 0 : await ExamAttempt.countDocuments({ examId: exam._id });
-        const fields = await readExamBody(req.body, exam);
+        const fields = await readExamBody(req.body, exam, { keepSebSecrets: true });
         if (isTemplate) {
             fields.proctoring.startTime = null;
             fields.proctoring.endTime = null;
@@ -767,6 +1120,18 @@ exports.editExam = async (req, res) => {
         exam.markModified('scoring');
         await exam.save();
         if (nextStatus === 'completed') await closeOpenAttempts(exam, 'Exam closed by instructor');
+        else if (!isTemplate) {
+            // Keep in-progress attempts consistent with the new duration / end time.
+            const open = await ExamAttempt.find({ examId: exam._id, status: 'in_progress', startedAt: { $ne: null } });
+            await Promise.all(
+                open.map((a) => {
+                    const next = examEndsAt(exam, new Date(a.startedAt));
+                    if (a.endsAt && next.getTime() === new Date(a.endsAt).getTime()) return null;
+                    a.endsAt = next;
+                    return saveAttemptWithRetry(a, (doc) => { doc.endsAt = next; }).catch(() => {});
+                })
+            );
+        }
 
         res.json({ message: isTemplate ? 'Template updated' : 'Exam updated', exam });
     } catch (err) {
@@ -813,7 +1178,15 @@ exports.duplicateExam = async (req, res) => {
             classId,
             questions: plain.questions,
             sections: plain.sections,
-            proctoring: { ...plain.proctoring, startTime: null, endTime: null },
+            // A copy never shares SEB passwords or the download token with its source.
+            proctoring: {
+                ...plain.proctoring,
+                startTime: null,
+                endTime: null,
+                ...(plain.proctoring?.sebRequired
+                    ? seb.newSecrets()
+                    : { sebEntryPassword: undefined, sebExitPassword: undefined, sebConfigToken: undefined }),
+            },
             scoring: { ...plain.scoring, releaseStatus: 'not_released' },
             createdBy: req.user._id,
             status: 'draft',
@@ -882,6 +1255,7 @@ exports.getExamReport = async (req, res) => {
                 phase: examPhase(plain),
                 released: releasedFor(plain),
                 proctoring: plain.proctoring,
+                seb: seb.staffSebView(plain, req),
                 scoring: plain.scoring,
                 sections: plain.sections,
                 totalPoints: totalPoints(plain),
@@ -991,6 +1365,107 @@ exports.resetAttempt = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
+// Safe Exam Browser
+// ---------------------------------------------------------------------------
+
+const sendSebFile = (req, res, exam) => {
+    const file = seb.buildSebFile(toPlain(exam), req);
+    // no-transform: the file is already gzip'd in SEB's own format; never let a proxy re-encode it.
+    res.set('Cache-Control', 'no-store, no-transform');
+    res.attachment(seb.fileNameFor(exam));
+    res.type('application/seb');
+    res.send(file.buffer);
+};
+
+/** POST /exams/:examId/seb/regenerate (staff): new entry + exit passwords; clears entry lockouts. */
+exports.regenerateSebPasswords = async (req, res) => {
+    try {
+        const exam = await loadManagedExam(req);
+        if (!seb.isSebRequired(exam)) throw clientError('Turn on "Require Safe Exam Browser" for this exam first', 409);
+        const fresh = seb.newSecrets();
+        const overrideCleared = Boolean(exam.proctoring.sebConfigKeyOverride);
+        exam.proctoring.sebEntryPassword = fresh.sebEntryPassword;
+        exam.proctoring.sebExitPassword = fresh.sebExitPassword;
+        if (!exam.proctoring.sebConfigToken) exam.proctoring.sebConfigToken = fresh.sebConfigToken;
+        // The exit password's hash is part of the .seb settings, so an old Config Key override no longer applies.
+        exam.proctoring.sebConfigKeyOverride = '';
+        exam.markModified('proctoring');
+        await exam.save();
+        await SebEntryThrottle.deleteMany({ examId: exam._id });
+        res.json({ message: 'New passwords generated', seb: seb.staffSebView(exam.toObject(), req), overrideCleared });
+    } catch (err) {
+        sendError(res, err, 'Failed to generate new passwords', 'regenerateSebPasswords');
+    }
+};
+
+/** GET /exams/:examId/seb-config (staff, bearer auth): the same .seb file students get. */
+exports.downloadSebConfigStaff = async (req, res) => {
+    try {
+        const exam = await loadManagedExam(req);
+        if (!seb.isSebRequired(exam)) throw clientError('Safe Exam Browser is not turned on for this exam', 409);
+        sendSebFile(req, res, exam);
+    } catch (err) {
+        sendError(res, err, 'Failed to build the .seb file', 'downloadSebConfigStaff');
+    }
+};
+
+/**
+ * GET /exams/:examId/seb-config/:token (no bearer auth: SEB downloads it itself after a seb(s):// link).
+ * 404 unless SEB is on and the token matches.
+ */
+exports.downloadSebConfig = async (req, res) => {
+    try {
+        const exam = await Exam.findById(req.params.examId);
+        const expected = exam?.proctoring?.sebConfigToken;
+        const ok = Boolean(exam && !exam.template?.isTemplate && seb.isSebRequired(exam) && expected && seb.safeEqual(String(req.params.token || ''), expected));
+        if (!ok) return res.status(404).json({ error: 'Not found' });
+        sendSebFile(req, res, exam);
+    } catch (err) {
+        sendError(res, err, 'Failed to build the .seb file', 'downloadSebConfig');
+    }
+};
+
+/**
+ * GET /exams/:examId/seb-check (enrolled student or managing staff): how this request looks to the SEB
+ * check. Lets a teacher verify one real SEB laptop before switching an exam to strict mode.
+ */
+exports.sebCheck = async (req, res) => {
+    try {
+        const exam = await Exam.findById(req.params.examId);
+        if (!exam || exam.template?.isTemplate) throw clientError('Exam not found', 404);
+        const staff = ['admin', 'teacher', 'superAdmin'].includes(req.user.role);
+        if (staff) {
+            if (!(await canManageExam(req.user, exam))) throw clientError('You do not manage this exam', 403);
+        } else {
+            if (exam.status === 'draft') throw clientError('Exam not found', 404);
+            const enrolled = await Class.exists({ _id: exam.classId, students: req.user._id });
+            if (!enrolled) throw clientError('You are not enrolled in this class', 403);
+        }
+        const plain = exam.toObject();
+        const result = seb.checkSebRequest(req, plain);
+        let expected = null;
+        if (staff && seb.isSebRequired(plain)) {
+            try {
+                const computed = seb.computeConfigKey(seb.buildSebSettings(plain, req));
+                expected = { computedConfigKey: computed, effectiveConfigKey: seb.expectedConfigKey(plain, req).key };
+            } catch {
+                expected = null;
+            }
+        }
+        res.json({
+            sebRequired: seb.isSebRequired(plain),
+            ...result,
+            wouldPass: seb.isSebRequired(plain) ? result.ok : true,
+            userAgent: String(req.get('user-agent') || '').slice(0, 300),
+            ...(expected || {}),
+            serverTime: new Date(),
+        });
+    } catch (err) {
+        sendError(res, err, 'Failed to check Safe Exam Browser', 'sebCheck');
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Student: taking an exam
 // ---------------------------------------------------------------------------
 
@@ -1003,10 +1478,13 @@ exports.getStudentExamSummary = async (req, res) => {
         ]);
         await closeIfExpired(exam, attempt);
         const released = releasedFor(exam);
+        const now = Date.now();
+        const sebInfo = seb.isSebRequired(exam) ? { required: true, link: seb.launchLinkFor(exam, req) } : { required: false };
         res.json({
-            exam: { ...studentExamSummary(exam), className: cls?.name || null, released },
-            attempt: studentAttempt(attempt, { released }),
-            serverTime: new Date(),
+            exam: { ...studentExamSummary(exam), className: cls?.name || null, released, seb: sebInfo },
+            sebLink: sebInfo.link || null,
+            attempt: studentAttempt(attempt, { released, exam, now }),
+            serverTime: new Date(now),
         });
     } catch (err) {
         sendError(res, err, 'Failed to load exam', 'getStudentExamSummary');
@@ -1027,7 +1505,13 @@ exports.startExam = async (req, res) => {
         if (attempt) {
             await closeIfExpired(exam, attempt);
             if (isClosed(attempt)) throw clientError('You have already submitted this exam', 409);
-                        } else {
+        }
+        // SEB entry password: needed to begin. Resuming an attempt already in progress does not ask again
+        // (the student is already inside SEB; the SEB check itself still ran in the route middleware).
+        if (seb.isSebRequired(exam) && attempt?.status !== 'in_progress') {
+            await checkSebEntryPassword(exam, req);
+        }
+        if (!attempt) {
             const now = new Date();
             try {
                 attempt = await ExamAttempt.create({
@@ -1047,8 +1531,8 @@ exports.startExam = async (req, res) => {
                         remainingSeconds: q.timeLimitSeconds || null,
                         completed: false,
                     })),
-                    currentSectionId: exam.sections?.[0]?.sectionId || null,
-                    currentQuestionId: exam.questions[0]?.questionId || null,
+                    currentSectionId: sectionIdOf(exam, orderedQuestions(exam)[0]),
+                    currentQuestionId: orderedQuestions(exam)[0]?.questionId || null,
                 });
             } catch (err) {
                 if (err.code !== 11000) throw err;
@@ -1061,6 +1545,9 @@ exports.startExam = async (req, res) => {
             attempt.endsAt = attempt.endsAt || examEndsAt(exam, attempt.startedAt);
             await attempt.save();
         }
+        // Starts the current section/question timers (new attempts, and resumed pre-migration attempts).
+        const now = Date.now();
+        attempt = await syncAttemptTimers(exam, attempt, now);
 
         const docs = await Question.find({ _id: { $in: exam.questions.map((q) => q.questionId) } });
         const byId = new Map(docs.map((d) => [String(d._id), d]));
@@ -1082,10 +1569,10 @@ exports.startExam = async (req, res) => {
 
         res.json({
             exam: { ...studentExamSummary(exam), className: cls?.name || null },
-            attempt: studentAttempt(attempt, { codingIds }),
+            attempt: studentAttempt(attempt, { codingIds, exam, now }),
             questions,
             questionDetails: questions,
-            serverTime: new Date(),
+            serverTime: new Date(now),
         });
     } catch (err) {
         sendError(res, err, 'Failed to start exam', 'startExam');
@@ -1098,7 +1585,12 @@ exports.getAttempt = async (req, res) => {
         const attempt = await ExamAttempt.findOne({ examId: exam._id, studentId: req.user._id });
         if (!attempt) throw clientError('Attempt not found', 404);
         await closeIfExpired(exam, attempt);
-        res.json({ attempt: studentAttempt(attempt, { released: releasedFor(exam), codingIds: await codingIdsFor(exam) }), serverTime: new Date() });
+        const now = Date.now();
+        const synced = await syncAttemptTimers(exam, attempt, now);
+        res.json({
+            attempt: studentAttempt(synced, { released: releasedFor(exam), codingIds: await codingIdsFor(exam), exam, now }),
+            serverTime: new Date(now),
+        });
     } catch (err) {
         sendError(res, err, 'Failed to fetch attempt', 'getAttempt');
     }
@@ -1134,6 +1626,15 @@ exports.submitAnswer = async (req, res) => {
             examAttemptId: attempt._id,
         });
 
+        // AI-generated-code check: coding answers in exams only; asynchronous, never blocks or fails the save.
+        if (coding) {
+            try {
+                scheduleAiCheck({ submissionId: submission._id, examId: exam._id, attemptId: attempt._id, questionId });
+            } catch (err) {
+                console.warn('[exam] scheduleAiCheck failed:', err?.message);
+            }
+        }
+
         const savedAt = new Date();
         const entry = {
             questionId,
@@ -1147,11 +1648,20 @@ exports.submitAnswer = async (req, res) => {
             totalTestCases: graded.totalTestCases,
             savedAt,
         };
-        const idx = attempt.answers.findIndex((a) => sameId(a.questionId, questionId));
-        if (idx >= 0) attempt.answers[idx] = entry;
-        else attempt.answers.push(entry);
-        attempt.currentQuestionId = questionId;
-        await attempt.save();
+        const applyAnswer = (doc) => {
+            const i = doc.answers.findIndex((a) => sameId(a.questionId, questionId));
+            if (i >= 0) doc.answers[i] = entry;
+            else doc.answers.push(entry);
+            // Not moving currentQuestionId here: only /navigate changes position (and the running timers).
+        };
+        applyAnswer(attempt);
+        // Grading took seconds; a concurrent auto-submit may have closed the attempt meanwhile.
+        const fresh = await ExamAttempt.findById(attempt._id).select('status endsAt');
+        if (!fresh || isClosed(fresh)) throw clientError('Time is up. Your exam has been submitted.', 409);
+        await saveAttemptWithRetry(attempt, (doc) => {
+            if (isClosed(doc)) throw clientError('Time is up. Your exam has been submitted.', 409);
+            applyAnswer(doc);
+        });
 
         res.json({
             message: 'Answer saved',
@@ -1196,8 +1706,9 @@ exports.runCode = async (req, res) => {
             results = await executeDockerCode(language, runnableCode(question, answer, language), tests, question.timeLimit, question.memoryLimit, {
                 wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language),
             });
-    } catch (err) {
-            throw clientError(`Your code could not be run: ${err.message}`, 422);
+        } catch (err) {
+            const busy = err?.status === 429;
+            throw clientError(busy ? err.message : `Your code could not be run: ${err.message}`, busy ? 429 : 422);
         }
         res.json({ custom, testResults: sanitizeTestResultsForStudent(results) });
     } catch (err) {
@@ -1217,24 +1728,33 @@ exports.logProctoringEvent = async (req, res) => {
             return res.json({ success: true, terminate: attempt.status === 'terminated', status: attempt.status, endsAt: attempt.endsAt });
         }
 
-        if (type === 'heartbeat') {
-            attempt.lastHeartbeatAt = new Date();
-        } else {
-            attempt.violations.push({ type, details: typeof details === 'object' ? details : undefined, timestamp: new Date() });
-            if (type === 'network_loss') attempt.networkDropCount += 1;
-            else {
-                attempt.violationCount += 1;
-                if (type === 'tab_switch') attempt.tabSwitchCount += 1;
-                if (type === 'fullscreen_exit') attempt.fullscreenExitCount += 1;
-                if (type === 'copy_paste') attempt.copyPasteCount += 1;
+        const MAX_VIOLATIONS = 500;
+        const detailText =
+            details === undefined || details === null
+                ? undefined
+                : String(typeof details === 'object' ? JSON.stringify(details) : details).slice(0, 512);
+        const applyEvent = (doc) => {
+            if (type === 'heartbeat') {
+                doc.lastHeartbeatAt = new Date();
+                return;
             }
-        }
+            if (doc.violations.length >= MAX_VIOLATIONS) doc.violations.splice(0, doc.violations.length - MAX_VIOLATIONS + 1);
+            doc.violations.push({ type, details: detailText, timestamp: new Date() });
+            if (type === 'network_loss') doc.networkDropCount += 1;
+            else {
+                doc.violationCount += 1;
+                if (type === 'tab_switch') doc.tabSwitchCount += 1;
+                if (type === 'fullscreen_exit') doc.fullscreenExitCount += 1;
+                if (type === 'copy_paste') doc.copyPasteCount += 1;
+            }
+        };
+        applyEvent(attempt);
 
         const limit = exam.proctoring?.tabSwitchLimit ?? 5;
         if (type === 'tab_switch' && limit > 0 && attempt.tabSwitchCount >= limit) {
             await finalizeAttempt(exam, attempt, 'terminated', `Locked after ${attempt.tabSwitchCount} tab switches`);
         } else {
-            await attempt.save();
+            await saveAttemptWithRetry(attempt, applyEvent);
         }
 
         res.json({
@@ -1251,47 +1771,104 @@ exports.logProctoringEvent = async (req, res) => {
     }
 };
 
-const updateTimer = (list, match, remainingSeconds, completed) => {
-    const timer = list.find(match);
-    if (!timer) return;
-    if (typeof remainingSeconds === 'number' && timer.remainingSeconds != null) {
-        // Timers only ever count down; a client cannot hand itself more time.
-        timer.remainingSeconds = Math.max(0, Math.min(timer.remainingSeconds, Math.floor(remainingSeconds)));
-        if (timer.remainingSeconds === 0) timer.completed = true;
-    }
-    if (completed === true) timer.completed = true;
+const firstQuestionOfSection = (exam, sectionId) => orderedQuestions(exam).find((q) => sectionIdOf(exam, q) === sectionId) || null;
+
+const timerResponse = (exam, attempt, now) => ({
+    success: true,
+    status: attempt.status,
+    endsAt: attempt.endsAt,
+    ...timerState(exam, attempt, now),
+    serverTime: new Date(now),
+});
+
+/**
+ * Move the attempt to `targetId` (or just reconcile when null), optionally locking a timer, and save.
+ * Shared by POST /navigate and the legacy PATCH timer routes.
+ */
+const moveAttempt = async (exam, attempt, targetId, finish) => {
+    await assertAttemptOpen(exam, attempt);
+    const now = Date.now();
+    const apply = (doc) => {
+        if (isClosed(doc)) throw clientError('This attempt is already closed', 409);
+        if (targetId) navigateTimers(exam, doc, targetId, now);
+        else reconcileTimers(exam, doc, now);
+        if (finish) {
+            finish(doc, now);
+            reconcileTimers(exam, doc, now);
+        }
+    };
+    apply(attempt);
+    const saved = attempt.isModified() ? await saveAttemptWithRetry(attempt, apply) : attempt;
+    return { saved, now };
 };
 
+/**
+ * POST /:examId/navigate { attemptId, questionId?, sectionId? }
+ * The student opened another question (or section: its first question). The server pauses the timers
+ * that were running, starts the new ones and returns the authoritative timer state + serverTime.
+ */
+exports.navigate = async (req, res) => {
+    try {
+        const exam = await loadStudentExam(req);
+        const attempt = await loadOwnAttempt(req, exam);
+        const { questionId, sectionId } = req.body;
+        let target = null;
+        if (questionId) {
+            target = isObjectId(questionId) ? questionMeta(exam, questionId) : null;
+            if (!target) throw clientError('This question is not part of the exam');
+            if (sectionId && sectionIdOf(exam, target) !== String(sectionId)) throw clientError('That question is not in this section');
+        } else if (sectionId) {
+            if (!sectionConf(exam, String(sectionId))) throw clientError('Unknown section');
+            target = firstQuestionOfSection(exam, String(sectionId));
+            if (!target) throw clientError('That section has no questions');
+        }
+        const { saved, now } = await moveAttempt(exam, attempt, target ? idOf(target.questionId) : null);
+        res.json(timerResponse(exam, saved, now));
+    } catch (err) {
+        sendError(res, err, 'Failed to change question', 'navigate');
+    }
+};
+
+/**
+ * Legacy: PATCH /:examId/section-timer { attemptId, sectionId, currentQuestionId?, completed? }.
+ * `remainingSeconds` is ignored: the server owns the clock. It can only switch the current
+ * question/section (same as /navigate) or lock the section (completed: true).
+ */
 exports.updateSectionTimer = async (req, res) => {
     try {
         const exam = await loadStudentExam(req);
         const attempt = await loadOwnAttempt(req, exam);
-        await assertAttemptOpen(exam, attempt);
-        const { sectionId, remainingSeconds, completed, currentQuestionId } = req.body;
-        if (!sectionId) throw clientError('sectionId is required');
-        updateTimer(attempt.sectionTimers || [], (t) => t.sectionId === sectionId, remainingSeconds, completed);
-        attempt.currentSectionId = sectionId;
-        if (isObjectId(currentQuestionId) && exam.questions.some((q) => sameId(q.questionId, currentQuestionId))) {
-            attempt.currentQuestionId = currentQuestionId;
-        }
-        await attempt.save();
-        res.json({ success: true });
+        const { sectionId, completed, currentQuestionId } = req.body;
+        const section = sectionId ? sectionConf(exam, String(sectionId)) : null;
+        if (!section) throw clientError('sectionId is required');
+        let target = isObjectId(currentQuestionId) ? questionMeta(exam, currentQuestionId) : null;
+        if (target && sectionIdOf(exam, target) !== section.sectionId) target = null;
+        if (!target && currentPosition(exam, attempt).sectionId !== section.sectionId) target = firstQuestionOfSection(exam, section.sectionId);
+        const limit = Number(section.durationSeconds) || 0;
+        const finish = completed === true ? (doc, now) => completeTimer(ensureTimer(doc, 'section', section.sectionId, limit), limit, now) : null;
+        const { saved, now } = await moveAttempt(exam, attempt, target ? idOf(target.questionId) : null, finish);
+        res.json(timerResponse(exam, saved, now));
     } catch (err) {
         sendError(res, err, 'Failed to update section timer', 'updateSectionTimer');
     }
 };
 
+/**
+ * Legacy: PATCH /:examId/question-timer { attemptId, questionId, completed? }.
+ * `remainingSeconds` is ignored. Opens the question (same as /navigate) and optionally locks it.
+ */
 exports.updateQuestionTimer = async (req, res) => {
     try {
         const exam = await loadStudentExam(req);
         const attempt = await loadOwnAttempt(req, exam);
-        await assertAttemptOpen(exam, attempt);
-        const { questionId, remainingSeconds, completed } = req.body;
-        if (!isObjectId(questionId)) throw clientError('questionId is required');
-        updateTimer(attempt.questionTimers || [], (t) => sameId(t.questionId, questionId), remainingSeconds, completed);
-        attempt.currentQuestionId = questionId;
-        await attempt.save();
-        res.json({ success: true });
+        const { questionId, completed } = req.body;
+        const meta = isObjectId(questionId) ? questionMeta(exam, questionId) : null;
+        if (!meta) throw clientError('questionId is required');
+        const key = idOf(meta.questionId);
+        const limit = Number(meta.timeLimitSeconds) || 0;
+        const finish = completed === true ? (doc, now) => completeTimer(ensureTimer(doc, 'question', key, limit), limit, now) : null;
+        const { saved, now } = await moveAttempt(exam, attempt, key, finish);
+        res.json(timerResponse(exam, saved, now));
     } catch (err) {
         sendError(res, err, 'Failed to update question timer', 'updateQuestionTimer');
     }
@@ -1361,6 +1938,9 @@ exports.getStudentExamResults = async (req, res) => {
         };
         if (!released) return res.json(summary);
 
+        // Scores may be released immediately, but answer keys only once nobody can still be writing:
+        // the exam window has closed, or staff explicitly released results.
+        const keysVisible = exam.scoring?.releaseStatus === 'released' || ['completed', 'archived'].includes(examPhase(exam));
         const docs = await Question.find({ _id: { $in: exam.questions.map((q) => q.questionId) } })
             .select('title type difficulty description options correctOption correctOptions correctAnswer')
             .lean();
@@ -1371,6 +1951,7 @@ exports.getStudentExamResults = async (req, res) => {
         res.json({
             ...summary,
             attempt: { ...summary.attempt, totalScore: attempt.totalScore, maxScore: attempt.maxScore || totalPoints(exam) },
+            answerKeysVisible: keysVisible,
             questions: [...exam.questions]
                 .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
                 .map((meta) => {
@@ -1386,9 +1967,9 @@ exports.getStudentExamResults = async (req, res) => {
                         difficulty: doc.difficulty || null,
                         description: doc.description || '',
                         options: doc.options || [],
-                        correctOption: coding ? undefined : doc.correctOption,
-                        correctOptions: coding ? undefined : doc.correctOptions,
-                        correctAnswer: coding ? undefined : doc.correctAnswer,
+                        correctOption: coding || !keysVisible ? undefined : doc.correctOption,
+                        correctOptions: coding || !keysVisible ? undefined : doc.correctOptions,
+                        correctAnswer: coding || !keysVisible ? undefined : doc.correctAnswer,
                         response: ans
                             ? {
                                   answer: ans.answer,

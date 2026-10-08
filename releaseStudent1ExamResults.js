@@ -1,4 +1,28 @@
+/**
+ * Dev helper: releases results for the seeded "Student1 Special Exam".
+ * Refuses to run against a non-local database or with NODE_ENV=production unless --yes-i-know is passed.
+ */
+require('dotenv').config();
+
 const mongoose = require('mongoose');
+
+function assertSafeSeedTarget(uri, label) {
+  if (process.argv.includes('--yes-i-know')) return;
+  let host = '';
+  try {
+    host = new URL(uri).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    host = '';
+  }
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(host);
+  if (process.env.NODE_ENV === 'production' || !isLocal) {
+    console.error(
+      `[${label}] Refusing to run: target host is "${host || 'unparseable'}" and NODE_ENV is "${process.env.NODE_ENV || 'development'}".\n` +
+        `[${label}] This script modifies data. Point MONGO_URI at localhost, or pass --yes-i-know to override.`,
+    );
+    process.exit(1);
+  }
+}
 
 // Define Exam Schema
 const examSchema = new mongoose.Schema({
@@ -19,12 +43,13 @@ const examSchema = new mongoose.Schema({
 const Exam = mongoose.model('Exam', examSchema);
 
 // MongoDB connection
-const MONGO_URI = 'mongodb://localhost:27017/education_platform';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/education_platform';
 
 /**
  * Releases results for student1 exam by setting immediateScoreRelease to true
  */
 async function releaseStudent1ExamResults() {
+  assertSafeSeedTarget(MONGO_URI, 'Release');
   try {
     console.log('[Release] Connecting to MongoDB...');
     await mongoose.connect(MONGO_URI);

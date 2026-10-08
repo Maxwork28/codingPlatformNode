@@ -32,7 +32,14 @@ const examSchema = new mongoose.Schema({
         copyPasteDisabled: { type: Boolean, default: true },
         fullscreenRequired: { type: Boolean, default: true },
         internetRequired: { type: Boolean, default: true },
-        allowRunCode: { type: Boolean, default: true }
+        allowRunCode: { type: Boolean, default: true },
+        // Safe Exam Browser. The passwords and token are staff-only: never put them in a student payload.
+        sebRequired: { type: Boolean, default: false },
+        sebVerifyMode: { type: String, enum: ['basic', 'strict'], default: 'basic' },
+        sebEntryPassword: { type: String }, // checked by POST /exams/:id/start
+        sebExitPassword: { type: String }, // SEB quit password (hashed into the .seb file)
+        sebConfigToken: { type: String }, // authorises GET /exams/:id/seb-config/:token (no bearer auth)
+        sebConfigKeyOverride: { type: String, default: '' } // Config Key shown by SEB, if ours ever differs
     },
     scoring: {
         immediateScoreRelease: { type: Boolean, default: false },
@@ -49,14 +56,12 @@ const examSchema = new mongoose.Schema({
     status: { type: String, enum: ['draft', 'scheduled', 'active', 'completed', 'archived'], default: 'draft' },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
-}, {
-    indexes: [
-        { key: { classId: 1 } },
-        { key: { 'template.isTemplate': 1 } },
-        { key: { createdBy: 1 } },
-        { key: { status: 1 } }
-    ]
 });
+
+examSchema.index({ classId: 1, status: 1 });
+examSchema.index({ 'template.isTemplate': 1 });
+examSchema.index({ createdBy: 1 });
+examSchema.index({ 'questions.questionId': 1 });
 
 examSchema.pre('save', function (next) {
     this.updatedAt = Date.now();

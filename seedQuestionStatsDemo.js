@@ -8,6 +8,7 @@
  */
 require('dotenv').config();
 
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 const User = require('./models/User');
@@ -17,8 +18,36 @@ const Submission = require('./models/Submission');
 const Leaderboard = require('./models/Leaderboard');
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/education_platform';
-const PASSWORD = 'Password123!';
 const TITLE = 'Sum Two Numbers';
+
+function assertSafeSeedTarget(uri, label) {
+  if (process.argv.includes('--yes-i-know')) return;
+  let host = '';
+  try {
+    host = new URL(uri).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    host = '';
+  }
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(host);
+  if (process.env.NODE_ENV === 'production' || !isLocal) {
+    console.error(
+      `[${label}] Refusing to run: target host is "${host || 'unparseable'}" and NODE_ENV is "${process.env.NODE_ENV || 'development'}".\n` +
+        `[${label}] This script modifies data. Point MONGO_URI at localhost, or pass --yes-i-know to override.`,
+    );
+    process.exit(1);
+  }
+}
+
+function randomSeedPassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (let i = 0; i < 12; i += 1) out += alphabet[crypto.randomInt(alphabet.length)];
+  return `${out}!`;
+}
+
+/** Only accounts created by this run get this password; existing accounts keep theirs. */
+const PASSWORD = randomSeedPassword();
+let createdAccounts = 0;
 
 const CORRECT_PY = `a, b = map(int, input().split())
 print(a + b)
@@ -52,10 +81,14 @@ async function upsertUser({ name, email, role, canCreateQuestion }) {
     existing.name = name;
     existing.role = role;
     existing.canCreateQuestion = Boolean(canCreateQuestion);
-    if (!existing.password) existing.password = hashed;
+    if (!existing.password) {
+      existing.password = hashed;
+      createdAccounts += 1;
+    }
     await existing.save();
     return existing;
   }
+  createdAccounts += 1;
   return User.create({
     name,
     email,
@@ -68,6 +101,7 @@ async function upsertUser({ name, email, role, canCreateQuestion }) {
 }
 
 async function run() {
+  assertSafeSeedTarget(MONGO_URI, 'seed:stats');
   await mongoose.connect(MONGO_URI);
   console.log('[seed:stats] Connected:', mongoose.connection.name);
 
@@ -207,10 +241,7 @@ async function run() {
   await demoClass.save();
 
   await Submission.deleteMany({ questionId: question._id, classId: demoClass._id });
-  await Leaderboard.updateMany(
-    { classId: demoClass._id },
-    { $pull: { attempts: { questionId: question._id }, highestScores: { questionId: question._id } } }
-  );
+  await Leaderboard.removeQuestion({ classIds: [demoClass._id], questionId: question._id });
 
   const rows = [
     { student: students[0], language: 'python', code: WRONG_SUBTRACT, correct: false }, // demo
@@ -243,32 +274,29 @@ async function run() {
   const inserted = await Submission.insertMany(submissions);
   console.log(`[seed:stats] Inserted ${inserted.length} submissions`);
 
+  // One atomic leaderboard update per submission (the same path the API uses).
   for (const sub of inserted) {
-    const row = rows.find((r) => r.student._id.toString() === sub.studentId.toString());
-    let board = await Leaderboard.findOne({ classId: demoClass._id, studentId: sub.studentId });
-    if (!board) {
-      board = new Leaderboard({
-        classId: demoClass._id,
-        studentId: sub.studentId,
-        attempts: [],
-        highestScores: [],
-      });
-    }
-    board.attempts.push({
+    await Leaderboard.recordSubmit({
+      classId: demoClass._id,
+      studentId: sub.studentId,
       questionId: question._id,
       questionType: 'coding',
       submissionId: sub._id,
-      isCorrect: sub.isCorrect,
       score: sub.score,
-      output: sub.output,
+      isCorrect: sub.isCorrect,
       submittedAt: sub.submittedAt,
-      isRun: false,
+      passedTestCases: sub.passedTestCases,
+      totalTestCases: sub.totalTestCases,
     });
-    await board.save();
   }
 
   console.log('\n[seed:stats] Ready to check Question statistics\n');
-  console.log('  Teacher login: teacher1@example.com / Password123!');
+  console.log('  Teacher login: teacher1@example.com');
+  if (createdAccounts > 0) {
+    console.log(`  Password for the ${createdAccounts} account(s) created by this run (shown once): ${PASSWORD}`);
+  } else {
+    console.log('  All demo accounts already existed; their passwords were left unchanged.');
+  }
   console.log('  Take Class → Demo Class → Sum Two Numbers → ⋮ → Question statistics');
   console.log('  Open a Wrong student (Demo Student, Student 1–3, 6) in the editor');
   console.log('  Fix print(a - b) to print(a + b), then Run corrected code\n');

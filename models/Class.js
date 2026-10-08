@@ -17,11 +17,12 @@ const classSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now },
     totalRuns: { type: Number, default: 0 }, // Total runs across all vhbhbhbstudents
     totalSubmits: { type: Number, default: 0 } // Total submits across all students
-}, {
-    indexes: [
-        { key: { questions: 1 } },
-        { key: { 'assignments.questionId': 1 } } // Index for assignment lookups
-    ]
 });
+
+classSchema.index({ students: 1 });
+classSchema.index({ teachers: 1 });
+classSchema.index({ createdBy: 1 });
+classSchema.index({ questions: 1 });
+classSchema.index({ 'assignments.questionId': 1 });
 
 module.exports = mongoose.model('Class', classSchema);

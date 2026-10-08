@@ -1,7 +1,9 @@
 /**
- * Prints stable test account and demo data IDs (matches seed.js credentials).
+ * Prints stable test account and demo data IDs (matches seed.js accounts).
  * Usage: node getTestIds.js
- * Uses MONGO_URI from .env when present.
+ * Uses MONGO_URI from .env when present. Passwords are never stored or printed; seed.js prints the
+ * generated password once when it runs.
+ * Refuses to run against a non-local database or with NODE_ENV=production unless --yes-i-know is passed.
  */
 require('dotenv').config();
 
@@ -11,6 +13,24 @@ const Class = require('./models/Class');
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/education_platform';
 
+function assertSafeSeedTarget(uri, label) {
+  if (process.argv.includes('--yes-i-know')) return;
+  let host = '';
+  try {
+    host = new URL(uri).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    host = '';
+  }
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(host);
+  if (process.env.NODE_ENV === 'production' || !isLocal) {
+    console.error(
+      `[${label}] Refusing to run: target host is "${host || 'unparseable'}" and NODE_ENV is "${process.env.NODE_ENV || 'development'}".\n` +
+        `[${label}] This is a dev-only helper. Point MONGO_URI at localhost, or pass --yes-i-know to override.`,
+    );
+    process.exit(1);
+  }
+}
+
 function oidToString(value) {
   if (value == null) return null;
   if (typeof value === 'string') return value;
@@ -19,6 +39,7 @@ function oidToString(value) {
 }
 
 async function getTestIds() {
+  assertSafeSeedTarget(MONGO_URI, 'getTestIds');
   try {
     await mongoose.connect(MONGO_URI);
     const userCount = await User.countDocuments();
@@ -50,22 +71,18 @@ async function getTestIds() {
       users: {
         admin: {
           email: 'admin1@example.com',
-          password: 'Password123!',
           id: oidToString(admin?._id),
         },
         teacher: {
           email: 'teacher1@example.com',
-          password: 'Password123!',
           id: oidToString(teacher?._id),
         },
         demoStudent: {
           email: 'demo@example.com',
-          password: 'Password123!',
           id: oidToString(demoStudent?._id),
         },
         student1: {
           email: 'student1@example.com',
-          password: 'Password123!',
           id: oidToString(student1?._id),
         },
       },
@@ -93,7 +110,6 @@ async function getTestIds() {
     for (const [label, u] of rows) {
       console.log(`${label}:`);
       console.log(`  Email: ${u.email}`);
-      console.log(`  Password: ${u.password}`);
       console.log(`  ID: ${u.id ?? '(not found — run seed or check DB)'}\n`);
     }
 

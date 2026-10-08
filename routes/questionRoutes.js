@@ -117,8 +117,9 @@ router.post('/:questionId/submit',
   questionController.submitAnswer
 );
 
-router.post('/:questionId/run', 
+router.post('/:questionId/run',
   authMiddleware,
+  requireRole('student'),
   questionController.runQuestion
 );
 

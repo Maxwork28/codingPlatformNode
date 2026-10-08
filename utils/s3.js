@@ -65,7 +65,26 @@ async function uploadQuestionImageToS3({ buffer, contentType, originalName, user
   return { key, url: publicUrlForKey(key) };
 }
 
+/** Generic image upload: `ext` must come from a sniffed/validated mimetype, never the client name. */
+async function uploadImageToS3({ buffer, contentType, ext, keyPrefix, userId }) {
+  const safeExt = ALLOWED_EXTS.includes(String(ext || '').toLowerCase()) ? String(ext).toLowerCase() : '.png';
+  const prefix = String(keyPrefix || 'images').replace(/^\/+|\/+$/g, '');
+  const key = `${prefix}/${userId || 'anon'}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${safeExt}`;
+  const input = {
+    Bucket: bucketName(),
+    Key: key,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream',
+    CacheControl: 'public, max-age=31536000, immutable',
+  };
+  const acl = env('AWS_S3_OBJECT_ACL');
+  if (acl) input.ACL = acl;
+  await getS3Client().send(new PutObjectCommand(input));
+  return { key, url: publicUrlForKey(key) };
+}
+
 module.exports = {
   isS3Enabled,
   uploadQuestionImageToS3,
+  uploadImageToS3,
 };

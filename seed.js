@@ -1,9 +1,40 @@
 require('dotenv').config();
 
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const { faker } = require('@faker-js/faker');
 const bcrypt = require('bcrypt');
 const { applyDefaultSolutions } = require('./utils/buildDefaultSolutions');
+
+/**
+ * This script WIPES the database. Refuse unless the target is a local MongoDB and NODE_ENV is not
+ * production, or the operator passes --yes-i-know.
+ */
+function assertSafeSeedTarget(uri, label) {
+  if (process.argv.includes('--yes-i-know')) return;
+  let host = '';
+  try {
+    host = new URL(uri).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    host = '';
+  }
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(host);
+  if (process.env.NODE_ENV === 'production' || !isLocal) {
+    console.error(
+      `[${label}] Refusing to run: target host is "${host || 'unparseable'}" and NODE_ENV is "${process.env.NODE_ENV || 'development'}".\n` +
+        `[${label}] This script modifies/destroys data. Point MONGO_URI at localhost, or pass --yes-i-know to override.`,
+    );
+    process.exit(1);
+  }
+}
+
+/** Random 12-char password for seeded accounts; printed once at the end of the run. */
+function randomSeedPassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (let i = 0; i < 12; i += 1) out += alphabet[crypto.randomInt(alphabet.length)];
+  return `${out}!`;
+}
 
 // Define Models
 const userSchema = new mongoose.Schema({
@@ -1019,6 +1050,8 @@ function buildLiveAttempts(exam, studentIds, questionsById) {
 }
 
 async function seedDatabase() {
+  assertSafeSeedTarget(MONGO_URI, 'Seed');
+  const SEED_PASSWORD = randomSeedPassword();
   try {
     console.log('[Seed] Connecting to MongoDB...');
     await mongoose.connect(MONGO_URI);
@@ -1038,7 +1071,7 @@ async function seedDatabase() {
 
     // ---------------------------------------------------------------- users
     console.log('[Seed] Generating users...');
-    const hashedPassword = await bcrypt.hash('Password123!', SALT_ROUNDS);
+    const hashedPassword = await bcrypt.hash(SEED_PASSWORD, SALT_ROUNDS);
     const baseUser = { password: hashedPassword, isBlocked: {} };
     const users = [
       { ...baseUser, name: 'Admin One', email: 'admin1@example.com', number: '1000000000', role: 'admin', canCreateQuestion: true },
@@ -1438,7 +1471,8 @@ async function seedDatabase() {
     };
     console.log('[Seed] Totals:', counts);
 
-    console.log('\n[Seed] ===== ACCOUNTS (password for all: Password123!) =====');
+    console.log('\n[Seed] ===== ACCOUNTS =====');
+    console.log(`[Seed] Password for every seeded account (shown once, not stored anywhere else): ${SEED_PASSWORD}`);
     console.log('[Seed] Admins:   admin1@example.com, admin2@example.com');
     console.log('[Seed] Teachers: teacher1@example.com (can create questions), teacher2@example.com (cannot), teacher3@example.com');
     console.log(`[Seed] Students: demo@example.com, student1..student${STUDENT_COUNT - 1}@example.com`);

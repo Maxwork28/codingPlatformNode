@@ -13,6 +13,24 @@ const { applyDefaultSolutions, CODING_TYPES } = require('./utils/buildDefaultSol
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/education_platform';
 
+function assertSafeSeedTarget(uri, label) {
+  if (process.argv.includes('--yes-i-know')) return;
+  let host = '';
+  try {
+    host = new URL(uri).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    host = '';
+  }
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(host);
+  if (process.env.NODE_ENV === 'production' || !isLocal) {
+    console.error(
+      `[${label}] Refusing to run: target host is "${host || 'unparseable'}" and NODE_ENV is "${process.env.NODE_ENV || 'development'}".\n` +
+        `[${label}] This script modifies data. Point MONGO_URI at localhost, or pass --yes-i-know to override.`,
+    );
+    process.exit(1);
+  }
+}
+
 function usableCount(question) {
   return (question.solutionCodes || []).filter((row) => String(row.code || '').trim()).length;
 }
@@ -53,6 +71,7 @@ async function assignOrphansToDemoClass() {
 }
 
 async function backfillSolutions() {
+  assertSafeSeedTarget(MONGO_URI, 'seed:solutions');
   try {
     console.log('[seed:solutions] Connecting...');
     await mongoose.connect(MONGO_URI);

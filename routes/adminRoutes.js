@@ -4,15 +4,28 @@ const router = express.Router();
 const adminController = require('../controllers/adminController');
 const { authMiddleware, requireRole } = require('../middleware/auth');
 
+const os = require('os');
 const path = require('path');
 
 const SPREADSHEET_EXTENSIONS = ['.xlsx', '.xls', '.csv'];
+// Browsers are inconsistent about spreadsheet MIME types, so accept the common ones plus octet-stream,
+// and always require a matching extension. The controller re-validates by actually parsing the file.
+const SPREADSHEET_MIMETYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+  'application/vnd.ms-excel', // .xls (and .csv on some Windows browsers)
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'application/octet-stream',
+]);
 const upload = multer({
-  dest: 'uploads/',
+  // OS temp dir: outside the project tree, never served, cleaned up by the controller in `finally`.
+  dest: os.tmpdir(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname || '').toLowerCase();
-    if (SPREADSHEET_EXTENSIONS.includes(ext)) return cb(null, true);
+    const mimetype = String(file.mimetype || '').toLowerCase();
+    if (SPREADSHEET_EXTENSIONS.includes(ext) && SPREADSHEET_MIMETYPES.has(mimetype)) return cb(null, true);
     cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'file'));
   },
 });
@@ -41,6 +54,7 @@ router.post(
 router.post(
   '/class',
   authMiddleware,
+  requireRole('admin', 'teacher'),
   spreadsheet,
   adminController.createClass
 );

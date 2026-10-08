@@ -1,10 +1,7 @@
-FROM node:18-slim
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends time && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN apt-get update && apt-get install -y \
-    g++ \
-    make \
-    python3 \
-    && rm -rf /var/lib/apt/lists/*
-RUN useradd -m appuser && chown -R appuser:appuser /app
+RUN useradd -m -u 1001 appuser && chown -R appuser:appuser /app
 USER appuser
-CMD ["node"]
+ENV HOME=/tmp
+CMD ["node", "--version"]

@@ -1,5 +1,7 @@
 const fs = require('fs').promises;
-const xlsx = require('xlsx');
+const path = require('path');
+const crypto = require('crypto');
+const ExcelJS = require('exceljs');
 const bcrypt = require('bcrypt');
 const User = require('../models/User');
 const Class = require('../models/Class');
@@ -8,52 +10,144 @@ const Submission = require('../models/Submission');
 const Leaderboard = require('../models/Leaderboard');
 const Exam = require('../models/Exam');
 const ExamAttempt = require('../models/ExamAttempt');
-const generatePassword = require('../utils/generatePassword');
 const sendEmail = require('../utils/sendEmail');
 const { normalizeQuestionRichTextFields } = require('../utils/normalizeRichTextField');
 const { parseOptionalPoints } = require('../utils/optionalPoints');
 const { applyDefaultSolutions } = require('../utils/buildDefaultSolutions');
 const { examPhase } = require('../utils/examPhase');
+const { sanitizeQuestionForStudent } = require('../utils/questionProjection');
+const {
+    isAdmin,
+    isTeacher,
+    isStudent,
+    classManagedBy,
+    assertClassManager,
+    assertClassMember,
+    managedClassIds,
+    canManageQuestion,
+    assertQuestionManager,
+    httpError,
+    sendError,
+} = require('../utils/access');
+const { htmlToPlainText } = require('../utils/answerText');
 const mongoose = require('mongoose');
 const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'];
 
 // Helper function to validate ObjectId
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 
-const DEFAULT_USER_PASSWORD = process.env.DEFAULT_USER_PASSWORD || 'Password123!';
-
 function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-const teacherClassIds = async (user) =>
-    (await Class.find({ $or: [{ teachers: user._id }, { createdBy: user._id }] }).select('_id').lean()).map((c) => c._id);
+/** Cryptographically random 12-char password with letters, digits and a symbol (one per account). */
+const PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+const PASSWORD_SYMBOLS = '!@#$%&*?';
+function generateStrongPassword(length = 12) {
+    const pick = (alphabet) => alphabet[crypto.randomInt(alphabet.length)];
+    const chars = [
+        pick('ABCDEFGHJKLMNPQRSTUVWXYZ'),
+        pick('abcdefghjkmnpqrstuvwxyz'),
+        pick('23456789'),
+        pick(PASSWORD_SYMBOLS),
+    ];
+    while (chars.length < length) chars.push(pick(PASSWORD_ALPHABET + PASSWORD_SYMBOLS));
+    // Fisher-Yates with crypto randomness so the required character classes are not positional.
+    for (let i = chars.length - 1; i > 0; i -= 1) {
+        const j = crypto.randomInt(i + 1);
+        [chars[i], chars[j]] = [chars[j], chars[i]];
+    }
+    return chars.join('');
+}
 
-const canAccessClass = async (user, classIdOrDoc) => {
-    if (!user) return false;
-    if (user.role === 'admin') return true;
-    if (user.role !== 'teacher') return false;
-    const cls =
-        classIdOrDoc && typeof classIdOrDoc === 'object' && (classIdOrDoc.teachers || classIdOrDoc.createdBy)
-            ? classIdOrDoc
-            : await Class.findById(classIdOrDoc).select('teachers createdBy').lean();
-    if (!cls) return false;
-    const uid = String(user._id);
-    return (
-        (cls.teachers || []).some((t) => String(t._id || t) === uid) ||
-        String(cls.createdBy?._id || cls.createdBy) === uid
-    );
-};
+/** Normalise an exceljs cell value to a plain string (hyperlinks, rich text, formulas, dates). */
+function cellToString(value) {
+    if (value === null || value === undefined) return '';
+    if (value instanceof Date) return value.toISOString();
+    if (typeof value === 'object') {
+        if (Array.isArray(value.richText)) return value.richText.map((part) => part.text || '').join('');
+        if (value.text !== undefined) return cellToString(value.text);
+        if (value.result !== undefined) return cellToString(value.result);
+        if (value.hyperlink) return String(value.hyperlink).replace(/^mailto:/i, '');
+        return '';
+    }
+    return String(value);
+}
 
-const canAccessQuestion = async (user, question) => {
-    if (user.role === 'admin') return true;
-    if (user.role !== 'teacher' || !question) return false;
-    if (String(question.createdBy?._id || question.createdBy) === String(user._id)) return true;
-    const classIds = await teacherClassIds(user);
-    const owned = new Set(classIds.map(String));
-    if ((question.classes || []).some((c) => owned.has(String(c.classId?._id || c.classId)))) return true;
-    return Boolean(await Class.exists({ _id: { $in: classIds }, questions: question._id }));
-};
+/**
+ * Read the first worksheet of an uploaded .xlsx/.csv into `[{ header: value }]` rows using the
+ * first row as headers (trimmed). Throws an Error with status 400 when the file cannot be parsed.
+ */
+async function readSpreadsheetRows(filePath, originalName) {
+    const workbook = new ExcelJS.Workbook();
+    const ext = path.extname(originalName || filePath || '').toLowerCase();
+    try {
+        if (ext === '.csv') await workbook.csv.readFile(filePath);
+        else await workbook.xlsx.readFile(filePath);
+    } catch {
+        throw httpError(400, 'Could not read the file. Save it as .xlsx or .csv and try again.');
+    }
+    const sheet = workbook.worksheets[0];
+    if (!sheet) return [];
+
+    const headers = [];
+    const headerRow = sheet.getRow(1);
+    headerRow.eachCell({ includeEmpty: false }, (cell, col) => {
+        const header = cellToString(cell.value).trim();
+        if (header) headers[col] = header;
+    });
+    if (!headers.some(Boolean)) return [];
+
+    const rows = [];
+    sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+        if (rowNumber === 1) return;
+        const entry = {};
+        let hasValue = false;
+        headers.forEach((header, col) => {
+            if (!header) return;
+            const text = cellToString(row.getCell(col).value).trim();
+            if (text === '') return;
+            entry[header] = text;
+            hasValue = true;
+        });
+        if (hasValue) rows.push(entry);
+    });
+    return rows;
+}
+
+async function removeUploadedFile(req, tag) {
+    if (!req.file?.path) return;
+    try {
+        await fs.unlink(req.file.path);
+    } catch (unlinkErr) {
+        if (unlinkErr.code !== 'ENOENT') console.warn(`${tag}: Could not delete temp file:`, unlinkErr.message);
+    }
+}
+
+/** Only these question fields may be set from a request body; ownership/publish/class links have their own flows. */
+const ALLOWED_QUESTION_FIELDS = [
+    'title', 'description', 'difficulty', 'tags', 'points', 'hints', 'solution', 'solutionCode', 'solutionLanguage',
+    'solutionCodes', 'level', 'type', 'options', 'correctOption', 'correctOptions', 'correctAnswer', 'codeSnippet',
+    'starterCode', 'testCases', 'inputFormat', 'outputFormat', 'sampleIo', 'constraints', 'examples',
+    'functionSignature', 'templateCode', 'driverCode', 'languages', 'timeLimit', 'memoryLimit', 'maxAttempts',
+    'explanation',
+];
+const ALLOWED_QUESTION_FIELD_SET = new Set(ALLOWED_QUESTION_FIELDS);
+
+function pickQuestionFields(body) {
+    const out = {};
+    if (!body || typeof body !== 'object') return out;
+    for (const key of ALLOWED_QUESTION_FIELDS) {
+        if (body[key] !== undefined) out[key] = body[key];
+    }
+    // Typed answers and fill-the-code templates are compared / executed as plain text, never HTML.
+    if (typeof out.correctAnswer === 'string') out.correctAnswer = htmlToPlainText(out.correctAnswer).trim();
+    if (typeof out.codeSnippet === 'string') out.codeSnippet = htmlToPlainText(out.codeSnippet);
+    return out;
+}
+
+/** Teachers need the canCreateQuestion flag to author or publish questions; admins always may. */
+const canAuthorQuestions = (user) => isAdmin(user) || (isTeacher(user) && Boolean(user.canCreateQuestion));
 
 function getRowField(entry, aliases) {
     if (!entry) return undefined;
@@ -183,7 +277,9 @@ async function findUsersByEmailsInsensitive(emails) {
 
 /**
  * Enroll/create users from Excel rows. Email is required; name and number are optional.
- * Missing accounts are created as `role` with DEFAULT_USER_PASSWORD when SMTP is unset.
+ * Every new account gets its own random password and must change it on first login. When SMTP is
+ * configured the password is emailed; otherwise it is returned in `credentials` so the caller can
+ * hand it to an admin exactly once (never logged, never shown to teachers).
  */
 async function ensureUsersFromExcelRows(data, role) {
     const parsed = [];
@@ -216,14 +312,12 @@ async function ensureUsersFromExcelRows(data, role) {
     const existingByEmail = new Map(existingUsers.map((user) => [String(user.email).toLowerCase(), user]));
 
     const smtpReady = sendEmail.isSmtpConfigured();
-    const hashedDefault = await bcrypt.hash(DEFAULT_USER_PASSWORD, 10);
     const userIds = [];
     const created = [];
     const toInsert = [];
-    const generatedPasswords = [];
+    const credentials = [];
 
-    for (let i = 0; i < parsed.length; i++) {
-        const row = parsed[i];
+    for (const row of parsed) {
         const existingUser = existingByEmail.get(row.email);
         if (existingUser) {
             if (existingUser.role === role) {
@@ -235,18 +329,19 @@ async function ensureUsersFromExcelRows(data, role) {
             continue;
         }
 
-        const password = smtpReady ? generatePassword() : DEFAULT_USER_PASSWORD;
-        const hashedPassword = smtpReady ? await bcrypt.hash(password, 10) : hashedDefault;
-        toInsert.push({
+        const password = generateStrongPassword();
+        const account = {
             name: row.name,
             email: row.email,
-            number: row.number || String(9000000000 + i),
             role,
-            password: hashedPassword,
-            canCreateQuestion: role === 'teacher',
+            password: await bcrypt.hash(password, 10),
+            canCreateQuestion: false,
+            mustChangePassword: true,
             isBlocked: {},
-        });
-        generatedPasswords.push({ email: row.email, password });
+        };
+        if (row.number) account.number = row.number;
+        toInsert.push(account);
+        credentials.push({ name: row.name, email: row.email, password });
     }
 
     if (toInsert.length) {
@@ -258,29 +353,39 @@ async function ensureUsersFromExcelRows(data, role) {
         }
     }
 
+    let emailed = 0;
     if (smtpReady) {
-        for (const cred of generatedPasswords) {
+        for (const cred of credentials) {
             try {
                 await sendEmail(
                     cred.email,
                     'Your Login Credentials',
-                    `Email: ${cred.email}\nPassword: ${cred.password}\nRole: ${role}`
+                    `Email: ${cred.email}\nTemporary password: ${cred.password}\nRole: ${role}\n\nYou will be asked to choose a new password when you first sign in.`
                 );
+                emailed += 1;
             } catch (emailError) {
-                console.error('Failed to send email to:', cred.email, emailError.message || emailError);
+                console.error('Failed to send credentials email to:', cred.email, emailError.message || emailError);
             }
         }
-    } else if (created.length) {
-        console.log(`${role} accounts created without SMTP; default password used for ${created.length} new user(s)`);
+    }
+    if (created.length) {
+        console.log(`${role} accounts created: ${created.length} (credentials emailed: ${emailed})`);
     }
 
-    return { userIds, created, existing, skipped, invalid, usedDefaultPassword: !smtpReady && created.length > 0 };
+    return {
+        userIds,
+        created,
+        existing,
+        skipped,
+        invalid,
+        credentialsEmailed: smtpReady && created.length > 0,
+        // Plaintext passwords exist only here; callers decide whether the requester may see them.
+        credentials: smtpReady ? [] : credentials,
+    };
 }
 
-/** Fields a publish request may never overwrite on a draft. */
-const DRAFT_PROTECTED_FIELDS = new Set([
-    '_id', 'createdBy', 'createdAt', 'status', 'isDraft', 'publishedAt', 'publishedBy', 'classes', 'examId', 'isExamOnly',
-]);
+/** Credentials go back only to admins, only when they could not be emailed. */
+const credentialsForRequester = (user, result) => (isAdmin(user) && !result.credentialsEmailed ? result.credentials : undefined);
 
 const hasText = (value) => typeof value === 'string' && value.replace(/<[^>]*>/g, '').trim() !== '';
 
@@ -314,10 +419,10 @@ function getDraftIssues(question) {
     return issues;
 }
 
-// Helper function to validate question data
+/** Load a question for linking to a class; throws 400 when it does not exist. */
 const validateQuestion = async (questionId) => {
     const question = await Question.findById(questionId);
-   
+    if (!question) throw httpError(400, `Question ${questionId} not found`);
     return question;
 };
 
@@ -333,14 +438,7 @@ const validateQuestion = async (questionId) => {
             return res.status(400).json({ error: 'Role must be student or teacher' });
         }
 
-        let data;
-        try {
-            const workbook = xlsx.readFile(req.file.path);
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            data = sheet ? xlsx.utils.sheet_to_json(sheet) : [];
-        } catch {
-            return res.status(400).json({ error: 'Could not read the file. Save it as .xlsx or .csv and try again.' });
-        }
+        const data = await readSpreadsheetRows(req.file.path, req.file.originalname);
 
         if (data.length === 0) {
             return res.status(400).json({ error: 'The first sheet has no data rows' });
@@ -350,7 +448,8 @@ const validateQuestion = async (questionId) => {
             return res.status(400).json({ error: 'No "email" column found. Add a header row with an email column.' });
         }
 
-        const { created, existing, skipped, invalid, usedDefaultPassword } = await ensureUsersFromExcelRows(data, role);
+        const result = await ensureUsersFromExcelRows(data, role);
+        const { created, existing, skipped, invalid } = result;
 
         const label = role === 'teacher' ? 'teacher' : 'student';
         const plural = (n) => `${n} ${label}${n === 1 ? '' : 's'}`;
@@ -368,20 +467,14 @@ const validateQuestion = async (questionId) => {
             existing,
             skipped,
             invalid,
-            defaultPassword: usedDefaultPassword ? DEFAULT_USER_PASSWORD : null,
-            credentialsEmailed: created.length > 0 && !usedDefaultPassword,
+            credentialsEmailed: result.credentialsEmailed,
+            // One-time plaintext credentials for the admin to distribute when email is not configured.
+            credentials: credentialsForRequester(req.user, result),
         });
     } catch (err) {
-        console.error('uploadExcel: Error:', err);
-        res.status(500).json({ error: 'Something went wrong while importing the file' });
+        sendError(res, err, 'Something went wrong while importing the file', 'uploadExcel');
     } finally {
-        if (req.file?.path) {
-            try {
-                await fs.unlink(req.file.path);
-            } catch (unlinkErr) {
-                console.warn('uploadExcel: Could not delete temp file:', unlinkErr.message);
-            }
-        }
+        await removeUploadedFile(req, 'uploadExcel');
     }
 };
 
@@ -390,100 +483,76 @@ exports.createClass = async (req, res) => {
         const { name, description } = req.body;
         const user = req.user;
 
-        console.log('createClass: Request received:', { name, description, file: req.file?.path });
-        console.log('createClass: User:', { id: user._id, role: user.role, canCreateQuestion: user.canCreateQuestion });
-
-        if (!name) {
-            console.log('createClass: Validation failed: Class name is missing');
+        if (!name || !String(name).trim()) {
             return res.status(400).json({ error: 'Class name is required' });
         }
 
-        if (user.role !== 'admin' && !(user.role === 'teacher' && user.canCreateQuestion)) {
-            console.log('createClass: Authorization failed: User not allowed to create class');
+        if (!isAdmin(user) && !(isTeacher(user) && user.canCreateQuestion)) {
             return res.status(403).json({ error: 'Unauthorized to create class' });
         }
 
         const newClass = new Class({
-            name,
-            description,
+            name: String(name).trim(),
+            description: typeof description === 'string' ? description.trim() : description,
             createdBy: user._id,
             students: [],
             teachers: [],
             questions: []
         });
-        console.log('createClass: New class object created:', newClass);
 
         if (req.file) {
-            console.log('createClass: Processing Excel file:', req.file.path);
-            const workbook = xlsx.readFile(req.file.path);
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const data = xlsx.utils.sheet_to_json(sheet);
-            console.log('createClass: Excel rows parsed:', data.length);
-
-            const { userIds, created, skipped, invalid, usedDefaultPassword } = await ensureUsersFromExcelRows(
-                data,
-                'student'
-            );
-            console.log('createClass: Excel students resolved:', {
-                enrolled: userIds.length,
-                created: created.length,
-                skipped: skipped.length,
-                invalid: invalid.length,
-            });
+            const data = await readSpreadsheetRows(req.file.path, req.file.originalname);
+            const result = await ensureUsersFromExcelRows(data, 'student');
+            const { userIds, created, skipped, invalid } = result;
 
             if (userIds.length === 0) {
-                console.log('createClass: Validation failed: No valid student emails in Excel');
                 return res.status(400).json({ error: 'No valid student emails found in Excel' });
             }
 
             newClass.students = userIds;
-            console.log('createClass: Students assigned to class:', newClass.students);
-
             await newClass.save();
-            console.log('createClass: Class saved successfully:', newClass._id);
+            console.log('createClass: saved', { classId: String(newClass._id), enrolled: userIds.length, created: created.length });
 
             const parts = [`Class created successfully`, `enrolled ${userIds.length} student(s)`];
             if (created.length) parts.push(`${created.length} newly created`);
-            if (usedDefaultPassword) parts.push(`new students can log in with password ${DEFAULT_USER_PASSWORD}`);
+            if (created.length && !result.credentialsEmailed) {
+                parts.push(
+                    isAdmin(user)
+                        ? 'temporary passwords are included in this response; share them securely'
+                        : 'email is not configured, so an admin must share the new students\' temporary passwords',
+                );
+            }
             return res.status(201).json({
                 message: parts.join('. ') + '.',
                 class: newClass,
                 created: created.length,
                 skipped,
                 invalid,
+                credentialsEmailed: result.credentialsEmailed,
+                credentials: credentialsForRequester(user, result),
             });
         }
 
         await newClass.save();
-        console.log('createClass: Class saved successfully:', newClass);
+        console.log('createClass: saved', { classId: String(newClass._id) });
 
         res.status(201).json({ message: 'Class created successfully', class: newClass });
     } catch (err) {
-        console.error('createClass: Error:', err);
-        res.status(500).json({ error: 'Error creating class' });
+        sendError(res, err, 'Error creating class', 'createClass');
     } finally {
-        if (req.file?.path) {
-            try {
-                await fs.unlink(req.file.path);
-            } catch (unlinkErr) {
-                console.warn('createClass: Could not delete temp file:', unlinkErr.message);
-            }
-        }
+        await removeUploadedFile(req, 'createClass');
     }
 };
 
 exports.manageTeacherPermission = async (req, res) => {
     try {
         const { teacherId, canCreateQuestion } = req.body;
-        console.log('manageTeacherPermission: Request received:', { teacherId, canCreateQuestion, userRole: req.user.role });
 
-        if (req.user.role !== 'admin') {
-            console.log('manageTeacherPermission: Authorization failed: User is not admin');
+        if (!isAdmin(req.user)) {
             return res.status(403).json({ error: 'Only admins can manage teacher permissions' });
         }
 
         if (!teacherId || typeof canCreateQuestion !== 'boolean') {
-            console.log('manageTeacherPermission: Validation failed: Invalid teacherId or canCreateQuestion');
             return res.status(400).json({ error: 'Teacher ID and canCreateQuestion (boolean) are required' });
         }
 
@@ -494,20 +563,17 @@ exports.manageTeacherPermission = async (req, res) => {
         const teacher = await User.findById(teacherId);
 
         if (!teacher || teacher.role !== 'teacher') {
-            console.log('manageTeacherPermission: Validation failed: Teacher not found or invalid role');
             return res.status(404).json({ error: 'Teacher not found' });
         }
 
         teacher.canCreateQuestion = canCreateQuestion;
         await teacher.save();
-        console.log('manageTeacherPermission: Teacher updated:', { id: teacher._id, canCreateQuestion });
 
         const action = canCreateQuestion ? 'granted' : 'revoked';
-        console.log(`manageTeacherPermission: Permission ${action} for teacher`);
+        console.log(`manageTeacherPermission: ${action}`, { teacherId: String(teacher._id) });
         res.status(200).json({ message: `Question creation permission ${action} for teacher` });
     } catch (err) {
-        console.error('manageTeacherPermission: Error:', err);
-        res.status(500).json({ error: 'Error managing teacher permission' });
+        sendError(res, err, 'Error managing teacher permission', 'manageTeacherPermission');
     }
 };
 
@@ -566,6 +632,41 @@ exports.getAllClasses = async (req, res) => {
             }
         }
         
+        // Students get a summary only: no classmates' identities, no question bodies.
+        if (userRole === 'student') {
+            const studentDocs = await Class.find(query)
+                .sort({ createdAt: -1 })
+                .select('name description status createdAt students teachers questions')
+                .populate('teachers', 'name')
+                .lean();
+            const examCounts = studentDocs.length
+                ? await Exam.aggregate([
+                      {
+                          $match: {
+                              classId: { $in: studentDocs.map((c) => c._id) },
+                              'template.isTemplate': { $ne: true },
+                              status: { $nin: ['draft', 'archived'] },
+                          },
+                      },
+                      { $group: { _id: '$classId', count: { $sum: 1 } } },
+                  ])
+                : [];
+            const examCountByClass = new Map(examCounts.map((e) => [e._id.toString(), e.count]));
+            const classes = studentDocs.map((c) => ({
+                _id: c._id,
+                name: c.name,
+                description: c.description,
+                status: c.status,
+                createdAt: c.createdAt,
+                studentCount: c.students?.length || 0,
+                teacherCount: c.teachers?.length || 0,
+                questionCount: c.questions?.length || 0,
+                teachers: (c.teachers || []).map((t) => ({ _id: t._id, name: t.name })),
+                examCount: examCountByClass.get(c._id.toString()) || 0,
+            }));
+            return res.status(200).json({ classes });
+        }
+
         const classDocs = await Class.find(query)
             .sort({ createdAt: -1 })
             .populate('createdBy', 'name email')
@@ -573,10 +674,12 @@ exports.getAllClasses = async (req, res) => {
             .populate('teachers', 'name email')
             .populate('questions', 'title type description points classes');
 
-        const examCounts = await Exam.aggregate([
-            { $match: { classId: { $in: classDocs.map((c) => c._id) }, 'template.isTemplate': { $ne: true } } },
-            { $group: { _id: '$classId', count: { $sum: 1 } } },
-        ]);
+        const examCounts = classDocs.length
+            ? await Exam.aggregate([
+                  { $match: { classId: { $in: classDocs.map((c) => c._id) }, 'template.isTemplate': { $ne: true } } },
+                  { $group: { _id: '$classId', count: { $sum: 1 } } },
+              ])
+            : [];
         const examCountByClass = new Map(examCounts.map((e) => [e._id.toString(), e.count]));
 
         const classes = classDocs.map((c) => ({
@@ -585,8 +688,7 @@ exports.getAllClasses = async (req, res) => {
         }));
         res.status(200).json({ classes });
     } catch (err) {
-        console.error('getAllClasses: Error:', err);
-        res.status(500).json({ error: 'Error fetching classes' });
+        sendError(res, err, 'Error fetching classes', 'getAllClasses');
     }
 };
 
@@ -606,8 +708,15 @@ exports.getAllTeachers = async (req, res) => {
             };
         }
 
+        // Students may only match on name and only ever see teacher names.
+        if (isStudent(req.user)) {
+            if (query.$or) query = { role: 'teacher', name: query.$or[0].name };
+            const names = await User.find(query).select('name').sort({ name: 1 }).lean();
+            return res.status(200).json({ teachers: names.map((t) => ({ _id: t._id, name: t.name })) });
+        }
+
         const teacherDocs = await User.find(query).select('name email canCreateQuestion').sort({ name: 1 }).lean();
-        if (req.user.role !== 'admin' || teacherDocs.length === 0) {
+        if (!isAdmin(req.user) || teacherDocs.length === 0) {
             return res.status(200).json({ teachers: teacherDocs });
         }
 
@@ -633,8 +742,7 @@ exports.getAllTeachers = async (req, res) => {
         });
         res.status(200).json({ teachers });
     } catch (err) {
-        console.error('getAllTeachers: Error:', err);
-        res.status(500).json({ error: 'Error fetching teachers' });
+        sendError(res, err, 'Error fetching teachers', 'getAllTeachers');
     }
 };
 
@@ -643,29 +751,24 @@ exports.getAllTeachers = async (req, res) => {
  * Does not delete classes, questions, exams, submissions, or other related records.
  */
 exports.deleteTeacher = async (req, res) => {
-    console.log('[Delete Teacher] Deleting teacher:', req.params.teacherId);
     try {
         const { teacherId } = req.params;
         const user = req.user;
 
-        if (!['admin'].includes(user.role)) {
-            console.warn('[Delete Teacher] Error: Not authorized');
+        if (!isAdmin(user)) {
             return res.status(403).json({ error: 'Only admin can delete teachers' });
         }
 
         if (!isValidObjectId(teacherId)) {
-            console.error('[Delete Teacher] Error: Invalid teacherId');
             return res.status(400).json({ error: 'Valid teacherId is required' });
         }
 
         const teacher = await User.findById(teacherId);
         if (!teacher) {
-            console.error('[Delete Teacher] Error: Teacher not found');
             return res.status(404).json({ error: 'Teacher not found' });
         }
 
         if (teacher.role !== 'teacher') {
-            console.error('[Delete Teacher] Error: User is not a teacher');
             return res.status(400).json({ error: 'User is not a teacher' });
         }
 
@@ -677,11 +780,10 @@ exports.deleteTeacher = async (req, res) => {
 
         await teacher.deleteOne();
 
-        console.log('[Delete Teacher] Teacher removed from list:', teacherId);
+        console.log('[Delete Teacher] removed', { teacherId });
         res.status(200).json({ message: 'Teacher deleted successfully' });
     } catch (err) {
-        console.error('[Delete Teacher] Error:', err.message);
-        res.status(500).json({ error: 'Error deleting teacher' });
+        sendError(res, err, 'Error deleting teacher', 'deleteTeacher');
     }
 };
 
@@ -708,8 +810,9 @@ exports.getAllStudents = async (req, res) => {
         const studentIds = studentDocs.map((s) => s._id);
         const [classDocs, activity] = await Promise.all([
             Class.find({ students: { $in: studentIds } }).select('name status students').lean(),
+            // Practice activity only: exam submissions would inflate the counts.
             Submission.aggregate([
-                { $match: { studentId: { $in: studentIds } } },
+                { $match: { studentId: { $in: studentIds }, examAttemptId: null } },
                 {
                     $group: {
                         _id: '$studentId',
@@ -737,184 +840,129 @@ exports.getAllStudents = async (req, res) => {
         });
         res.status(200).json({ students });
     } catch (err) {
-        console.error('getAllStudents: Error:', err);
-        res.status(500).json({ error: 'Error fetching students' });
+        sendError(res, err, 'Error fetching students', 'getAllStudents');
     }
 };
 
 exports.getStudentsByClass = async (req, res) => {
     try {
         const { classId } = req.params;
-        const userRole = req.user.role;
-        const userId = req.user._id;
-        console.log('[getStudentsByClass] Request received:', { classId, user: { id: userId, role: userRole } });
 
         if (!isValidObjectId(classId)) {
-            console.error('[getStudentsByClass] Validation failed: Invalid classId');
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
-        const classData = await Class.findById(classId)
-            .populate('students', 'name email number isBlocked')
-            .populate('teachers', '_id');
-        if (!classData) {
-            console.error('[getStudentsByClass] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        // Admin: any class. Teacher: assigned/creator only. Student: enrolled only (and names only).
+        const classData = await assertClassMember(req.user, classId, 'students teachers createdBy');
+        const isStudentView = isStudent(req.user);
+        await classData.populate('students', isStudentView ? 'name' : 'name email number isBlocked');
 
-        // Authorization: Admin can see all, Teacher can only see students in classes they're assigned to
-        if (userRole === 'teacher') {
-            const isAssignedTeacher = classData.teachers.some(t => String(t._id) === String(userId));
-            const isCreator = String(classData.createdBy) === String(userId);
-            
-            if (!isAssignedTeacher && !isCreator) {
-                console.error('[getStudentsByClass] Authorization failed: Teacher not assigned to class');
-                return res.status(403).json({ error: 'Unauthorized: You are not assigned to this class' });
-            }
-            console.log('[getStudentsByClass] Teacher authorized:', { isAssignedTeacher, isCreator });
-        } else if (userRole !== 'admin' && userRole !== 'student') {
-            console.error('[getStudentsByClass] Authorization failed: Invalid role');
-            return res.status(403).json({ error: 'Unauthorized' });
-        }
+        const students = classData.students.map((student) =>
+            isStudentView
+                ? { _id: student._id, name: student.name }
+                : {
+                      _id: student._id,
+                      name: student.name,
+                      email: student.email,
+                      number: student.number,
+                      isBlocked: student.isBlocked?.get?.(classId.toString()) || false,
+                  },
+        );
 
-        const students = classData.students.map((student) => ({
-            _id: student._id,
-            name: student.name,
-            email: student.email,
-            number: student.number,
-            isBlocked: student.isBlocked?.get?.(classId.toString()) || false,
-        }));
-
-        console.log('[getStudentsByClass] Students fetched:', students.length, 'for role:', userRole);
         res.status(200).json({ students });
     } catch (err) {
-        console.error('[getStudentsByClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error fetching students for class' });
+        sendError(res, err, 'Error fetching students for class', 'getStudentsByClass');
     }
 };
 
 exports.getTeachersByClass = async (req, res) => {
     try {
         const { classId } = req.params;
-        console.log('[getTeachersByClass] Request received:', { classId, user: { id: req.user._id, role: req.user.role } });
 
         if (!isValidObjectId(classId)) {
-            console.error('[getTeachersByClass] Validation failed: Invalid classId');
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
-        const classData = await Class.findById(classId)
-            .populate('teachers', 'name email canCreateQuestion');
-        if (!classData) {
-            console.error('[getTeachersByClass] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        const classData = await assertClassMember(req.user, classId, 'students teachers createdBy');
+        const isStudentView = isStudent(req.user);
+        await classData.populate('teachers', isStudentView ? 'name' : 'name email canCreateQuestion');
 
-        console.log('[getTeachersByClass] Teachers fetched:', classData.teachers.length);
-        res.status(200).json({ teachers: classData.teachers });
+        const teachers = isStudentView
+            ? classData.teachers.map((t) => ({ _id: t._id, name: t.name }))
+            : classData.teachers;
+        res.status(200).json({ teachers });
     } catch (err) {
-        console.error('[getTeachersByClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error fetching teachers for class' });
+        sendError(res, err, 'Error fetching teachers for class', 'getTeachersByClass');
     }
 };
 
 exports.assignTeacherToClass = async (req, res) => {
     try {
         const { classId, teacherId } = req.body;
-        console.log('[assignTeacherToClass] Request received:', { classId, teacherId, user: { id: req.user._id, role: req.user.role } });
 
         if (!isValidObjectId(classId) || !isValidObjectId(teacherId)) {
-            console.error('[assignTeacherToClass] Validation failed: Invalid classId or teacherId');
             return res.status(400).json({ error: 'Valid class ID and teacher ID are required' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[assignTeacherToClass] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        const classData = await assertClassManager(req.user, classId);
 
         const teacher = await User.findById(teacherId);
         if (!teacher || teacher.role !== 'teacher') {
-            console.error('[assignTeacherToClass] Validation failed: Teacher not found or invalid role');
             return res.status(404).json({ error: 'Teacher not found' });
         }
 
         if (classData.teachers.some((id) => String(id) === String(teacherId))) {
-            console.error('[assignTeacherToClass] Validation failed: Teacher already assigned');
             return res.status(400).json({ error: 'Teacher already assigned to class' });
         }
 
         classData.teachers.push(teacherId);
         await classData.save();
-        console.log('[assignTeacherToClass] Teacher assigned:', teacherId);
 
         res.status(200).json({ message: 'Teacher assigned to class', class: classData });
     } catch (err) {
-        console.error('[assignTeacherToClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error assigning teacher to class' });
+        sendError(res, err, 'Error assigning teacher to class', 'assignTeacherToClass');
     }
 };
 
 exports.removeTeacherFromClass = async (req, res) => {
     try {
         const { classId, teacherId } = req.body.data || req.body;
-        console.log('[removeTeacherFromClass] Request received:', { classId, teacherId, user: { id: req.user._id, role: req.user.role } });
 
         if (!isValidObjectId(classId) || !isValidObjectId(teacherId)) {
-            console.error('[removeTeacherFromClass] Validation failed: Invalid classId or teacherId');
             return res.status(400).json({ error: 'Valid class ID and teacher ID are required' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[removeTeacherFromClass] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        const classData = await assertClassManager(req.user, classId);
 
         if (!classData.teachers.some((id) => String(id) === String(teacherId))) {
-            console.error('[removeTeacherFromClass] Validation failed: Teacher not assigned');
             return res.status(400).json({ error: 'Teacher not assigned to class' });
         }
 
         classData.teachers = classData.teachers.filter(id => id.toString() !== teacherId.toString());
         await classData.save();
-        console.log('[removeTeacherFromClass] Teacher removed:', teacherId);
 
         res.status(200).json({ message: 'Teacher removed from class', class: classData });
     } catch (err) {
-        console.error('[removeTeacherFromClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error removing teacher from class' });
+        sendError(res, err, 'Error removing teacher from class', 'removeTeacherFromClass');
     }
 };
 
 exports.removeStudentFromClass = async (req, res) => {
     try {
         const { classId, studentId } = req.body.data || req.body;
-        console.log('[removeStudentFromClass] Request received:', { classId, studentId, user: { id: req.user._id, role: req.user.role } });
 
         if (!isValidObjectId(classId) || !isValidObjectId(studentId)) {
-            console.error('[removeStudentFromClass] Validation failed: Invalid classId or studentId');
             return res.status(400).json({ error: 'Valid class ID and student ID are required' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[removeStudentFromClass] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
-        if (!(await canAccessClass(req.user, classData))) {
-            return res.status(403).json({ error: 'Not authorized for this class' });
-        }
+        const classData = await assertClassManager(req.user, classId);
 
         if (!classData.students.some((id) => String(id) === String(studentId))) {
-            console.error('[removeStudentFromClass] Validation failed: Student not enrolled');
             return res.status(400).json({ error: 'Student not enrolled in class' });
         }
 
         classData.students = classData.students.filter(id => id.toString() !== studentId.toString());
         await classData.save();
-        console.log('[removeStudentFromClass] Student removed:', studentId);
 
         // Remove student-related data
         await Promise.all([
@@ -922,12 +970,10 @@ exports.removeStudentFromClass = async (req, res) => {
             Leaderboard.deleteMany({ classId, studentId }),
             User.updateOne({ _id: studentId }, { $unset: { [`isBlocked.${classId}`]: '' } }),
         ]);
-        console.log('[removeStudentFromClass] Cleared submissions and leaderboard for student:', studentId);
 
         res.status(200).json({ message: 'Student removed from class', class: classData });
     } catch (err) {
-        console.error('[removeStudentFromClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error removing student from class' });
+        sendError(res, err, 'Error removing student from class', 'removeStudentFromClass');
     }
 };
 
@@ -935,22 +981,13 @@ exports.editClass = async (req, res) => {
     try {
         const { classId } = req.params;
         const { name, description, studentIds, teacherIds, questionIds } = req.body;
-        console.log('[editClass] Request received:', { classId, name, description, studentIds, teacherIds, questionIds, user: { id: req.user._id, role: req.user.role } });
 
         if (!isValidObjectId(classId)) {
-            console.error('[editClass] Validation failed: Invalid classId');
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[editClass] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
-        if (!(await canAccessClass(req.user, classData))) {
-            return res.status(403).json({ error: 'Not authorized for this class' });
-        }
-        if (req.user.role !== 'admin' && (studentIds || teacherIds || questionIds)) {
+        const classData = await assertClassManager(req.user, classId);
+        if (!isAdmin(req.user) && (studentIds || teacherIds || questionIds)) {
             return res.status(403).json({ error: 'Teachers can only update class name and description' });
         }
 
@@ -961,69 +998,61 @@ exports.editClass = async (req, res) => {
         }
         if (typeof description === 'string') classData.description = description.trim();
 
+        // Array members are ObjectIds, so compare as strings to dedupe.
+        const pushMissing = (arr, ids) => {
+            const have = new Set(arr.map(String));
+            let added = 0;
+            for (const id of ids) {
+                const key = String(id);
+                if (have.has(key)) continue;
+                have.add(key);
+                arr.push(id);
+                added += 1;
+            }
+            return added;
+        };
+
         if (studentIds && Array.isArray(studentIds)) {
             if (!studentIds.every(isValidObjectId)) {
-                console.error('[editClass] Validation failed: Invalid studentIds');
                 return res.status(400).json({ error: 'Invalid student IDs' });
             }
             const students = await User.find({ _id: { $in: studentIds }, role: 'student' }).select('_id');
             if (students.length === 0) {
-                console.error('[editClass] Validation failed: No valid students found');
                 return res.status(400).json({ error: 'No valid students found' });
             }
-            const newStudentIds = students.map(student => student._id.toString());
-            const uniqueStudentIds = newStudentIds.filter(id => !classData.students.includes(id));
-            classData.students.push(...uniqueStudentIds);
-            console.log('[editClass] Students added:', uniqueStudentIds.length);
+            pushMissing(classData.students, students.map((s) => s._id));
         }
 
         if (teacherIds && Array.isArray(teacherIds)) {
             if (!teacherIds.every(isValidObjectId)) {
-                console.error('[editClass] Validation failed: Invalid teacherIds');
                 return res.status(400).json({ error: 'Invalid teacher IDs' });
             }
             const teachers = await User.find({ _id: { $in: teacherIds }, role: 'teacher' }).select('_id');
             if (teachers.length === 0) {
-                console.error('[editClass] Validation failed: No valid teachers found');
                 return res.status(400).json({ error: 'No valid teachers found' });
             }
-            const newTeacherIds = teachers.map(teacher => teacher._id.toString());
-            const uniqueTeacherIds = newTeacherIds.filter(id => !classData.teachers.includes(id));
-            classData.teachers.push(...uniqueTeacherIds);
-            console.log('[editClass] Teachers added:', uniqueTeacherIds.length);
+            pushMissing(classData.teachers, teachers.map((t) => t._id));
         }
 
         if (questionIds && Array.isArray(questionIds)) {
             if (!questionIds.every(isValidObjectId)) {
-                console.error('[editClass] Validation failed: Invalid questionIds');
                 return res.status(400).json({ error: 'Invalid question IDs' });
             }
-            const questions = await Promise.all(questionIds.map(async (qid) => {
-                try {
-                    return await validateQuestion(qid);
-                } catch (err) {
-                    console.error('[editClass] Question validation failed:', qid, err.message);
-                    throw new Error(`Invalid question ${qid}: ${err.message}`);
-                }
-            }));
-            if (questions.length === 0) {
-                console.error('[editClass] Validation failed: No valid questions found');
+            if (questionIds.length === 0) {
                 return res.status(400).json({ error: 'No valid questions found' });
             }
+            // validateQuestion throws a 400 for unknown ids; sendError relays it.
+            const questions = await Promise.all([...new Set(questionIds.map(String))].map(validateQuestion));
             for (const question of questions) {
-                if (!question.classes.some(c => c.classId.toString() === classId)) {
+                if (!question.classes.some((c) => String(c.classId) === String(classId))) {
                     question.classes.push({ classId, isPublished: false, isDisabled: false });
                     await question.save();
                 }
-                if (!classData.questions.includes(question._id)) {
-                    classData.questions.push(question._id);
-                }
+                pushMissing(classData.questions, [question._id]);
             }
-            console.log('[editClass] Questions added:', questionIds.length);
         }
 
         await classData.save();
-        console.log('[editClass] Class updated:', classData._id);
 
         const updatedClass = await Class.findById(classId)
             .populate('createdBy', 'name email')
@@ -1033,8 +1062,7 @@ exports.editClass = async (req, res) => {
 
         res.status(200).json({ message: 'Class updated successfully', class: updatedClass });
     } catch (err) {
-        console.error('[editClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error updating class' });
+        sendError(res, err, 'Error updating class', 'editClass');
     }
 };
 
@@ -1045,20 +1073,12 @@ exports.addStudentsToClass = async (req, res) => {
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            return res.status(404).json({ error: 'Class not found' });
-        }
-        if (!(await canAccessClass(req.user, classData))) {
-            return res.status(403).json({ error: 'Not authorized for this class' });
-        }
+        const classData = await assertClassManager(req.user, classId);
 
         let emailRows = [];
         const identifiers = parseIdentifiersFromText(req.body.emails);
         if (req.file) {
-            const workbook = xlsx.readFile(req.file.path);
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const data = xlsx.utils.sheet_to_json(sheet);
+            const data = await readSpreadsheetRows(req.file.path, req.file.originalname);
             for (const entry of data) {
                 const email = getRowField(entry, ['email']);
                 if (email) {
@@ -1080,15 +1100,14 @@ exports.addStudentsToClass = async (req, res) => {
         let created = [];
         let skipped = [];
         let invalid = [];
-        let usedDefaultPassword = false;
+        let fromExcel = null;
 
         if (emailRows.length) {
-            const fromExcel = await ensureUsersFromExcelRows(emailRows, 'student');
+            fromExcel = await ensureUsersFromExcelRows(emailRows, 'student');
             userIds.push(...fromExcel.userIds);
             created = fromExcel.created;
             skipped = fromExcel.skipped;
             invalid = fromExcel.invalid;
-            usedDefaultPassword = fromExcel.usedDefaultPassword;
         }
 
         const fromIdentifiers = await findExistingStudentsByIdentifiers(identifiers);
@@ -1124,7 +1143,13 @@ exports.addStudentsToClass = async (req, res) => {
         if (created.length) parts.push(`${created.length} newly created`);
         if (fromIdentifiers.unmatched.length) parts.push(`${fromIdentifiers.unmatched.length} not found`);
         if (fromIdentifiers.ambiguous.length) parts.push(`${fromIdentifiers.ambiguous.length} name(s) matched more than one student — use email for those`);
-        if (usedDefaultPassword) parts.push(`new students can log in with password ${DEFAULT_USER_PASSWORD}`);
+        if (created.length && fromExcel && !fromExcel.credentialsEmailed) {
+            parts.push(
+                isAdmin(req.user)
+                    ? 'temporary passwords are included in this response; share them securely'
+                    : 'email is not configured, so an admin must share the new students\' temporary passwords',
+            );
+        }
 
         res.status(200).json({
             message: parts.join('. ') + '.',
@@ -1135,18 +1160,13 @@ exports.addStudentsToClass = async (req, res) => {
             invalid,
             unmatched: fromIdentifiers.unmatched,
             ambiguous: fromIdentifiers.ambiguous,
+            credentialsEmailed: fromExcel ? fromExcel.credentialsEmailed : false,
+            credentials: fromExcel ? credentialsForRequester(req.user, fromExcel) : undefined,
         });
     } catch (err) {
-        console.error('[addStudentsToClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error adding students to class' });
+        sendError(res, err, 'Error adding students to class', 'addStudentsToClass');
     } finally {
-        if (req.file?.path) {
-            try {
-                await fs.unlink(req.file.path);
-            } catch (unlinkErr) {
-                console.warn('[addStudentsToClass] Could not delete temp file:', unlinkErr.message);
-            }
-        }
+        await removeUploadedFile(req, 'addStudentsToClass');
     }
 };
 
@@ -1154,7 +1174,6 @@ exports.changeClassStatus = async (req, res) => {
     try {
         const { classId } = req.params;
         const { status } = req.body;
-        console.log('changeClassStatus: Request received:', { classId, status, user: { id: req.user._id, role: req.user.role } });
 
         if (!['active', 'inactive'].includes(status)) {
             return res.status(400).json({ error: 'Status must be active or inactive' });
@@ -1163,44 +1182,31 @@ exports.changeClassStatus = async (req, res) => {
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
-        const classData = await Class.findById(classId);
-
-        if (!classData) {
-            console.log('changeClassStatus: Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
-        if (!(await canAccessClass(req.user, classData))) {
-            return res.status(403).json({ error: 'Not authorized for this class' });
-        }
+        const classData = await assertClassManager(req.user, classId);
 
         classData.status = status;
         await classData.save();
 
         res.status(200).json({ message: `Class status changed to ${status}`, class: classData });
     } catch (err) {
-        console.error('changeClassStatus: Error:', err);
-        res.status(500).json({ error: 'Error changing class status' });
+        sendError(res, err, 'Error changing class status', 'changeClassStatus');
     }
 };
 
 exports.deleteClass = async (req, res) => {
     try {
         const { classId } = req.params;
-        console.log('[deleteClass] Request received:', { classId, user: { id: req.user._id, role: req.user.role } });
 
-        if (req.user.role !== 'admin') {
-            console.error('[deleteClass] Authorization failed: User is not admin');
+        if (!isAdmin(req.user)) {
             return res.status(403).json({ error: 'Unauthorized: Admins only' });
         }
 
         if (!isValidObjectId(classId)) {
-            console.error('[deleteClass] Validation failed: Invalid classId');
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
         const classData = await Class.findById(classId);
         if (!classData) {
-            console.error('[deleteClass] Validation failed: Class not found');
             return res.status(404).json({ error: 'Class not found' });
         }
 
@@ -1217,12 +1223,10 @@ exports.deleteClass = async (req, res) => {
             User.updateMany({ [`isBlocked.${classId}`]: { $exists: true } }, { $unset: { [`isBlocked.${classId}`]: '' } }),
         ]);
         await Class.deleteOne({ _id: classId });
-        console.log('[deleteClass] Class and related data deleted:', classId);
 
         res.status(200).json({ message: 'Class deleted successfully' });
     } catch (err) {
-        console.error('[deleteClass] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error deleting class' });
+        sendError(res, err, 'Error deleting class', 'deleteClass');
     }
 };
 
@@ -1233,86 +1237,78 @@ exports.getClassDetails = async (req, res) => {
             return res.status(400).json({ error: 'Invalid class ID' });
         }
 
+        await assertClassManager(req.user, classId, 'teachers createdBy');
         const classData = await Class.findById(classId)
             .populate('teachers', 'name email canCreateQuestion')
             .populate('createdBy', 'name email')
             .populate('students', 'name email')
             .populate('questions', 'title type description points classes')
             .lean();
-        console.log('getClassDetails: Class lookup:', classData ? { id: classData._id, name: classData.name } : 'Not found');
-
         if (!classData) {
-            console.log('getClassDetails: Validation failed: Class not found');
             return res.status(404).json({ error: 'Class not found' });
         }
 
-        console.log('getClassDetails: Class data fetched:', {
-            id: classData._id,
-            name: classData.name,
-            teachers: classData.teachers.length,
-            students: classData.students.length,
-        });
         res.status(200).json({ class: classData });
     } catch (err) {
-        console.error('getClassDetails: Error:', err);
-        res.status(500).json({ error: 'Error fetching class details' });
+        sendError(res, err, 'Error fetching class details', 'getClassDetails');
     }
 };
 
 exports.getQuestionSummary = async (req, res) => {
     try {
         const { classId } = req.params;
-        const user = req.user;
-        if (!['admin', 'teacher'].includes(user.role)) {
-            return res.status(403).json({ error: 'Not authorized' });
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid class ID' });
         }
-        const classData = await Class.findById(classId);
-        if (!classData) return res.status(404).json({ error: 'Class not found' });
-        if (user.role === 'teacher' && !classData.teachers.some(t => t.toString() === user._id.toString()) && classData.createdBy?.toString() !== user._id.toString()) {
-            return res.status(403).json({ error: 'Not authorized for this class' });
-        }
-        const questions = await Question.find({ 'classes.classId': classId }).select('_id title type');
-        const summaries = await Promise.all(questions.map(async (q) => {
-            const subs = await Submission.aggregate([
-                { $match: { questionId: q._id, classId: new mongoose.Types.ObjectId(classId), isRun: false } },
+        await assertClassManager(req.user, classId, 'teachers createdBy');
+
+        const classObjectId = new mongoose.Types.ObjectId(classId);
+        const [questions, statsRows] = await Promise.all([
+            Question.find({ 'classes.classId': classObjectId }).select('_id title type').lean(),
+            // Practice submissions only (exam attempts are scored separately); one pass for the whole class.
+            Submission.aggregate([
+                { $match: { classId: classObjectId, isRun: { $ne: true }, isCustomInput: { $ne: true }, examAttemptId: null } },
                 { $sort: { submittedAt: -1 } },
-                { $group: { _id: '$studentId', latestCorrect: { $first: '$isCorrect' } } },
-                { $group: {
-                    _id: null,
-                    attempted: { $sum: 1 },
-                    successful: { $sum: { $cond: ['$latestCorrect', 1, 0] } }
-                } }
-            ]);
-            const s = subs[0] || { attempted: 0, successful: 0 };
+                { $group: { _id: { questionId: '$questionId', studentId: '$studentId' }, latestCorrect: { $first: '$isCorrect' } } },
+                {
+                    $group: {
+                        _id: '$_id.questionId',
+                        attempted: { $sum: 1 },
+                        successful: { $sum: { $cond: ['$latestCorrect', 1, 0] } },
+                    },
+                },
+            ]),
+        ]);
+        const statsByQuestion = new Map(statsRows.map((row) => [String(row._id), row]));
+
+        const summaries = questions.map((q) => {
+            const s = statsByQuestion.get(String(q._id)) || { attempted: 0, successful: 0 };
             return {
                 questionId: q._id,
                 title: q.title,
                 type: q.type,
                 attempted: s.attempted,
                 successful: s.successful,
-                unsuccessful: (s.attempted || 0) - (s.successful || 0)
+                unsuccessful: s.attempted - s.successful,
             };
-        }));
+        });
         res.status(200).json({ summaries });
     } catch (err) {
-        console.error('getQuestionSummary Error:', err);
-        res.status(500).json({ error: 'Error fetching question summary' });
+        sendError(res, err, 'Error fetching question summary', 'getQuestionSummary');
     }
 };
 
 exports.getParticipantStats = async (req, res) => {
     try {
         const { classId } = req.params;
-        console.log('getParticipantStats: Request received:', { classId, user: { id: req.user._id, role: req.user.role } });
-
-        const classData = await Class.findById(classId).populate('students', 'name email');
-        if (!classData) {
-            console.log('Error: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid class ID' });
         }
 
+        const classData = await assertClassManager(req.user, classId, 'students teachers createdBy');
+
         const leaderboards = await Leaderboard.find({ classId })
-            .populate('studentId', 'name email')
+            .select('activityStatus correctAttempts wrongAttempts')
             .lean();
 
         const totalParticipants = classData.students.length;
@@ -1325,9 +1321,9 @@ exports.getParticipantStats = async (req, res) => {
         let totalWrongAttempts = 0;
 
         leaderboards.forEach(entry => {
-            activityStats[entry.activityStatus]++;
-            totalCorrectAttempts += entry.correctAttempts;
-            totalWrongAttempts += entry.wrongAttempts;
+            if (entry.activityStatus in activityStats) activityStats[entry.activityStatus] += 1;
+            totalCorrectAttempts += entry.correctAttempts || 0;
+            totalWrongAttempts += entry.wrongAttempts || 0;
         });
 
         const totalAttempts = totalCorrectAttempts + totalWrongAttempts;
@@ -1344,46 +1340,43 @@ exports.getParticipantStats = async (req, res) => {
             correctPercentage: totalAttempts ? (totalCorrectAttempts / totalAttempts * 100).toFixed(1) : 0,
         };
 
-        console.log('getParticipantStats: Stats retrieved:', stats);
         res.status(200).json({ stats });
     } catch (err) {
-        console.error('getParticipantStats: Error:', err);
-        res.status(500).json({ error: 'Error retrieving participant stats' });
+        sendError(res, err, 'Error retrieving participant stats', 'getParticipantStats');
     }
 };
 
 exports.getRunSubmitStats = async (req, res) => {
     try {
         const { classId } = req.params;
-        console.log('getRunSubmitStats: Request received:', { classId, user: { id: req.user._id, role: req.user.role } });
-
-        const classData = await Class.findById(classId).lean();
-        if (!classData) {
-            console.log('Error: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid class ID' });
         }
 
+        const classData = await assertClassManager(req.user, classId, 'totalRuns totalSubmits teachers createdBy');
+
         const leaderboards = await Leaderboard.find({ classId })
+            .select('studentId totalRuns totalSubmits')
             .populate('studentId', 'name email')
             .lean();
 
-        const studentStats = leaderboards.map(entry => ({
-            student: { id: entry.studentId._id, name: entry.studentId.name, email: entry.studentId.email },
-            totalRuns: entry.totalRuns,
-            totalSubmissions: entry.totalSubmits,
-        }));
+        const studentStats = leaderboards
+            .filter((entry) => entry.studentId)
+            .map((entry) => ({
+                student: { id: entry.studentId._id, name: entry.studentId.name, email: entry.studentId.email },
+                totalRuns: entry.totalRuns || 0,
+                totalSubmissions: entry.totalSubmits || 0,
+            }));
 
         const stats = {
-            classTotalRuns: classData.totalRuns,
-            classTotalSubmits: classData.totalSubmits,
+            classTotalRuns: classData.totalRuns || 0,
+            classTotalSubmits: classData.totalSubmits || 0,
             studentStats,
         };
 
-        console.log('getRunSubmitStats: Stats retrieved:', stats);
         res.status(200).json({ stats });
     } catch (err) {
-        console.error('getRunSubmitStats: Error:', err);
-        res.status(500).json({ error: 'Error retrieving run/submit stats' });
+        sendError(res, err, 'Error retrieving run/submit stats', 'getRunSubmitStats');
     }
 };
 
@@ -1391,38 +1384,22 @@ exports.createAssignment = async (req, res) => {
     try {
         const { classId } = req.params;
         const { questionId, dueDate, maxPoints } = req.body;
-        console.log('[createAssignment] Request received:', { classId, questionId, dueDate, maxPoints, user: { id: req.user._id, role: req.user.role } });
 
         if (!isValidObjectId(classId) || !isValidObjectId(questionId)) {
-            console.error('[createAssignment] Validation failed: Invalid classId or questionId');
             return res.status(400).json({ error: 'Valid class ID and question ID are required' });
         }
 
-        
         if (dueDate) {
             const parsedDueDate = new Date(dueDate);
             if (isNaN(parsedDueDate) || parsedDueDate <= new Date()) {
-                console.error('[createAssignment] Validation failed: Invalid or past dueDate');
                 return res.status(400).json({ error: 'dueDate must be a valid future date' });
             }
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[createAssignment] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
-
-        let question;
-        try {
-            question = await validateQuestion(questionId);
-        } catch (err) {
-            console.error('[createAssignment] Question validation failed:', err.message);
-            return res.status(400).json({ error: err.message });
-        }
+        const classData = await assertClassManager(req.user, classId);
+        await validateQuestion(questionId); // 400 when the question does not exist
 
         if (!classData.questions.some((id) => String(id) === String(questionId))) {
-            console.error('[createAssignment] Validation failed: Question not associated with class');
             return res.status(400).json({ error: 'Question is not associated with this class' });
         }
 
@@ -1439,69 +1416,57 @@ exports.createAssignment = async (req, res) => {
 
         classData.assignments.push(assignment);
         await classData.save();
-        console.log('[createAssignment] Assignment created:', assignment);
 
         req.io.to(`class:${classId}`).emit('assignmentCreated', { classId, assignment });
         res.status(201).json({ message: 'Assignment created successfully', assignment });
     } catch (err) {
-        console.error('[createAssignment] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error creating assignment' });
+        sendError(res, err, 'Error creating assignment', 'createAssignment');
     }
 };
 
 exports.getAssignments = async (req, res) => {
     try {
         const { classId } = req.params;
+        if (!isValidObjectId(classId)) {
+            return res.status(400).json({ error: 'Invalid class ID' });
+        }
+        // Managers, or students enrolled in this class.
+        await assertClassMember(req.user, classId, 'students teachers createdBy');
+
         const classData = await Class.findById(classId)
+            .select('assignments')
             .populate('assignments.questionId', 'title type difficulty')
             .lean();
         if (!classData) return res.status(404).json({ error: 'Class not found' });
 
-        if (req.user.role === 'student') {
-            const enrolled = (classData.students || []).some((s) => String(s._id || s) === String(req.user._id));
-            if (!enrolled) return res.status(403).json({ error: 'You are not enrolled in this class' });
-        } else if (req.user.role === 'teacher' && !(await canAccessClass(req.user, classData))) {
-            return res.status(403).json({ error: 'Not authorized for this class' });
-        }
-
         res.status(200).json({ assignments: classData.assignments || [] });
     } catch (err) {
-        console.error('getAssignments: Error:', err);
-        res.status(500).json({ error: 'Error retrieving assignments' });
+        sendError(res, err, 'Error retrieving assignments', 'getAssignments');
     }
 };
 
 exports.deleteAssignment = async (req, res) => {
     try {
         const { classId, assignmentId } = req.params;
-        console.log('[deleteAssignment] Request received:', { classId, assignmentId, user: { id: req.user._id, role: req.user.role } });
 
         if (!isValidObjectId(classId) || !isValidObjectId(assignmentId)) {
-            console.error('[deleteAssignment] Validation failed: Invalid classId or assignmentId');
             return res.status(400).json({ error: 'Valid class ID and assignment ID are required' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[deleteAssignment] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        const classData = await assertClassManager(req.user, classId);
 
         const assignmentIndex = classData.assignments.findIndex(a => a._id.toString() === assignmentId);
         if (assignmentIndex === -1) {
-            console.error('[deleteAssignment] Validation failed: Assignment not found');
             return res.status(404).json({ error: 'Assignment not found' });
         }
 
         classData.assignments.splice(assignmentIndex, 1);
         await classData.save();
-        console.log('[deleteAssignment] Assignment deleted:', assignmentId);
 
         req.io.to(`class:${classId}`).emit('assignmentDeleted', { classId, assignmentId });
         res.status(200).json({ message: 'Assignment deleted successfully' });
     } catch (err) {
-        console.error('[deleteAssignment] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error deleting assignment' });
+        sendError(res, err, 'Error deleting assignment', 'deleteAssignment');
     }
 };
 
@@ -1509,33 +1474,24 @@ exports.blockUser = async (req, res) => {
     try {
         const { classId } = req.params;
         const { studentId, isBlocked } = req.body;
-        console.log('blockUser: Request received:', { classId, studentId, isBlocked, user: { id: req.user._id, role: req.user.role } });
 
         if (!studentId || typeof isBlocked !== 'boolean') {
-            console.log('Error: Missing or invalid fields');
             return res.status(400).json({ error: 'Student ID and isBlocked (boolean) are required' });
         }
 
-        if (!mongoose.Types.ObjectId.isValid(classId) || !mongoose.Types.ObjectId.isValid(studentId)) {
+        if (!isValidObjectId(classId) || !isValidObjectId(studentId)) {
             return res.status(400).json({ error: 'Invalid classId or studentId' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.log('Error: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        const classData = await assertClassManager(req.user, classId, 'students teachers createdBy');
 
-        const studentObjectId = new mongoose.Types.ObjectId(studentId);
         const isEnrolled = classData.students.some((id) => String(id) === String(studentId));
         if (!isEnrolled) {
-            console.log('Error: Student not enrolled in class', { studentId, students: classData.students.map(String) });
             return res.status(400).json({ error: 'Student not enrolled in class' });
         }
 
-        const student = await User.findById(studentObjectId);
+        const student = await User.findById(studentId);
         if (!student || student.role !== 'student') {
-            console.log('Error: Student not found or invalid role');
             return res.status(404).json({ error: 'Student not found' });
         }
 
@@ -1553,12 +1509,9 @@ exports.blockUser = async (req, res) => {
             studentName: student.name,
             studentEmail: student.email,
         });
-        console.log('blockUser:', isBlocked ? 'Blocked' : 'Unblocked', 'student:', studentId);
-
         res.status(200).json({ message: `Student ${isBlocked ? 'blocked' : 'unblocked'} successfully` });
     } catch (err) {
-        console.error('blockUser: Error:', err);
-        res.status(500).json({ error: 'Error updating block status' });
+        sendError(res, err, 'Error updating block status', 'blockUser');
     }
 };
 
@@ -1571,15 +1524,10 @@ exports.blockAllUsers = async (req, res) => {
         }
 
         if (typeof isBlocked !== 'boolean') {
-            console.log('Error: Invalid isBlocked field');
             return res.status(400).json({ error: 'isBlocked (boolean) is required' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.log('Error: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        const classData = await assertClassManager(req.user, classId, 'students teachers createdBy');
 
         let targetStudentIds = classData.students.map((id) => String(id));
 
@@ -1589,7 +1537,6 @@ exports.blockAllUsers = async (req, res) => {
             targetStudentIds = studentIds.map(String).filter((id) => allowed.has(id));
         } else if (onlyInactive) {
             // Block only inactive students (no submissions / activityStatus inactive)
-            const Leaderboard = require('../models/Leaderboard');
             const entries = await Leaderboard.find({ classId }).select('studentId activityStatus totalSubmits').lean();
             const activeIds = new Set(
                 entries
@@ -1610,15 +1557,13 @@ exports.blockAllUsers = async (req, res) => {
 
         req.io.to(`class:${classId}`).emit('allUsersBlocked', { classId, isBlocked, onlyInactive: !!onlyInactive });
         req.io.to(`class:${classId}`).emit('studentBlockStatusUpdated', { classId, isBlocked, onlyInactive: !!onlyInactive });
-        console.log('blockAllUsers:', isBlocked ? 'Blocked' : 'Unblocked', 'students:', targetStudentIds.length);
 
         res.status(200).json({
             message: `${targetStudentIds.length} student(s) ${isBlocked ? 'blocked' : 'unblocked'} successfully`,
             updated: targetStudentIds.length,
         });
     } catch (err) {
-        console.error('blockAllUsers: Error:', err);
-        res.status(500).json({ error: 'Error updating block status' });
+        sendError(res, err, 'Error updating block status', 'blockAllUsers');
     }
 };
 
@@ -1626,23 +1571,17 @@ exports.searchLeaderboard = async (req, res) => {
     try {
         const { classId } = req.params;
 
-        if (!mongoose.Types.ObjectId.isValid(classId)) {
-            console.log('searchLeaderboard: Error: Invalid classId format');
+        if (!isValidObjectId(classId)) {
             return res.status(400).json({ error: 'Invalid classId format' });
         }
 
-        const classData = await Class.findById(classId).select('_id');
-        if (!classData) {
-            console.log('searchLeaderboard: Error: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        await assertClassManager(req.user, classId, 'teachers createdBy');
 
         let query = { classId: new mongoose.Types.ObjectId(classId) };
         const { name, activityStatus, minCorrectAttempts, maxAttempts } = req.query;
 
         if (activityStatus) {
             if (!['inactive', 'active', 'focused'].includes(activityStatus)) {
-                console.log('searchLeaderboard: Error: Invalid activity status');
                 return res.status(400).json({ error: 'Invalid activity status' });
             }
             query.activityStatus = activityStatus;
@@ -1651,7 +1590,6 @@ exports.searchLeaderboard = async (req, res) => {
         if (minCorrectAttempts && !isNaN(parseInt(minCorrectAttempts, 10))) {
             query.correctAttempts = { $gte: parseInt(minCorrectAttempts, 10) };
         } else if (minCorrectAttempts) {
-            console.log('searchLeaderboard: Error: Invalid minCorrectAttempts');
             return res.status(400).json({ error: 'minCorrectAttempts must be a number' });
         }
 
@@ -1663,11 +1601,12 @@ exports.searchLeaderboard = async (req, res) => {
                 ],
             };
         } else if (maxAttempts) {
-            console.log('searchLeaderboard: Error: Invalid maxAttempts');
             return res.status(400).json({ error: 'maxAttempts must be a number' });
         }
 
+        // Bounded per-question rows only; a legacy (pre-migration) `attempts` history is never loaded.
         let leaderboard = await Leaderboard.find(query)
+            .select(Leaderboard.SAFE_PROJECTION)
             .populate('studentId', 'name email isBlocked')
             .lean();
 
@@ -1679,16 +1618,18 @@ exports.searchLeaderboard = async (req, res) => {
         // Add isBlocked status from User model to each leaderboard entry
         leaderboard = leaderboard.map(entry => {
             const isBlockedForClass = entry.studentId?.isBlocked ? (entry.studentId.isBlocked[classId] || false) : false;
+            const questionRows = Leaderboard.questionRows(entry);
             return {
                 ...entry,
+                questions: questionRows,
+                highestScores: Leaderboard.highestScoresFrom(questionRows),
                 isBlocked: isBlockedForClass
             };
         });
 
         res.status(200).json({ leaderboard });
     } catch (err) {
-        console.error('searchLeaderboard: Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error searching leaderboard', details: err.message });
+        sendError(res, err, 'Error searching leaderboard', 'searchLeaderboard');
     }
 };
 
@@ -1696,52 +1637,28 @@ exports.blockUnblockStudent = async (req, res) => {
     try {
         const { classId } = req.params;
         const { studentId, isBlocked } = req.body;
-        console.log('[blockUnblockStudent] Request received:', { classId, studentId, isBlocked, user: { id: req.user._id, role: req.user.role } });
-
-        if (!['admin', 'teacher'].includes(req.user.role)) {
-            console.error('[blockUnblockStudent] Authorization failed: User not authorized');
-            return res.status(403).json({ error: 'Only admins or teachers can block/unblock students' });
-        }
 
         if (!isValidObjectId(classId) || !isValidObjectId(studentId) || typeof isBlocked !== 'boolean') {
-            console.error('[blockUnblockStudent] Validation failed: Invalid classId, studentId, or isBlocked');
             return res.status(400).json({ error: 'Valid class ID, student ID, and isBlocked (boolean) are required' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[blockUnblockStudent] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        // Admin, assigned teacher, or the class creator.
+        const classData = await assertClassManager(req.user, classId, 'students teachers createdBy');
 
         const student = await User.findById(studentId);
         if (!student || student.role !== 'student') {
-            console.error('[blockUnblockStudent] Validation failed: Student not found or invalid role');
             return res.status(404).json({ error: 'Student not found or not a student' });
         }
 
         if (!classData.students.some((id) => String(id) === String(studentId))) {
-            console.error('[blockUnblockStudent] Validation failed: Student not enrolled');
             return res.status(400).json({ error: 'Student not enrolled in class' });
-        }
-
-        if (req.user.role === 'teacher' && !classData.teachers.some((id) => String(id) === String(req.user._id))) {
-            console.error('[blockUnblockStudent] Authorization failed: Teacher not assigned to class');
-            return res.status(403).json({ error: 'Teacher not assigned to this class' });
         }
 
         if (!student.isBlocked) {
             student.isBlocked = new Map();
         }
-        console.log('[blockUnblockStudent] Current isBlocked status for this class:', student.isBlocked.get(String(classId)));
-        console.log('[blockUnblockStudent] Setting isBlocked to:', isBlocked);
-        
         student.isBlocked.set(String(classId), isBlocked);
         await student.save();
-        
-        console.log('[blockUnblockStudent] ✅ Student saved successfully!');
-        console.log('[blockUnblockStudent] Final isBlocked status:', student.isBlocked.get(String(classId)));
-        console.log('[blockUnblockStudent] Full isBlocked Map:', Object.fromEntries(student.isBlocked));
 
         if (req.io) req.io.to(`class:${classId}`).emit('analyticsUpdated', { classId });
         req.io.to(`class:${classId}`).emit('studentBlockStatusUpdated', {
@@ -1754,11 +1671,10 @@ exports.blockUnblockStudent = async (req, res) => {
 
         res.status(200).json({
             message: `Student ${isBlocked ? 'blocked' : 'unblocked'} successfully`,
-            student: { id: student._id, name: student.name, email: student.email, isBlocked: student.isBlocked.get(classId) }
+            student: { id: student._id, name: student.name, email: student.email, isBlocked: student.isBlocked.get(String(classId)) }
         });
     } catch (err) {
-        console.error('[blockUnblockStudent] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error updating student block status' });
+        sendError(res, err, 'Error updating student block status', 'blockUnblockStudent');
     }
 };
 
@@ -1766,97 +1682,25 @@ exports.focusUnfocusStudent = async (req, res) => {
     try {
         const { classId } = req.params;
         const { studentId, needsFocus } = req.body;
-        console.log('[focusUnfocusStudent] Request received:', { classId, studentId, needsFocus, user: { id: req.user._id, role: req.user.role } });
-
-        if (!['admin', 'teacher'].includes(req.user.role)) {
-            console.error('[focusUnfocusStudent] Authorization failed: User not authorized');
-            return res.status(403).json({ error: 'Only admins or teachers can focus/unfocus students' });
-        }
 
         if (!isValidObjectId(classId) || !isValidObjectId(studentId) || typeof needsFocus !== 'boolean') {
-            console.error('[focusUnfocusStudent] Validation failed: Invalid classId, studentId, or needsFocus');
             return res.status(400).json({ error: 'Valid class ID, student ID, and needsFocus (boolean) are required' });
         }
 
-        const classData = await Class.findById(classId);
-        if (!classData) {
-            console.error('[focusUnfocusStudent] Validation failed: Class not found');
-            return res.status(404).json({ error: 'Class not found' });
-        }
+        // Admin, assigned teacher, or the class creator.
+        const classData = await assertClassManager(req.user, classId, 'students teachers createdBy');
 
         const student = await User.findById(studentId);
         if (!student || student.role !== 'student') {
-            console.error('[focusUnfocusStudent] Validation failed: Student not found or invalid role');
             return res.status(404).json({ error: 'Student not found or not a student' });
         }
 
         if (!classData.students.some((id) => String(id) === String(studentId))) {
-            console.error('[focusUnfocusStudent] Validation failed: Student not enrolled');
             return res.status(400).json({ error: 'Student not enrolled in class' });
         }
 
-        if (req.user.role === 'teacher' && !classData.teachers.some((id) => String(id) === String(req.user._id))) {
-            console.error('[focusUnfocusStudent] Authorization failed: Teacher not assigned to class');
-            return res.status(403).json({ error: 'Teacher not assigned to this class' });
-        }
-
-        console.log('[focusUnfocusStudent] Looking up leaderboard for:', { classId, studentId });
-        let leaderboard = await Leaderboard.findOne({ classId, studentId });
-        
-        if (!leaderboard) {
-            console.log('[focusUnfocusStudent] No leaderboard found, creating new one');
-            leaderboard = new Leaderboard({
-                classId,
-                studentId,
-                attempts: [],
-                highestScores: [],
-                totalScore: 0,
-                correctAttempts: 0,
-                wrongAttempts: 0,
-                totalRuns: 0,
-                totalSubmits: 0,
-                activityStatus: 'inactive',
-                needsFocus
-            });
-            console.log('[focusUnfocusStudent] New leaderboard created with needsFocus:', needsFocus);
-        } else {
-            console.log('[focusUnfocusStudent] Existing leaderboard found:', {
-                _id: leaderboard._id,
-                currentNeedsFocus: leaderboard.needsFocus,
-                currentActivityStatus: leaderboard.activityStatus,
-                totalSubmits: leaderboard.totalSubmits,
-                newNeedsFocus: needsFocus
-            });
-            
-            leaderboard.needsFocus = needsFocus;
-            console.log('[focusUnfocusStudent] Set needsFocus to:', needsFocus);
-            
-            if (needsFocus) {
-                console.log('[focusUnfocusStudent] Setting activityStatus to "focused" because needsFocus=true');
-                leaderboard.activityStatus = 'focused';
-            } else if (leaderboard.activityStatus === 'focused') {
-                const newStatus = leaderboard.totalSubmits > 0 ? 'active' : 'inactive';
-                console.log('[focusUnfocusStudent] Setting activityStatus from "focused" to:', newStatus, '(totalSubmits:', leaderboard.totalSubmits + ')');
-                leaderboard.activityStatus = newStatus;
-            } else {
-                console.log('[focusUnfocusStudent] Not changing activityStatus, currently:', leaderboard.activityStatus);
-            }
-        }
-        
-        console.log('[focusUnfocusStudent] Saving leaderboard with:', {
-            needsFocus: leaderboard.needsFocus,
-            activityStatus: leaderboard.activityStatus
-        });
-        
-        await leaderboard.save();
-        
-        console.log('[focusUnfocusStudent] ✅ Leaderboard saved successfully!');
-        console.log('[focusUnfocusStudent] Final values:', {
-            studentId: leaderboard.studentId,
-            needsFocus: leaderboard.needsFocus,
-            activityStatus: leaderboard.activityStatus,
-            _id: leaderboard._id
-        });
+        // Atomic upsert: needsFocus + derived activityStatus ('focused' | 'active' | 'inactive') in one write.
+        await Leaderboard.setNeedsFocus({ classId, studentId, needsFocus });
 
         req.io.to(`class:${classId}`).emit('studentFocusStatusUpdated', {
             classId,
@@ -1871,33 +1715,25 @@ exports.focusUnfocusStudent = async (req, res) => {
             student: { id: student._id, name: student.name, email: student.email, needsFocus }
         });
     } catch (err) {
-        console.error('[focusUnfocusStudent] Error:', err.message, err.stack);
-        res.status(500).json({ error: 'Error updating student focus status' });
+        sendError(res, err, 'Error updating student focus status', 'focusUnfocusStudent');
     }
 };
 
 exports.getCounts = async (req, res) => {
     try {
-        console.log('getCounts: Request received:', { user: { id: req.user._id, role: req.user.role } });
-
-        const Exam = require('../models/Exam');
-        const ExamAttempt = require('../models/ExamAttempt');
-
+        const now = new Date();
         const [
-            teacherCount, 
-            studentCount, 
-            questionCount, 
+            teacherCount,
+            studentCount,
+            questionCount,
             classCount,
             activeClassCount,
             inactiveClassCount,
-            examCount,
-            examDraftCount,
-            examScheduledCount,
-            examActiveCount,
-            examCompletedCount,
             examTemplateCount,
             examAttemptCount,
-            totalSubmissions
+            totalSubmissions,
+            classes,
+            exams,
         ] = await Promise.all([
             User.countDocuments({ role: 'teacher' }),
             User.countDocuments({ role: 'student' }),
@@ -1905,70 +1741,44 @@ exports.getCounts = async (req, res) => {
             Class.countDocuments(),
             Class.countDocuments({ status: 'active' }),
             Class.countDocuments({ status: 'inactive' }),
-            Exam.countDocuments({ 'template.isTemplate': { $ne: true } }),
-            Exam.countDocuments({ status: 'draft', 'template.isTemplate': { $ne: true } }),
-            Exam.countDocuments({ status: 'scheduled', 'template.isTemplate': { $ne: true } }),
-            Exam.countDocuments({ status: 'active', 'template.isTemplate': { $ne: true } }),
-            Exam.countDocuments({ status: 'completed', 'template.isTemplate': { $ne: true } }),
             Exam.countDocuments({ 'template.isTemplate': true }),
             ExamAttempt.countDocuments(),
-            Submission.countDocuments()
+            Submission.countDocuments(),
+            Class.find().select('name status students teachers questions assignments').lean(),
+            Exam.find({ 'template.isTemplate': { $ne: true } }).select('classId status proctoring template').lean(),
         ]);
 
-        // Get class analytics
-        const classes = await Class.find().select('name status students teachers questions assignments').lean();
-        const classAnalytics = classes.map(cls => ({
-            id: cls._id.toString(),
-            name: cls.name,
-            status: cls.status,
-            studentCount: cls.students?.length || 0,
-            teacherCount: cls.teachers?.length || 0,
-            questionCount: cls.questions?.length || 0,
-            assignmentCount: cls.assignments?.length || 0
-        }));
-
-        // Get exam statistics per class
-        const exams = await Exam.find({ 'template.isTemplate': { $ne: true } })
-            .select('classId status title')
-            .lean();
-        
+        // Exams never store status 'active'; "active" means a published exam whose window is open right now.
+        const emptyExamStats = () => ({ total: 0, draft: 0, scheduled: 0, active: 0, completed: 0 });
+        const examTotals = emptyExamStats();
         const examStatsByClass = {};
-        exams.forEach(exam => {
+        for (const exam of exams) {
+            const phase = examPhase(exam, now);
+            const key = phase === 'live' ? 'active' : phase;
+            examTotals.total += 1;
+            if (key in examTotals) examTotals[key] += 1;
+
             const classId = exam.classId?.toString();
-            if (!classId) return;
-            
-            if (!examStatsByClass[classId]) {
-                examStatsByClass[classId] = {
-                    total: 0,
-                    draft: 0,
-                    scheduled: 0,
-                    active: 0,
-                    completed: 0
-                };
-            }
-            
-            examStatsByClass[classId].total++;
-            if (exam.status) {
-                examStatsByClass[classId][exam.status] = (examStatsByClass[classId][exam.status] || 0) + 1;
-            }
-        });
+            if (!classId) continue;
+            if (!examStatsByClass[classId]) examStatsByClass[classId] = emptyExamStats();
+            examStatsByClass[classId].total += 1;
+            if (key in examStatsByClass[classId]) examStatsByClass[classId][key] += 1;
+        }
 
-        // Add exam counts to class analytics
-        classAnalytics.forEach(cls => {
-            const examStats = examStatsByClass[cls.id.toString()] || { total: 0, draft: 0, scheduled: 0, active: 0, completed: 0 };
-            cls.examCount = examStats.total;
-            cls.examStats = examStats;
-        });
-
-        console.log('getCounts: Counts fetched:', {
-            teachers: teacherCount,
-            students: studentCount,
-            questions: questionCount,
-            classes: classCount,
-            activeClasses: activeClassCount,
-            inactiveClasses: inactiveClassCount,
-            exams: examCount,
-            examAttempts: examAttemptCount
+        const classAnalytics = classes.map((cls) => {
+            const id = cls._id.toString();
+            const examStats = examStatsByClass[id] || emptyExamStats();
+            return {
+                id,
+                name: cls.name,
+                status: cls.status,
+                studentCount: cls.students?.length || 0,
+                teacherCount: cls.teachers?.length || 0,
+                questionCount: cls.questions?.length || 0,
+                assignmentCount: cls.assignments?.length || 0,
+                examCount: examStats.total,
+                examStats,
+            };
         });
 
         res.status(200).json({
@@ -1979,11 +1789,11 @@ exports.getCounts = async (req, res) => {
                 classes: classCount,
                 activeClasses: activeClassCount,
                 inactiveClasses: inactiveClassCount,
-                exams: examCount,
-                examDrafts: examDraftCount,
-                examScheduled: examScheduledCount,
-                examActive: examActiveCount,
-                examCompleted: examCompletedCount,
+                exams: examTotals.total,
+                examDrafts: examTotals.draft,
+                examScheduled: examTotals.scheduled,
+                examActive: examTotals.active,
+                examCompleted: examTotals.completed,
                 examTemplates: examTemplateCount,
                 examAttempts: examAttemptCount,
                 totalSubmissions: totalSubmissions
@@ -1991,8 +1801,7 @@ exports.getCounts = async (req, res) => {
             classAnalytics: classAnalytics
         });
     } catch (err) {
-        console.error('getCounts: Error:', err);
-        res.status(500).json({ error: 'Error fetching counts' });
+        sendError(res, err, 'Error fetching counts', 'getCounts');
     }
 };
 
@@ -2023,8 +1832,9 @@ exports.getDashboard = async (req, res) => {
         const activityStart = new Date(now.getTime() - ACTIVITY_DAYS * DAY_MS);
         const weekAgoId = mongoose.Types.ObjectId.createFromTime(Math.floor(weekAgo.getTime() / 1000));
         const realSubmission = { isRun: { $ne: true }, isCustomInput: { $ne: true } };
-        const isTeacher = req.user.role === 'teacher';
-        const ownClassIds = isTeacher ? await teacherClassIds(req.user) : null;
+        const teacherScope = isTeacher(req.user);
+        // Admins: null (no class filter). Teachers: classes they are assigned to or created.
+        const ownClassIds = teacherScope ? await managedClassIds(req.user) : null;
         const classQuery = ownClassIds ? { _id: { $in: ownClassIds } } : {};
         const examQuery = { 'template.isTemplate': { $ne: true }, ...(ownClassIds ? { classId: { $in: ownClassIds } } : {}) };
         const submissionQuery = { ...realSubmission, ...(ownClassIds ? { classId: { $in: ownClassIds } } : {}) };
@@ -2054,7 +1864,7 @@ exports.getDashboard = async (req, res) => {
             classActivity,
             blockedStudentCount,
         ] = await Promise.all([
-            isTeacher
+            teacherScope
                 ? Class.aggregate([
                       { $match: classQuery },
                       { $unwind: { path: '$students', preserveNullAndEmptyArrays: false } },
@@ -2062,7 +1872,7 @@ exports.getDashboard = async (req, res) => {
                       { $count: 'n' },
                   ]).then((rows) => rows[0]?.n || 0)
                 : User.countDocuments({ role: 'student' }),
-            isTeacher
+            teacherScope
                 ? Class.aggregate([
                       { $match: classQuery },
                       { $unwind: { path: '$students', preserveNullAndEmptyArrays: false } },
@@ -2071,8 +1881,8 @@ exports.getDashboard = async (req, res) => {
                       { $count: 'n' },
                   ]).then((rows) => rows[0]?.n || 0)
                 : User.countDocuments({ role: 'student', _id: { $gte: weekAgoId } }),
-            isTeacher ? 0 : User.countDocuments({ role: 'teacher' }),
-            isTeacher ? 0 : User.countDocuments({ role: 'teacher', canCreateQuestion: true }),
+            teacherScope ? 0 : User.countDocuments({ role: 'teacher' }),
+            teacherScope ? 0 : User.countDocuments({ role: 'teacher', canCreateQuestion: true }),
             Class.find(classQuery).select('name status students teachers').lean(),
             Question.countDocuments(questionQuery),
             Question.countDocuments({ status: 'draft', isDraft: true, createdBy: req.user._id }),
@@ -2105,7 +1915,7 @@ exports.getDashboard = async (req, res) => {
                 { $match: { ...submissionQuery, submittedAt: { $gte: weekAgo } } },
                 { $group: { _id: '$classId', total: { $sum: 1 }, correct: { $sum: { $cond: ['$isCorrect', 1, 0] } } } },
             ]),
-            isTeacher
+            teacherScope
                 ? Promise.resolve(0)
                 : User.countDocuments({
                       role: 'student',
@@ -2117,14 +1927,14 @@ exports.getDashboard = async (req, res) => {
 
         const classById = new Map(classes.map((c) => [String(c._id), c]));
         const enrolled = new Set(classes.flatMap((c) => (c.students || []).map(String)));
-        const unenrolledStudentCount = isTeacher
+        const unenrolledStudentCount = teacherScope
             ? 0
             : await User.countDocuments({
                   role: 'student',
                   _id: { $nin: [...enrolled].map((id) => new mongoose.Types.ObjectId(id)) },
               });
         let teacherBlockedCount = blockedStudentCount;
-        if (isTeacher && enrolled.size && ownClassIds?.length) {
+        if (teacherScope && enrolled.size && ownClassIds?.length) {
             teacherBlockedCount = await User.countDocuments({
                 role: 'student',
                 _id: { $in: [...enrolled].map((id) => new mongoose.Types.ObjectId(id)) },
@@ -2238,7 +2048,7 @@ exports.getDashboard = async (req, res) => {
 
         res.json({
             generatedAt: now,
-            scope: isTeacher ? 'teacher' : 'admin',
+            scope: teacherScope ? 'teacher' : 'admin',
             kpis: {
                 students: studentCount,
                 newStudents7d: newStudentCount,
@@ -2268,8 +2078,7 @@ exports.getDashboard = async (req, res) => {
             topClasses,
         });
     } catch (err) {
-        console.error('getDashboard error:', err);
-        res.status(500).json({ error: 'Failed to load dashboard' });
+        sendError(res, err, 'Failed to load dashboard', 'getDashboard');
     }
 };
 
@@ -2412,8 +2221,7 @@ exports.getStudentDashboard = async (req, res) => {
             })),
         });
     } catch (err) {
-        console.error('getStudentDashboard error:', err);
-        res.status(500).json({ error: 'Failed to load dashboard' });
+        sendError(res, err, 'Failed to load dashboard', 'getStudentDashboard');
     }
 };
 
@@ -2430,7 +2238,7 @@ exports.getClassOverview = async (req, res) => {
             .populate('students', 'name email number isBlocked')
             .lean();
         if (!classData) return res.status(404).json({ error: 'Class not found' });
-        if (!(await canAccessClass(req.user, classData))) {
+        if (!classManagedBy(classData, req.user)) {
             return res.status(403).json({ error: 'Not authorized for this class' });
         }
 
@@ -2642,8 +2450,7 @@ exports.getClassOverview = async (req, res) => {
             activity,
         });
     } catch (err) {
-        console.error('getClassOverview error:', err);
-        res.status(500).json({ error: 'Failed to load class overview' });
+        sendError(res, err, 'Failed to load class overview', 'getClassOverview');
     }
 };
 
@@ -2655,13 +2462,9 @@ exports.removeQuestionFromClass = async (req, res) => {
             return res.status(400).json({ error: 'Invalid class or question ID' });
         }
         const [classData, linkedOnQuestion] = await Promise.all([
-            Class.findById(classId).select('questions'),
+            assertClassManager(req.user, classId, 'questions teachers createdBy'),
             Question.exists({ _id: questionId, 'classes.classId': classId }),
         ]);
-        if (!classData) return res.status(404).json({ error: 'Class not found' });
-        if (!(await canAccessClass(req.user, classId))) {
-            return res.status(403).json({ error: 'Not authorized for this class' });
-        }
         const linkedOnClass = classData.questions.some((id) => String(id) === questionId);
         if (!linkedOnClass && !linkedOnQuestion) return res.status(404).json({ error: 'Question is not in this class' });
 
@@ -2671,8 +2474,7 @@ exports.removeQuestionFromClass = async (req, res) => {
         ]);
         res.json({ message: 'Question removed from class' });
     } catch (err) {
-        console.error('removeQuestionFromClass error:', err);
-        res.status(500).json({ error: 'Failed to remove question from class' });
+        sendError(res, err, 'Failed to remove question from class', 'removeQuestionFromClass');
     }
 };
 
@@ -2696,14 +2498,11 @@ exports.getQuestionOverview = async (req, res) => {
 
         // Teachers only see their own questions or ones used in their classes, and only their classes' data.
         let classScope = { $or: [{ _id: { $in: settingIds } }, { questions: qid }] };
-        if (req.user.role !== 'admin') {
-            const ownClassIds = (
-                await Class.find({ $or: [{ teachers: req.user._id }, { createdBy: req.user._id }] }).select('_id').lean()
-            ).map((c) => c._id);
-            const ownSet = new Set(ownClassIds.map(String));
-            const isAuthor = String(question.createdBy?._id || question.createdBy) === String(req.user._id);
-            const inOwnClass = settingIds.some((id) => ownSet.has(id)) || (await Class.exists({ _id: { $in: ownClassIds }, questions: qid }));
-            if (!isAuthor && !inOwnClass) return res.status(403).json({ error: 'You do not have access to this question' });
+        if (!isAdmin(req.user)) {
+            if (!(await canManageQuestion(req.user, question))) {
+                return res.status(403).json({ error: 'You do not have access to this question' });
+            }
+            const ownClassIds = await managedClassIds(req.user);
             classScope = { $and: [classScope, { _id: { $in: ownClassIds } }] };
             practice.classId = { $in: ownClassIds };
             examFilter.classId = { $in: ownClassIds };
@@ -2844,27 +2643,28 @@ exports.getQuestionOverview = async (req, res) => {
             })),
         });
     } catch (err) {
-        console.error('getQuestionOverview error:', err);
-        res.status(500).json({ error: 'Failed to load question' });
+        sendError(res, err, 'Failed to load question', 'getQuestionOverview');
     }
 };
 
 // Updated Question Management Functions
 exports.adminCreateQuestion = async (req, res) => {
-    console.log('[Admin Create Question] Started');
     try {
-        const questionData = req.body;
         const user = req.user;
 
-        console.log('[Admin Create Question] User:', user._id, '| Role:', user.role);
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Admin Create Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can create questions' });
+        if (!canAuthorQuestions(user)) {
+            return res.status(403).json({ error: 'You do not have permission to create questions' });
         }
 
+        if (!req.body || typeof req.body !== 'object') {
+            return res.status(400).json({ error: 'Question data is required' });
+        }
+        // "Save as draft" is a request flag; ownership, class links and publish state are set below, never copied from the body.
+        const saveAsDraft = req.body.isDraft === true || req.body.status === 'draft';
+        const questionData = pickQuestionFields(req.body);
+
         // Basic validation
-        if (!questionData || !questionData.type || !questionData.title) {
+        if (!questionData.type || !questionData.title) {
             console.error('[Admin Create Question] Error: Type or title missing');
             return res.status(400).json({ error: 'Question type and title are required' });
         }
@@ -3007,9 +2807,6 @@ exports.adminCreateQuestion = async (req, res) => {
             }
         }
 
-        // Check if this is a draft
-        const isDraft = questionData.status === 'draft' || questionData.isDraft === true;
-
         normalizeQuestionRichTextFields(questionData);
 
         // Create question
@@ -3017,24 +2814,22 @@ exports.adminCreateQuestion = async (req, res) => {
             ...questionData,
             createdBy: user._id,
             points: parseOptionalPoints(questionData.points),
-            classes: [], // Admins don't assign to classes
-            status: isDraft ? 'draft' : 'published',
-            isDraft: isDraft,
-            publishedAt: isDraft ? null : new Date(),
-            publishedBy: isDraft ? null : user._id,
+            classes: [], // Class links are managed through the class endpoints
+            status: saveAsDraft ? 'draft' : 'published',
+            isDraft: saveAsDraft,
+            publishedAt: saveAsDraft ? null : new Date(),
+            publishedBy: saveAsDraft ? null : user._id,
             createdAt: new Date(),
             updatedAt: new Date(),
         });
 
         applyDefaultSolutions(question);
         await question.save();
-        console.log('[Admin Create Question] Saved:', question._id, '| Status:', question.status);
 
-        const message = isDraft ? 'Draft saved successfully' : 'Question created successfully';
+        const message = saveAsDraft ? 'Draft saved successfully' : 'Question created successfully';
         res.status(201).json({ message, question });
     } catch (err) {
-        console.error('[Admin Create Question] Error:', err.message);
-        res.status(500).json({ error: 'Error creating question' });
+        sendError(res, err, 'Error creating question', 'adminCreateQuestion');
     }
 };
 
@@ -3072,8 +2867,8 @@ exports.getAllQuestionsPaginated = async (req, res) => {
         if (usage === 'bank') filters.push({ isExamOnly: { $ne: true }, 'classes.0': { $exists: false } });
         if (usage === 'classes') filters.push({ 'classes.0': { $exists: true } });
         if (usage === 'exam') filters.push({ isExamOnly: true });
-        if (user.role !== 'admin') {
-            const classIds = await teacherClassIds(user);
+        if (!isAdmin(user)) {
+            const classIds = await managedClassIds(user);
             filters.push({
                 $or: [
                     { createdBy: user._id },
@@ -3124,37 +2919,23 @@ exports.getAllQuestionsPaginated = async (req, res) => {
             totalPages: Math.ceil(totalQuestions / limitNum) // Also include at root level for compatibility
         });
     } catch (err) {
-        console.error('[Get All Questions Paginated] Error:', err.message);
-        res.status(500).json({ error: 'Error fetching questions' });
+        sendError(res, err, 'Error fetching questions', 'getAllQuestionsPaginated');
     }
 };
 
 exports.editQuestion = async (req, res) => {
-    console.log('[Admin Edit Question] Editing Question:', req.params.questionId);
     try {
         const { questionId } = req.params;
         const user = req.user;
 
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Admin Edit Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can edit questions' });
-        }
         if (!isValidObjectId(questionId)) return res.status(400).json({ error: 'Invalid question ID' });
         if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'Question data is required' });
 
         // Ownership, publish state and class links are managed by their own endpoints.
-        const questionData = Object.fromEntries(
-            Object.entries(req.body).filter(([key]) => !DRAFT_PROTECTED_FIELDS.has(key) && key !== 'classIds' && key !== 'updatedAt'),
-        );
+        const questionData = pickQuestionFields(req.body);
 
-        const question = await Question.findById(questionId);
-        if (!question) {
-            console.error('[Admin Edit Question] Error: Not found');
-            return res.status(404).json({ error: 'Question not found' });
-        }
-        if (!(await canAccessQuestion(user, question))) {
-            return res.status(403).json({ error: 'You do not have access to this question' });
-        }
+        // 404 when missing, 403 unless admin, author, or teacher of a class that uses it.
+        const question = await assertQuestionManager(user, questionId);
 
         // Basic validation
         if (!questionData.type || !questionData.title) {
@@ -3348,19 +3129,18 @@ exports.editQuestion = async (req, res) => {
         applyDefaultSolutions(question);
         await question.save();
 
-        // Emit updates to associated classes
+        // Tell class rooms (which include students) that the question changed, but never push
+        // solutions, hidden test cases or correct answers over the socket.
         for (const classEntry of question.classes) {
             req.io.to(`class:${classEntry.classId}`).emit('questionUpdated', {
                 questionId: question._id,
-                updatedFields: questionData,
+                updatedFields: sanitizeQuestionForStudent(question, { classId: classEntry.classId }),
             });
         }
 
-        console.log('[Admin Edit Question] Question updated:', question._id);
         res.status(200).json({ message: 'Question updated successfully', question });
     } catch (err) {
-        console.error('[Admin Edit Question] Error:', err.message);
-        res.status(500).json({ error: 'Error editing question' });
+        sendError(res, err, 'Error editing question', 'editQuestion');
     }
 };
 
@@ -3369,7 +3149,7 @@ exports.deleteQuestion = async (req, res) => {
         const { questionId } = req.params;
         const user = req.user;
 
-        if (!['admin'].includes(user.role)) {
+        if (!isAdmin(user)) {
             return res.status(403).json({ error: 'Only admin can delete questions' });
         }
         if (!isValidObjectId(questionId)) {
@@ -3398,13 +3178,9 @@ exports.deleteQuestion = async (req, res) => {
         );
 
         await Submission.deleteMany({ questionId });
-        await Leaderboard.updateMany(
-            { classId: { $in: question.classes.map(c => c.classId) } },
-            { $pull: { attempts: { questionId } } }
-        );
+        await Leaderboard.removeQuestion({ classIds: question.classes.map(c => c.classId), questionId: question._id });
 
         await question.deleteOne();
-        console.log('[Admin Delete Question] Deleted:', questionId);
 
         // Emit deletion to associated classes
         for (const classEntry of question.classes) {
@@ -3413,70 +3189,52 @@ exports.deleteQuestion = async (req, res) => {
 
         res.status(200).json({ message: 'Question deleted successfully' });
     } catch (err) {
-        console.error('[Admin Delete Question] Error:', err.message);
-        res.status(500).json({ error: 'Error deleting question' });
+        sendError(res, err, 'Error deleting question', 'deleteQuestion');
     }
 };
 
 exports.searchQuestionsById = async (req, res) => {
-    console.log('[Search Questions By ID] Searching question:', req.query.questionId);
     try {
         const { questionId } = req.query;
         const user = req.user;
 
-        console.log('[Search Questions By ID] User:', user._id);
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Search Questions By ID] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can search questions' });
-        }
-
-        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
-            console.error('[Search Questions By ID] Error: Invalid questionId');
+        if (!questionId || !isValidObjectId(questionId)) {
             return res.status(400).json({ error: 'Valid questionId is required' });
         }
 
         const question = await Question.findById(questionId).lean();
         if (!question) {
-            console.error('[Search Questions By ID] Error: Question not found');
             return res.status(404).json({ error: 'Question not found' });
         }
-        if (!(await canAccessQuestion(user, question))) {
+        if (!(await canManageQuestion(user, question))) {
             return res.status(403).json({ error: 'You do not have access to this question' });
         }
 
-        console.log('[Search Questions By ID] Question found:', questionId);
         res.status(200).json({ question });
     } catch (err) {
-        console.error('[Search Questions By ID] Error:', err.message);
-        res.status(500).json({ error: 'Error searching question by ID' });
+        sendError(res, err, 'Error searching question by ID', 'searchQuestionsById');
     }
 };
 
 // Create draft question
 exports.createDraftQuestion = async (req, res) => {
-    console.log('[Create Draft Question] Started');
     try {
-        const questionData = req.body;
         const user = req.user;
 
-        console.log('[Create Draft Question] User:', user._id, '| Role:', user.role);
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Create Draft Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can create drafts' });
+        if (!canAuthorQuestions(user)) {
+            return res.status(403).json({ error: 'You do not have permission to create questions' });
         }
 
+        const questionData = pickQuestionFields(req.body);
+
         // Basic validation - drafts can have minimal data
-        if (!questionData || !questionData.type) {
-            console.error('[Create Draft Question] Error: Type missing');
+        if (!questionData.type) {
             return res.status(400).json({ error: 'Question type is required' });
         }
 
         // Validate question type
         const validTypes = ['singleCorrectMcq', 'multipleCorrectMcq', 'fillInTheBlanks', 'fillInTheBlanksCoding', 'coding', 'codingWithDriver'];
         if (!validTypes.includes(questionData.type)) {
-            console.error('[Create Draft Question] Error: Invalid type:', questionData.type);
             return res.status(400).json({ error: 'Invalid question type' });
         }
 
@@ -3497,25 +3255,18 @@ exports.createDraftQuestion = async (req, res) => {
 
         applyDefaultSolutions(draftQuestion);
         await draftQuestion.save();
-        console.log('[Create Draft Question] Draft saved:', draftQuestion._id);
 
         res.status(201).json({ message: 'Draft created successfully', question: draftQuestion });
     } catch (err) {
-        console.error('[Create Draft Question] Error:', err.message);
-        res.status(500).json({ error: 'Error creating draft' });
+        sendError(res, err, 'Error creating draft', 'createDraftQuestion');
     }
 };
 
 // Get all drafts
 exports.getDrafts = async (req, res) => {
-    console.log('[Get Drafts] Fetching drafts');
     try {
         const user = req.user;
         const { page = 1, limit = 20, search = '' } = req.query;
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            return res.status(403).json({ error: 'Only admin or teacher can view drafts' });
-        }
 
         const pageNum = Math.max(1, parseInt(page, 10) || 1);
         const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
@@ -3556,21 +3307,14 @@ exports.getDrafts = async (req, res) => {
             }
         });
     } catch (err) {
-        console.error('[Get Drafts] Error:', err.message);
-        res.status(500).json({ error: 'Error fetching drafts' });
+        sendError(res, err, 'Error fetching drafts', 'getDrafts');
     }
 };
 
 // Get draft count
 exports.getDraftCount = async (req, res) => {
-    console.log('[Get Draft Count] Fetching draft count');
     try {
         const user = req.user;
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Get Draft Count] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can view draft count' });
-        }
 
         const count = await Question.countDocuments({
             status: 'draft',
@@ -3578,30 +3322,19 @@ exports.getDraftCount = async (req, res) => {
             createdBy: user._id
         });
 
-        console.log('[Get Draft Count] Count:', count);
         res.status(200).json({ count });
     } catch (err) {
-        console.error('[Get Draft Count] Error:', err.message);
-        res.status(500).json({ error: 'Error fetching draft count' });
+        sendError(res, err, 'Error fetching draft count', 'getDraftCount');
     }
 };
 
 // Get single draft
 exports.getDraftQuestion = async (req, res) => {
-    console.log('[Get Draft Question] Fetching draft:', req.params.questionId);
     try {
         const { questionId } = req.params;
         const user = req.user;
 
-        console.log('[Get Draft Question] User:', user._id);
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Get Draft Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can view drafts' });
-        }
-
-        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
-            console.error('[Get Draft Question] Error: Invalid questionId');
+        if (!questionId || !isValidObjectId(questionId)) {
             return res.status(400).json({ error: 'Valid questionId is required' });
         }
 
@@ -3613,35 +3346,22 @@ exports.getDraftQuestion = async (req, res) => {
         }).lean();
 
         if (!question) {
-            console.error('[Get Draft Question] Error: Draft not found');
             return res.status(404).json({ error: 'Draft not found' });
         }
 
-        console.log('[Get Draft Question] Draft found:', questionId);
         res.status(200).json({ question });
     } catch (err) {
-        console.error('[Get Draft Question] Error:', err.message);
-        res.status(500).json({ error: 'Error fetching draft' });
+        sendError(res, err, 'Error fetching draft', 'getDraftQuestion');
     }
 };
 
 // Update draft
 exports.updateDraftQuestion = async (req, res) => {
-    console.log('[Update Draft Question] Updating draft:', req.params.questionId);
     try {
         const { questionId } = req.params;
-        const questionData = req.body;
         const user = req.user;
 
-        console.log('[Update Draft Question] User:', user._id);
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Update Draft Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can update drafts' });
-        }
-
-        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
-            console.error('[Update Draft Question] Error: Invalid questionId');
+        if (!questionId || !isValidObjectId(questionId)) {
             return res.status(400).json({ error: 'Valid questionId is required' });
         }
 
@@ -3653,51 +3373,36 @@ exports.updateDraftQuestion = async (req, res) => {
         });
 
         if (!question) {
-            console.error('[Update Draft Question] Error: Draft not found');
             return res.status(404).json({ error: 'Draft not found' });
         }
 
+        // Only content fields; ownership, publish state and class links are never taken from the body.
+        const questionData = pickQuestionFields(req.body);
         normalizeQuestionRichTextFields(questionData);
-
-        // Update question data
-        Object.keys(questionData).forEach(key => {
-            if (questionData[key] !== undefined) {
-                question[key] = questionData[key];
-            }
-        });
+        for (const [key, value] of Object.entries(questionData)) {
+            if (value !== undefined) question[key] = value;
+        }
 
         question.updatedAt = new Date();
         await question.save();
 
-        console.log('[Update Draft Question] Draft updated:', questionId);
         res.status(200).json({ message: 'Draft updated successfully', question });
     } catch (err) {
-        console.error('[Update Draft Question] Error:', err.message);
-        res.status(500).json({ error: 'Error updating draft' });
+        sendError(res, err, 'Error updating draft', 'updateDraftQuestion');
     }
 };
 
 // Publish draft (convert to published)
 exports.publishDraftQuestion = async (req, res) => {
-    console.log('[Publish Draft Question] Publishing draft:', req.params.questionId);
     try {
         const { questionId } = req.params;
-        const questionData = req.body; // Optional: final question data
         const user = req.user;
 
-        console.log('[Publish Draft Question] User:', user._id);
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Publish Draft Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can publish drafts' });
-        }
-
-        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
-            console.error('[Publish Draft Question] Error: Invalid questionId');
+        if (!questionId || !isValidObjectId(questionId)) {
             return res.status(400).json({ error: 'Valid questionId is required' });
         }
 
-        if (user.role === 'teacher' && !user.canCreateQuestion) {
+        if (!canAuthorQuestions(user)) {
             return res.status(403).json({ error: 'You do not have permission to publish questions' });
         }
 
@@ -3705,20 +3410,18 @@ exports.publishDraftQuestion = async (req, res) => {
             _id: questionId,
             status: 'draft',
             isDraft: true,
-            ...(user.role === 'admin' ? {} : { createdBy: user._id }),
+            ...(isAdmin(user) ? {} : { createdBy: user._id }),
         });
 
         if (!question) {
             return res.status(404).json({ error: 'Draft not found' });
         }
 
-        if (questionData && typeof questionData === 'object') {
-            normalizeQuestionRichTextFields(questionData);
-            Object.keys(questionData).forEach((key) => {
-                if (!DRAFT_PROTECTED_FIELDS.has(key) && questionData[key] !== undefined) {
-                    question[key] = questionData[key];
-                }
-            });
+        // Optional final edits, restricted to content fields.
+        const questionData = pickQuestionFields(req.body);
+        normalizeQuestionRichTextFields(questionData);
+        for (const [key, value] of Object.entries(questionData)) {
+            if (value !== undefined) question[key] = value;
         }
 
         const issues = getDraftIssues(question);
@@ -3735,30 +3438,19 @@ exports.publishDraftQuestion = async (req, res) => {
 
         await question.save();
 
-        console.log('[Publish Draft Question] Draft published:', questionId);
         res.status(200).json({ message: 'Question published successfully', question });
     } catch (err) {
-        console.error('[Publish Draft Question] Error:', err.message);
-        res.status(500).json({ error: 'Error publishing draft' });
+        sendError(res, err, 'Error publishing draft', 'publishDraftQuestion');
     }
 };
 
 // Delete draft
 exports.deleteDraftQuestion = async (req, res) => {
-    console.log('[Delete Draft Question] Deleting draft:', req.params.questionId);
     try {
         const { questionId } = req.params;
         const user = req.user;
 
-        console.log('[Delete Draft Question] User:', user._id);
-
-        if (!['admin', 'teacher'].includes(user.role)) {
-            console.warn('[Delete Draft Question] Error: Not authorized');
-            return res.status(403).json({ error: 'Only admin or teacher can delete drafts' });
-        }
-
-        if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
-            console.error('[Delete Draft Question] Error: Invalid questionId');
+        if (!questionId || !isValidObjectId(questionId)) {
             return res.status(400).json({ error: 'Valid questionId is required' });
         }
 
@@ -3770,48 +3462,38 @@ exports.deleteDraftQuestion = async (req, res) => {
         });
 
         if (!question) {
-            console.error('[Delete Draft Question] Error: Draft not found');
             return res.status(404).json({ error: 'Draft not found' });
         }
 
         await question.deleteOne();
 
-        console.log('[Delete Draft Question] Draft deleted:', questionId);
         res.status(200).json({ message: 'Draft deleted successfully' });
     } catch (err) {
-        console.error('[Delete Draft Question] Error:', err.message);
-        res.status(500).json({ error: 'Error deleting draft' });
+        sendError(res, err, 'Error deleting draft', 'deleteDraftQuestion');
     }
 };
 
 // Student Management Functions
 exports.editStudent = async (req, res) => {
-    console.log('[Edit Student] Editing student:', req.params.studentId);
     try {
         const { studentId } = req.params;
         const { name, email, number } = req.body;
         const user = req.user;
 
-        console.log('[Edit Student] User:', user._id, 'Role:', user.role);
-
-        if (!['admin'].includes(user.role)) {
-            console.warn('[Edit Student] Error: Not authorized');
+        if (!isAdmin(user)) {
             return res.status(403).json({ error: 'Only admin can edit students' });
         }
 
         if (!isValidObjectId(studentId)) {
-            console.error('[Edit Student] Error: Invalid studentId');
             return res.status(400).json({ error: 'Valid studentId is required' });
         }
 
         const student = await User.findById(studentId);
         if (!student) {
-            console.error('[Edit Student] Error: Student not found');
             return res.status(404).json({ error: 'Student not found' });
         }
 
         if (student.role !== 'student') {
-            console.error('[Edit Student] Error: User is not a student');
             return res.status(400).json({ error: 'User is not a student' });
         }
 
@@ -3837,8 +3519,7 @@ exports.editStudent = async (req, res) => {
         Object.assign(student, updateData);
         await student.save();
 
-        console.log('[Edit Student] Student updated:', studentId);
-        res.status(200).json({ 
+        res.status(200).json({
             message: 'Student updated successfully', 
             student: {
                 _id: student._id,
@@ -3848,37 +3529,29 @@ exports.editStudent = async (req, res) => {
             }
         });
     } catch (err) {
-        console.error('[Edit Student] Error:', err.message);
-        res.status(500).json({ error: 'Error editing student' });
+        sendError(res, err, 'Error editing student', 'editStudent');
     }
 };
 
 exports.deleteStudent = async (req, res) => {
-    console.log('[Delete Student] Deleting student:', req.params.studentId);
     try {
         const { studentId } = req.params;
         const user = req.user;
 
-        console.log('[Delete Student] User:', user._id, 'Role:', user.role);
-
-        if (!['admin'].includes(user.role)) {
-            console.warn('[Delete Student] Error: Not authorized');
+        if (!isAdmin(user)) {
             return res.status(403).json({ error: 'Only admin can delete students' });
         }
 
         if (!isValidObjectId(studentId)) {
-            console.error('[Delete Student] Error: Invalid studentId');
             return res.status(400).json({ error: 'Valid studentId is required' });
         }
 
         const student = await User.findById(studentId);
         if (!student) {
-            console.error('[Delete Student] Error: Student not found');
             return res.status(404).json({ error: 'Student not found' });
         }
 
         if (student.role !== 'student') {
-            console.error('[Delete Student] Error: User is not a student');
             return res.status(400).json({ error: 'User is not a student' });
         }
 
@@ -3897,10 +3570,8 @@ exports.deleteStudent = async (req, res) => {
         // Delete the student
         await student.deleteOne();
 
-        console.log('[Delete Student] Student deleted:', studentId);
         res.status(200).json({ message: 'Student deleted successfully' });
     } catch (err) {
-        console.error('[Delete Student] Error:', err.message);
-        res.status(500).json({ error: 'Error deleting student' });
+        sendError(res, err, 'Error deleting student', 'deleteStudent');
     }
 };

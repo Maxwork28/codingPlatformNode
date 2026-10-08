@@ -104,15 +104,13 @@ const questionSchema = new mongoose.Schema({
     },
     publishedAt: { type: Date },
     publishedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
-}, {
-    indexes: [
-        { key: { 'classes.classId': 1 } },
-        { key: { title: 'text', tags: 'text' } },
-        { key: { status: 1 } },
-        { key: { isDraft: 1 } },
-        { key: { createdBy: 1, status: 1 } }
-    ]
 });
+
+questionSchema.index({ 'classes.classId': 1 });
+questionSchema.index({ title: 'text', tags: 'text' });
+questionSchema.index({ status: 1, isDraft: 1 });
+questionSchema.index({ createdBy: 1, status: 1 });
+questionSchema.index({ examId: 1 });
 
 questionSchema.pre('save', function (next) {
     this.updatedAt = Date.now();
