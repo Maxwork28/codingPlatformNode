@@ -18,6 +18,7 @@ const authRoutes = require('./routes/auth');
 const questionRoutes = require('./routes/questionRoutes');
 const examRoutes = require('./routes/examRoutes');
 const aiCheckRoutes = require('./routes/aiCheckRoutes');
+const contactRoutes = require('./routes/contactRoutes');
 const Class = require('./models/Class');
 const { verifyToken, resolveUser } = require('./middleware/auth');
 const { sanitizeRequest } = require('./middleware/sanitize');
@@ -217,6 +218,7 @@ app.use('/admin', adminRoutes);
 app.use('/questions', questionRoutes);
 app.use('/exams', examRoutes);
 app.use('/ai-check', aiCheckRoutes);
+app.use('/contact', contactRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
