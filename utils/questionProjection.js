@@ -37,7 +37,7 @@ const STUDENT_FIELDS = [
 ];
 
 /** Mongo projection string for queries that only serve students. */
-const STUDENT_SELECT = [...STUDENT_FIELDS, 'classes', 'testCases', 'hints'].join(' ');
+const STUDENT_SELECT = [...STUDENT_FIELDS, 'classes', 'testCases', 'hints', 'checker.type', 'checker.tolerance'].join(' ');
 
 const publicTestCases = (testCases) =>
     (testCases || [])
@@ -64,6 +64,10 @@ const sanitizeQuestionForStudent = (question, opts = {}) => {
     out.testCases = publicTestCases(q.testCases);
     out.hiddenTestCaseCount = (q.testCases || []).filter((tc) => tc && !tc.isPublic).length;
     out.hasDriverCode = Array.isArray(q.driverCode) && q.driverCode.some((d) => d && d.code);
+    // How answers are compared (e.g. "within 1e-6"); a custom checker's code is never sent.
+    if (q.checker?.type && q.checker.type !== 'exact') {
+        out.checker = { type: q.checker.type, ...(q.checker.type === 'float' && q.checker.tolerance ? { tolerance: q.checker.tolerance } : {}) };
+    }
     if (opts.includeHints) out.hints = q.hints || [];
     if (opts.classId) {
         const entry = (q.classes || []).find((c) => String(c.classId?._id || c.classId) === String(opts.classId));

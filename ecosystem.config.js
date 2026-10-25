@@ -4,8 +4,8 @@
  *   pm2 start ecosystem.config.js --env production
  *   pm2 save && pm2 startup
  *
- * Default: ONE API process in fork mode running the judge locally (JUDGE_MODE=local). Nothing
- * here needs Redis.
+ * Default: ONE API process in fork mode that also runs the judge worker (JUDGE_WORKER=inline).
+ * The judge job queue lives in MongoDB, so nothing here needs Redis.
  *
  * Scaling (see ../DEPLOY.md "Scaling out"), all opt-in:
  *
@@ -14,20 +14,20 @@
  *      (or API_INSTANCES=max). PM2 cluster balances connections round-robin with NO stickiness,
  *      so Socket.IO clients must connect with transports: ['websocket'] (no long-polling), or run
  *      several fork-mode instances on different PORTs behind an nginx upstream with ip_hash.
- *      In local judge mode each API process gets its own JUDGE_CONCURRENCY budget: keep
- *      instances x JUDGE_CONCURRENCY below the vCPU count, or switch to JUDGE_MODE=queue.
+ *      With JUDGE_WORKER=inline every API process runs its own worker: keep
+ *      instances x JUDGE_CONCURRENCY below the vCPU count, or use external workers.
  *
- *   2. Judge workers - JUDGE_MODE=queue on the API (+ REDIS_URL) and one
- *      `algosutra-judge-worker` per judge host (Docker + judge images required there; the API
- *      host then runs no containers). On a judge-only host:
+ *   2. Separate judge worker process - set JUDGE_WORKER=external in .env. The API then only
+ *      queues jobs and this file also starts `algosutra-judge-worker` (Docker + judge images
+ *      needed on that host). On a judge-only host (same MONGO_URI):
  *          pm2 start ecosystem.config.js --only algosutra-judge-worker --env production
- *      To also run a worker on the API host, start with JUDGE_WORKER=1.
  */
 
 const apiInstances = process.env.API_INSTANCES || '1';
 const apiCluster = apiInstances !== '1';
 const isOnlyWorker = process.argv.some((a) => /algosutra-judge-worker/.test(a));
-const includeWorker = process.env.JUDGE_WORKER === '1' || isOnlyWorker;
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+const includeWorker = String(process.env.JUDGE_WORKER || '').toLowerCase() === 'external' || isOnlyWorker;
 
 const logDir = process.env.PM2_LOG_DIR || '/var/log/algosutra';
 
@@ -40,7 +40,7 @@ const apps = [
         exec_mode: apiCluster ? 'cluster' : 'fork',
         autorestart: true,
         max_memory_restart: '1G',
-        kill_timeout: 20000, // give in-flight judge runs time to finish on reload
+        kill_timeout: 20000, // inline worker: running jobs finish or are re-queued on reload
         listen_timeout: 15000,
         wait_ready: false,
         env: {
@@ -77,7 +77,7 @@ if (includeWorker) {
         env_production: {
             NODE_ENV: 'production',
             CONFIG_ROLE: 'worker',
-            // Needs REDIS_URL and JUDGE_* in .env; MONGO_URI / JWT_SECRET are not required.
+            // Needs MONGO_URI and JUDGE_* in .env; JWT_SECRET / CORS are not required.
         },
         out_file: `${logDir}/judge-worker.out.log`,
         error_file: `${logDir}/judge-worker.err.log`,

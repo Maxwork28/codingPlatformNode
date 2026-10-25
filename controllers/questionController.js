@@ -7,8 +7,8 @@ const { parseOptionalPoints, resolvePoints } = require('../utils/optionalPoints'
 const { applyDefaultSolutions } = require('../utils/buildDefaultSolutions');
 const { isS3Enabled, uploadQuestionImageToS3 } = require('../utils/s3');
 const {
+    checkerFromInput,
     compactTestResultsForStorage,
-    executeDockerCode,
     supportedLanguages,
     parseOptionalJudgeLimit,
     summarizeRunCaseMetrics,
@@ -16,6 +16,9 @@ const {
     fieldLimitsFromAverages,
 } = require('../utils/judge');
 const Question = require('../models/Question');
+const JudgeJob = require('../models/JudgeJob');
+const { enqueue, respondWithJob, waitForJob } = require('../services/judgeJobs');
+const { sanitizeTestResultsForStudent, staffTestResultRows } = require('../utils/judgeResults');
 const Submission = require('../models/Submission');
 const Class = require('../models/Class');
 const Leaderboard = require('../models/Leaderboard');
@@ -55,7 +58,7 @@ const EDITABLE_QUESTION_FIELDS = [
     'solutionLanguage', 'solutionCodes', 'level', 'type', 'options', 'correctOption', 'correctOptions',
     'correctAnswer', 'codeSnippet', 'starterCode', 'testCases', 'inputFormat', 'outputFormat', 'sampleIo',
     'constraints', 'examples', 'functionSignature', 'templateCode', 'driverCode', 'languages', 'timeLimit',
-    'memoryLimit', 'maxAttempts', 'explanation',
+    'memoryLimit', 'maxAttempts', 'explanation', 'checker',
 ];
 
 const pickEditableQuestionFields = (body = {}) => {
@@ -66,11 +69,12 @@ const pickEditableQuestionFields = (body = {}) => {
     // Typed answers and fill-the-code templates are compared / executed as plain text.
     if (typeof out.correctAnswer === 'string') out.correctAnswer = htmlToPlainText(out.correctAnswer).trim();
     if (typeof out.codeSnippet === 'string') out.codeSnippet = htmlToPlainText(out.codeSnippet);
+    if (out.checker !== undefined) out.checker = checkerFromInput(out.checker);
     return out;
 };
 
 /** Secret question fields that must never appear in list / search responses. */
-const LIST_HIDDEN_SELECT = '-solution -solutionCode -solutionCodes -driverCode -correctOption -correctOptions -correctAnswer';
+const LIST_HIDDEN_SELECT = '-solution -solutionCode -solutionCodes -driverCode -correctOption -correctOptions -correctAnswer -checker.code';
 
 const withTestCaseCount = (q) => {
     const obj = q && typeof q.toObject === 'function' ? q.toObject() : { ...q };
@@ -145,7 +149,8 @@ const loadStudentRunContext = async (user, questionId, classId, { label }) => {
     if (!classId || !mongoose.Types.ObjectId.isValid(String(classId))) throw httpError(400, 'A valid classId is required');
     if (!mongoose.Types.ObjectId.isValid(String(questionId))) throw httpError(400, 'Invalid question id');
     if (user.isBlocked?.get?.(String(classId))) throw httpError(403, `You are blocked from ${label} in this class`);
-    const question = await Question.findById(questionId);
+    // Test cases are not loaded here: the judge worker reads (and caches) them.
+    const question = await Question.findById(questionId).select('-testCases -solution -solutionCode -solutionCodes');
     const classEntry = await assertStudentCanViewQuestion(user, question, classId);
     if (classEntry.isDisabled) throw httpError(403, `Question is disabled for ${label} in this class`);
     return { question, classEntry };
@@ -219,32 +224,53 @@ const shouldWrapBareArrayStdinForQuestion = (question, language) =>
 const resolveFillInTheBlanksCodingCode = (question, answer, language) =>
     buildFillTheCodeProgram(question, answer, language);
 
-exports.executeDockerCode = executeDockerCode;
+/**
+ * Staff tools (teacher test, re-judge) still answer synchronously, but the code runs as a judge job
+ * so the API process never runs containers itself (external workers) and priorities apply.
+ * Resolves the job's result or throws an error carrying the job's status.
+ */
+const runStaffJudgeJob = async (user, kind, spec, timeoutMs = 200_000) => {
+    const { job } = await enqueue({ kind, ownerId: user._id, spec });
+    const done = await waitForJob(job._id, timeoutMs);
+    if (done?.status === 'done') return done.result;
+    if (done?.status === 'failed') throw httpError(done.error?.status || 500, done.error?.message || 'Code execution failed');
+    throw httpError(429, 'The code judge is overloaded. Please try again shortly.');
+};
+
 exports.shouldMergeDriverForLanguage = shouldMergeDriverForLanguage;
 exports.shouldWrapBareArrayStdinForQuestion = shouldWrapBareArrayStdinForQuestion;
 
-/** Student-facing test result rows with stable numbering and hidden I/O for private cases */
-const sanitizeTestResultsForStudent = (testResults = []) =>
-    testResults.map((r, index) => ({
-        testCaseNumber: index + 1,
-        passed: !!r.passed,
-        isPublic: r.isPublic !== false,
-        status: r.status,
-        isTLE: !!r.isTLE,
-        isMLE: !!r.isMLE,
-        timeMs: r.timeMs ?? null,
-        memoryKb: r.memoryKb ?? null,
-        ...(r.isPublic !== false
-            ? {
-                input: r.input,
-                output: r.output,
-                expected: r.expected,
-                error: r.error || null,
-            }
-            : {}),
-    }));
-
 exports.sanitizeTestResultsForStudent = sanitizeTestResultsForStudent;
+
+/**
+ * Final program for a coding answer: fill-the-code template or driver merge applied.
+ * Returns null when a fill-the-code question has no template for that language.
+ */
+const buildProgram = (question, answer, language) => {
+    if (question.type === 'fillInTheBlanksCoding') {
+        const code = resolveFillInTheBlanksCodingCode(question, answer, language);
+        return String(code || '').trim() ? code : null;
+    }
+    if (shouldMergeDriverForLanguage(question, language)) {
+        const driverCodeObj = question.driverCode.find((d) => d.language === language);
+        if (driverCodeObj && driverCodeObj.code) return mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
+    }
+    return answer;
+};
+
+/** Practice Submit attempts already used: stored submits + submits still being judged. */
+const submitAttemptsUsed = async (questionId, classId, studentId) => {
+    const [stored, pending] = await Promise.all([
+        Submission.countDocuments({ questionId, classId, studentId, isRun: false }),
+        JudgeJob.countDocuments({
+            kind: 'practice-submit',
+            status: { $in: ['queued', 'running'] },
+            'context.studentId': String(studentId),
+            'context.questionId': String(questionId),
+        }),
+    ]);
+    return stored + pending;
+};
 
 exports.submitAnswer = async (req, res) => {
     try {
@@ -252,34 +278,64 @@ exports.submitAnswer = async (req, res) => {
         const { answer, classId, language } = req.body;
         const user = req.user;
 
-        console.log('[Submission] User:', user._id, '| Question:', questionId, '| Class:', classId, '| Language:', language);
-
         if (!isStudent(user)) {
             return res.status(403).json({ error: 'Only students can submit answers' });
         }
 
         const { question } = await loadStudentRunContext(user, questionId, classId, { label: 'submitting' });
+        const coding = CODING_TYPES.includes(question.type);
 
         if (question.maxAttempts) {
-            const submissionCount = await Submission.countDocuments({
-                questionId,
-                classId,
-                studentId: user._id,
-                isRun: false
-            });
-            if (submissionCount >= question.maxAttempts) {
+            const used = coding
+                ? await submitAttemptsUsed(questionId, classId, user._id)
+                : await Submission.countDocuments({ questionId, classId, studentId: user._id, isRun: false });
+            if (used >= question.maxAttempts) {
                 return res.status(403).json({ error: 'Maximum submission attempts reached' });
             }
+        }
+
+        if (coding) {
+            if (!language || !question.languages.includes(language)) {
+                return res.status(400).json({ error: `Language ${language} is not supported for this question` });
+            }
+            if (typeof answer !== 'string' || !answer.trim()) {
+                return res.status(400).json({ error: 'Code is required' });
+            }
+            const code = buildProgram(question, answer, language);
+            if (code == null) return res.status(400).json({ error: 'Question is missing code snippet' });
+            const { job, duplicate } = await enqueue({
+                kind: 'practice-submit',
+                ownerId: user._id,
+                clientRequestId: req.body.clientRequestId,
+                spec: {
+                    language,
+                    code,
+                    questionId: String(question._id),
+                    testSet: 'all',
+                    timeLimit: question.timeLimit,
+                    memoryLimit: question.memoryLimit,
+                    wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+                    // Practice: stop at the first failing test (frees the judge sooner); exams run every test.
+                    stopOnFirstFail: true,
+                },
+                context: {
+                    classId: String(classId),
+                    questionId: String(question._id),
+                    studentId: String(user._id),
+                    answer,
+                    points: resolvePoints(question.points),
+                    questionType: question.type,
+                    explanation: question.explanation,
+                },
+            });
+            return respondWithJob(req, res, job, duplicate);
         }
 
         let isCorrect = false;
         let output = null;
         let score = 0;
-        let codeToExecute = answer;
         let passedTestCases = 0;
         let totalTestCases = 0;
-        let testResultsForResponse = null;
-        let submissionStatus;
 
         if (question.type === 'singleCorrectMcq') {
             isCorrect = parseInt(answer) === question.correctOption;
@@ -306,57 +362,6 @@ exports.submitAnswer = async (req, res) => {
             output = answer;
             passedTestCases = isCorrect ? 1 : 0;
             totalTestCases = 1;
-        } else if (CODING_TYPES.includes(question.type)) {
-            submissionStatus = 'wrong_answer';
-            if (!language || !question.languages.includes(language)) {
-                return res.status(400).json({ error: `Language ${language} is not supported for this question` });
-            }
-            if (typeof answer !== 'string' || !answer.trim()) {
-                return res.status(400).json({ error: 'Code is required' });
-            }
-            if (question.type === 'fillInTheBlanksCoding' && !question.codeSnippet && !question.starterCode?.length) {
-                return res.status(400).json({ error: 'Question is missing code snippet' });
-            }
-            try {
-                if (question.type === 'fillInTheBlanksCoding') {
-                    codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
-                } else if (shouldMergeDriverForLanguage(question, language)) {
-                    const driverCodeObj = question.driverCode.find(d => d.language === language);
-                    if (driverCodeObj && driverCodeObj.code) {
-                        codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
-                    }
-                }
-                const testResults = await executeDockerCode(
-                    language,
-                    codeToExecute,
-                    question.testCases,
-                    question.timeLimit,
-                    question.memoryLimit,
-                    { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
-                );
-                testResultsForResponse = testResults;
-                totalTestCases = testResults.length;
-                passedTestCases = testResults.filter(test => test.passed).length;
-                isCorrect = totalTestCases > 0 && testResults.every(test => test.passed);
-                score = isCorrect
-                    ? resolvePoints(question.points)
-                    : (totalTestCases ? Math.floor((passedTestCases / totalTestCases) * resolvePoints(question.points)) : 0);
-                const firstFail = testResults.find(t => !t.passed);
-                submissionStatus = isCorrect ? 'accepted' : (firstFail?.status || 'wrong_answer');
-                output = JSON.stringify(compactTestResultsForStorage(sanitizeTestResultsForStudent(testResults)));
-                console.log('[Submission] Judged:', passedTestCases, '/', totalTestCases, 'passed');
-            } catch (err) {
-                // Judge saturated (429) or other client-facing judge error: do not record an attempt.
-                if (isHttpError(err)) return sendError(res, err, 'Judge unavailable', 'Submission');
-                console.error('[Submission] Code execution failed:', err.message);
-                isCorrect = false;
-                score = 0;
-                const errLower = (err.message || '').toLowerCase();
-                submissionStatus = errLower.includes('timeout') ? 'tle' : errLower.includes('memory') || errLower.includes('oom') || errLower.includes('killed') ? 'mle' : 'runtime_error';
-                output = 'Error: code execution failed';
-                passedTestCases = 0;
-                totalTestCases = question.testCases.length;
-            }
         } else {
             return res.status(400).json({ error: 'Unsupported question type' });
         }
@@ -366,18 +371,15 @@ exports.submitAnswer = async (req, res) => {
             classId,
             studentId: user._id,
             answer,
-            language,
             isCorrect,
             score,
             output,
             isRun: false,
             passedTestCases,
             totalTestCases,
-            status: submissionStatus || (isCorrect ? 'accepted' : 'wrong_answer'),
-            testResults: testResultsForResponse ? compactTestResultsForStorage(testResultsForResponse) : undefined,
+            status: isCorrect ? 'accepted' : 'wrong_answer',
         });
         await submission.save();
-        console.log('[Submission] Saved submission:', submission._id);
 
         await Class.updateOne({ _id: classId }, { $inc: { totalSubmits: 1 } });
 
@@ -395,8 +397,9 @@ exports.submitAnswer = async (req, res) => {
             totalTestCases,
         });
 
-        req.io?.to(`class:${classId}`).emit('analyticsUpdated', { classId });
-        req.io?.to(`class:${classId}`).emit('submissionUpdate', {
+        const staff = `class:${classId}:staff`;
+        req.io?.to(staff).emit('analyticsUpdated', { classId });
+        req.io?.to(staff).emit('submissionUpdate', {
             classId,
             studentId: user._id,
             submissionId: submission._id,
@@ -407,19 +410,13 @@ exports.submitAnswer = async (req, res) => {
 
         const submissionJson = submission.toObject();
         delete submissionJson.testResults;
-        const responsePayload = {
+        res.status(200).json({
             message: 'Answer submitted successfully',
             submission: submissionJson,
             passedTestCases,
             totalTestCases,
             explanation: question.explanation,
-        };
-        if (testResultsForResponse) {
-            responsePayload.testResults = sanitizeTestResultsForStudent(testResultsForResponse);
-            responsePayload.publicTestCases = testResultsForResponse.filter((t) => t.isPublic).length;
-            responsePayload.hiddenTestCases = testResultsForResponse.filter((t) => !t.isPublic).length;
-        }
-        res.status(200).json(responsePayload);
+        });
     } catch (err) {
         return sendError(res, err, 'Error submitting answer', 'Submission');
     }
@@ -430,7 +427,6 @@ exports.runQuestion = async (req, res) => {
         const { questionId } = req.params;
         const { answer, classId, language } = req.body;
         const user = req.user;
-        console.log('[Run Question] User:', user._id, '| Question:', questionId, '| Class:', classId, '| Language:', language);
 
         if (!isStudent(user)) {
             return res.status(403).json({ error: 'Only students can run code' });
@@ -441,97 +437,38 @@ exports.runQuestion = async (req, res) => {
         if (!CODING_TYPES.includes(question.type)) {
             return res.status(400).json({ error: 'Only coding, fillInTheBlanksCoding, or codingWithDriver questions can be run' });
         }
-
         if (!language || !question.languages.includes(language)) {
             return res.status(400).json({ error: `Language ${language} is not supported for this question` });
         }
         if (typeof answer !== 'string' || !answer.trim()) {
             return res.status(400).json({ error: 'Code is required' });
         }
-
-        let codeToExecute = answer;
-        if (question.type === 'fillInTheBlanksCoding') {
-            codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
-            if (!codeToExecute) {
-                return res.status(400).json({ error: 'Question is missing code snippet' });
-            }
-        } else if (shouldMergeDriverForLanguage(question, language)) {
-            const driverCodeObj = question.driverCode.find(d => d.language === language);
-            if (driverCodeObj && driverCodeObj.code) {
-                codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
-            }
-        }
+        const code = buildProgram(question, answer, language);
+        if (code == null) return res.status(400).json({ error: 'Question is missing code snippet' });
 
         // Runs only ever execute public test cases, so stored results contain no hidden I/O.
-        const publicTestCases = question.testCases.filter(tc => tc.isPublic);
-        if (publicTestCases.length === 0) {
-            return res.status(400).json({ error: 'No public test cases available for this question' });
-        }
-
-        let testResults;
-        try {
-            testResults = await executeDockerCode(
+        const { job, duplicate } = await enqueue({
+            kind: 'practice-run',
+            ownerId: user._id,
+            clientRequestId: req.body.clientRequestId,
+            spec: {
                 language,
-                codeToExecute,
-                publicTestCases,
-                question.timeLimit,
-                question.memoryLimit,
-                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
-            );
-        } catch (err) {
-            return sendError(res, err, 'Code execution failed', 'Run Question');
-        }
-
-        const passedCount = testResults.filter(test => test.passed).length;
-        const isCorrect = testResults.length > 0 && testResults.every(test => test.passed);
-        const firstFail = testResults.find(t => !t.passed);
-        const runStatus = isCorrect ? 'accepted' : (firstFail?.status || 'wrong_answer');
-        const sanitizedRunResults = sanitizeTestResultsForStudent(testResults);
-
-        const submission = new Submission({
-            questionId,
-            classId,
-            studentId: user._id,
-            answer,
-            language,
-            isCorrect,
-            score: 0, // No score for run
-            output: JSON.stringify(compactTestResultsForStorage(sanitizedRunResults)),
-            isRun: true,
-            passedTestCases: passedCount,
-            totalTestCases: testResults.length,
-            status: runStatus,
-            testResults: compactTestResultsForStorage(sanitizedRunResults),
+                code,
+                questionId: String(question._id),
+                testSet: 'public',
+                timeLimit: question.timeLimit,
+                memoryLimit: question.memoryLimit,
+                wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+            },
+            context: {
+                classId: String(classId),
+                questionId: String(question._id),
+                studentId: String(user._id),
+                answer,
+                explanation: question.explanation,
+            },
         });
-        await submission.save();
-        console.log('[Run Question] Saved run:', submission._id, passedCount, '/', testResults.length, 'passed');
-
-        await Class.updateOne({ _id: classId }, { $inc: { totalRuns: 1 } });
-        await Leaderboard.recordRun({ classId, studentId: user._id });
-
-        req.io?.to(`class:${classId}`).emit('analyticsUpdated', { classId });
-        req.io?.to(`class:${classId}`).emit('codeRun', {
-            classId,
-            studentId: user._id,
-            submissionId: submission._id,
-            isCorrect,
-            passedTestCases: passedCount,
-            totalTestCases: testResults.length
-        });
-
-        const submissionJson = submission.toObject();
-        delete submissionJson.testResults;
-        res.status(200).json({
-            message: 'Code run successfully',
-            submission: submissionJson,
-            testResults: sanitizedRunResults,
-            passedTestCases: passedCount,
-            totalTestCases: testResults.length,
-            publicTestCases: testResults.filter((t) => t.isPublic).length,
-            hiddenTestCases: testResults.filter((t) => !t.isPublic).length,
-            isCorrect,
-            explanation: question.explanation
-        });
+        return respondWithJob(req, res, job, duplicate);
     } catch (err) {
         return sendError(res, err, 'Error running code', 'Run Question');
     }
@@ -543,8 +480,6 @@ exports.runWithCustomInput = async (req, res) => {
         const { answer, classId, language, customInput, expectedOutput } = req.body;
         const user = req.user;
 
-        console.log('[Run With Custom Input] User:', user._id, '| Question:', questionId, '| Class:', classId, '| Language:', language);
-
         if (!isStudent(user)) {
             return res.status(403).json({ error: 'Only students can run code with custom input' });
         }
@@ -554,96 +489,45 @@ exports.runWithCustomInput = async (req, res) => {
         if (!CODING_TYPES.includes(question.type)) {
             return res.status(400).json({ error: 'Only coding, fillInTheBlanksCoding, or codingWithDriver questions can be run' });
         }
-
         if (!language || !question.languages.includes(language)) {
             return res.status(400).json({ error: `Language ${language} is not supported for this question` });
         }
         if (typeof answer !== 'string' || !answer.trim()) {
             return res.status(400).json({ error: 'Code is required' });
         }
-
         if (!customInput || typeof customInput !== 'string' || !customInput.trim()) {
             return res.status(400).json({ error: 'Valid custom input is required' });
         }
-
         if (expectedOutput && typeof expectedOutput !== 'string') {
             return res.status(400).json({ error: 'Expected output must be a string' });
         }
+        const code = buildProgram(question, answer, language);
+        if (code == null) return res.status(400).json({ error: 'Question is missing code snippet' });
 
-        let codeToExecute = answer;
-        if (question.type === 'fillInTheBlanksCoding') {
-            codeToExecute = resolveFillInTheBlanksCodingCode(question, answer, language);
-            if (!codeToExecute) {
-                return res.status(400).json({ error: 'Question is missing code snippet' });
-            }
-        } else if (shouldMergeDriverForLanguage(question, language)) {
-            const driverCodeObj = question.driverCode.find(d => d.language === language);
-            if (driverCodeObj && driverCodeObj.code) {
-                codeToExecute = mergeDriverWithUserAnswer(driverCodeObj.code, answer, { language });
-            }
-        }
-
-        const customTestCase = [{
-            input: customInput,
-            expectedOutput: expectedOutput || '',
-            isPublic: true
-        }];
-
-        let testResults;
-        try {
-            testResults = await executeDockerCode(
+        const { job, duplicate } = await enqueue({
+            kind: 'practice-custom',
+            ownerId: user._id,
+            clientRequestId: req.body.clientRequestId,
+            spec: {
                 language,
-                codeToExecute,
-                customTestCase,
-                question.timeLimit,
-                question.memoryLimit,
-                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
-            );
-        } catch (err) {
-            return sendError(res, err, 'Code execution failed', 'Run With Custom Input');
-        }
-
-        const customResult = testResults[0];
-        const submission = new Submission({
-            questionId,
-            classId,
-            studentId: user._id,
-            answer,
-            language,
-            isCorrect: Boolean(customResult?.passed) && expectedOutput !== undefined,
-            score: 0, // No score for custom input run
-            output: JSON.stringify(compactTestResultsForStorage(testResults)),
-            isRun: true,
-            isCustomInput: true,
-            passedTestCases: customResult?.passed ? 1 : 0,
-            totalTestCases: 1,
-            testResults: compactTestResultsForStorage(testResults),
+                code,
+                questionId: String(question._id),
+                testSet: 'custom',
+                customTests: [{ input: customInput, expectedOutput: expectedOutput || '', isPublic: true }],
+                timeLimit: question.timeLimit,
+                memoryLimit: question.memoryLimit,
+                wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+            },
+            context: {
+                classId: String(classId),
+                questionId: String(question._id),
+                studentId: String(user._id),
+                answer,
+                hasExpectedOutput: expectedOutput !== undefined && expectedOutput !== '',
+                explanation: question.explanation,
+            },
         });
-        await submission.save();
-        console.log('[Run With Custom Input] Saved custom run:', submission._id);
-
-        await Class.updateOne({ _id: classId }, { $inc: { totalRuns: 1 } });
-        await Leaderboard.recordRun({ classId, studentId: user._id });
-
-        req.io?.to(`class:${classId}`).emit('customInputRun', {
-            classId,
-            studentId: user._id,
-            submissionId: submission._id,
-            customInput,
-            expectedOutput
-        });
-
-        const submissionJson = submission.toObject();
-        delete submissionJson.testResults;
-        res.status(200).json({
-            message: 'Code run with custom input successfully',
-            submission: submissionJson,
-            testResults: customResult,
-            actualOutput: customResult?.output,
-            timeMs: customResult?.timeMs ?? null,
-            memoryKb: customResult?.memoryKb ?? null,
-            explanation: question.explanation
-        });
+        return respondWithJob(req, res, job, duplicate);
     } catch (err) {
         return sendError(res, err, 'Error running code with custom input', 'Run With Custom Input');
     }
@@ -1367,22 +1251,6 @@ exports.searchQuestions = async (req, res) => {
 };
 
 /** Full (staff) test result rows: stable numbering plus input/expected for every case. */
-const staffTestResultRows = (rawResults = []) =>
-    rawResults.map((r, index) => ({
-        testCaseNumber: r.testCaseNumber ?? index + 1,
-        passed: !!r.passed,
-        isPublic: r.isPublic !== false,
-        status: r.status,
-        isTLE: !!r.isTLE,
-        isMLE: !!r.isMLE,
-        timeMs: r.timeMs ?? null,
-        memoryKb: r.memoryKb ?? null,
-        input: r.input,
-        output: r.output,
-        expected: r.expected,
-        error: r.error || null,
-    }));
-
 exports.viewSubmissionCode = async (req, res) => {
     try {
         const { submissionId } = req.params;
@@ -1465,14 +1333,16 @@ exports.viewSubmissionCode = async (req, res) => {
         }
         let rawResults;
         try {
-            rawResults = await executeDockerCode(
+            const out = await runStaffJudgeJob(user, 'staff-rejudge', {
                 language,
-                codeToExecute,
-                question.testCases,
-                question.timeLimit || 2,
-                question.memoryLimit || 256,
-                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
-            );
+                code: codeToExecute,
+                questionId: String(qId),
+                testSet: 'all',
+                timeLimit: question.timeLimit || 2,
+                memoryLimit: question.memoryLimit || 256,
+                wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+            });
+            rawResults = out.testResults || [];
         } catch (rerunErr) {
             if (isHttpError(rerunErr)) return sendError(res, rerunErr, 'Judge unavailable', 'View Submission Code');
             console.warn('[View Submission Code] Re-judge failed:', rerunErr.message);
@@ -2066,13 +1936,6 @@ exports.teacherTestQuestion = async (req, res) => {
         const timeLimit = overrideTime ?? (question.timeLimit || 2);
         const memoryLimit = overrideMemory ?? (question.memoryLimit || 256);
 
-        // Execute public tests only for Run; all tests for Submit
-        const testsToRun = publicOnly
-            ? (question.testCases.filter((tc) => tc.isPublic).length
-                ? question.testCases.filter((tc) => tc.isPublic)
-                : question.testCases)
-            : question.testCases;
-
         let runCount = Number.parseInt(req.body.runs, 10);
         if (!Number.isFinite(runCount) || runCount < 1) runCount = 1;
         runCount = Math.min(10, runCount);
@@ -2080,19 +1943,21 @@ exports.teacherTestQuestion = async (req, res) => {
         let testResults;
         let benchmark = null;
         try {
-            const wrapOpts = { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) };
-
+            // Run: public tests (all tests when there are none); Submit: every test; benchmark: one probe test N times.
+            const out = await runStaffJudgeJob(user, 'teacher-test', {
+                language,
+                code: codeToExecute,
+                questionId: String(question._id),
+                testSet: runCount > 1 ? 'probe' : publicOnly ? 'public' : 'all',
+                publicFallbackToAll: true,
+                repeats: runCount,
+                timeLimit,
+                memoryLimit,
+                wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+            });
+            testResults = out.testResults;
             if (runCount > 1) {
-                const probe = testsToRun.find((tc) => tc.isPublic) || testsToRun[0];
-                const runSummaries = [];
-                testResults = await executeDockerCode(
-                    language,
-                    codeToExecute,
-                    [probe],
-                    timeLimit,
-                    memoryLimit,
-                    { ...wrapOpts, repeats: runCount, repeatSummaries: runSummaries }
-                );
+                const runSummaries = out.repeatSummaries || [];
                 const avgTimeMs = averageNumbers(runSummaries.map((row) => row.maxTimeMs));
                 const avgMemoryKb = averageNumbers(runSummaries.map((row) => row.maxMemoryKb));
                 const fields = fieldLimitsFromAverages(avgTimeMs, avgMemoryKb);
@@ -2104,26 +1969,9 @@ exports.teacherTestQuestion = async (req, res) => {
                     memoryLimit: fields.memoryLimit,
                     runSummaries,
                 };
-            } else {
-                testResults = await executeDockerCode(
-                    language,
-                    codeToExecute,
-                    testsToRun,
-                    timeLimit,
-                    memoryLimit,
-                    wrapOpts
-                );
             }
         } catch (err) {
-            // 429 JudgeBusyError (and other client-facing judge errors) propagate with their own status.
-            if (isHttpError(err)) return sendError(res, err, 'Judge unavailable', 'Teacher Test Question');
-            console.error('[Teacher Test Question] Code execution failed:', err.message);
-            const missingImage = /No such image|no such container/i.test(err.message || '');
-            return res.status(500).json({
-                error: missingImage
-                    ? 'Code execution failed: Docker image not found. Please build Docker images first.'
-                    : 'Code execution failed',
-            });
+            return sendError(res, err, 'Code execution failed', 'Teacher Test Question');
         }
 
         if (!Array.isArray(testResults) || testResults.length === 0) {
@@ -2226,19 +2074,19 @@ exports.teacherTestWithCustomInput = async (req, res) => {
         // Execute with custom input
         let testResults;
         try {
-            testResults = await executeDockerCode(
+            const out = await runStaffJudgeJob(user, 'teacher-custom', {
                 language,
-                codeToExecute,
-                customTestCase,
-                question.timeLimit,
-                question.memoryLimit,
-                { wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language) }
-            );
+                code: codeToExecute,
+                questionId: String(question._id),
+                testSet: 'custom',
+                customTests: customTestCase,
+                timeLimit: question.timeLimit,
+                memoryLimit: question.memoryLimit,
+                wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+            });
+            testResults = out.testResults || [];
         } catch (err) {
-            // 429 JudgeBusyError (and other client-facing judge errors) propagate with their own status.
-            if (isHttpError(err)) return sendError(res, err, 'Judge unavailable', 'Teacher Test With Custom Input');
-            console.error('[Teacher Test With Custom Input] Code execution failed:', err.message);
-            return res.status(500).json({ error: 'Code execution failed' });
+            return sendError(res, err, 'Code execution failed', 'Teacher Test With Custom Input');
         }
 
         const testResult = testResults[0] || {};

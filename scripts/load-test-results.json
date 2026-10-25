@@ -1,0 +1,1015 @@
+{
+  "meta": {
+    "date": "2026-10-08T00:37:19.077Z",
+    "host": {
+      "platform": "win32",
+      "release": "10.0.26200",
+      "cpus": 8,
+      "cpuModel": "Intel(R) Core(TM) i7-8665U CPU @ 1.90GHz",
+      "memGb": 17,
+      "node": "v24.14.1"
+    },
+    "students": 300,
+    "teachers": 20,
+    "classes": 5,
+    "judgeConcurrency": 4,
+    "note": "Single machine: load generator, API, MongoDB and Docker judge all share these CPUs. Treat absolute numbers as a lower bound for a dedicated EC2 instance.",
+    "finalHealth": {
+      "status": "ok",
+      "uptimeSeconds": 279,
+      "mongo": "up",
+      "docker": "up",
+      "judge": {
+        "concurrency": 4,
+        "maxQueue": 200,
+        "active": 0,
+        "queued": 0,
+        "started": 101,
+        "completed": 101,
+        "rejected": 0,
+        "timedOutWaiting": 0,
+        "peakActive": 4,
+        "peakQueued": 24
+      },
+      "version": null
+    },
+    "serverMemoryMb": null
+  },
+  "scenarios": [
+    {
+      "name": "Login (bcrypt cost 10)",
+      "group": "auth",
+      "concurrency": 25,
+      "durationSec": 8.9,
+      "requests": 321,
+      "rps": 35.9,
+      "okPct": 100,
+      "p50": 600.9,
+      "p95": 1152.1,
+      "p99": 1230.3,
+      "max": 1282.6,
+      "mean": 662,
+      "statuses": {
+        "200": 321
+      },
+      "endpoints": {
+        "POST /auth/login": {
+          "count": 321,
+          "okPct": 100,
+          "p50": 600.9,
+          "p95": 1152.1
+        }
+      },
+      "note": "All users log in once; concurrency 25. bcrypt dominates CPU here."
+    },
+    {
+      "name": "Students browsing",
+      "group": "browse",
+      "concurrency": 25,
+      "durationSec": 13,
+      "requests": 1146,
+      "rps": 87.9,
+      "okPct": 100,
+      "p50": 127.7,
+      "p95": 531.1,
+      "p99": 897.7,
+      "max": 1059.2,
+      "mean": 180.6,
+      "statuses": {
+        "200": 1146
+      },
+      "endpoints": {
+        "GET /auth/me": {
+          "count": 191,
+          "okPct": 100,
+          "p50": 47,
+          "p95": 150.9
+        },
+        "GET /admin/classes": {
+          "count": 191,
+          "okPct": 100,
+          "p50": 139.4,
+          "p95": 551.6
+        },
+        "GET class questions": {
+          "count": 191,
+          "okPct": 100,
+          "p50": 232.2,
+          "p95": 931.6
+        },
+        "GET question": {
+          "count": 191,
+          "okPct": 100,
+          "p50": 149.9,
+          "p95": 412
+        },
+        "GET leaderboard": {
+          "count": 191,
+          "okPct": 100,
+          "p50": 108.7,
+          "p95": 296.9
+        },
+        "GET class exams": {
+          "count": 191,
+          "okPct": 100,
+          "p50": 147.3,
+          "p95": 375.9
+        }
+      },
+      "note": "6 read requests per loop + 200-500 ms think time"
+    },
+    {
+      "name": "Students browsing",
+      "group": "browse",
+      "concurrency": 50,
+      "durationSec": 30.1,
+      "requests": 882,
+      "rps": 29.3,
+      "okPct": 100,
+      "p50": 846.9,
+      "p95": 4991.8,
+      "p99": 10677.6,
+      "max": 11500.5,
+      "mean": 1433.3,
+      "statuses": {
+        "200": 882
+      },
+      "endpoints": {
+        "GET /auth/me": {
+          "count": 147,
+          "okPct": 100,
+          "p50": 249.6,
+          "p95": 983.3
+        },
+        "GET /admin/classes": {
+          "count": 147,
+          "okPct": 100,
+          "p50": 863.4,
+          "p95": 3012.7
+        },
+        "GET class questions": {
+          "count": 147,
+          "okPct": 100,
+          "p50": 1829.2,
+          "p95": 10693.1
+        },
+        "GET question": {
+          "count": 147,
+          "okPct": 100,
+          "p50": 1178.2,
+          "p95": 4807.6
+        },
+        "GET leaderboard": {
+          "count": 147,
+          "okPct": 100,
+          "p50": 605.7,
+          "p95": 1446.6
+        },
+        "GET class exams": {
+          "count": 147,
+          "okPct": 100,
+          "p50": 966.4,
+          "p95": 2174.4
+        }
+      },
+      "note": "6 read requests per loop + 200-500 ms think time"
+    },
+    {
+      "name": "Students browsing",
+      "group": "browse",
+      "concurrency": 100,
+      "durationSec": 17.3,
+      "requests": 1200,
+      "rps": 69.2,
+      "okPct": 100,
+      "p50": 1115.4,
+      "p95": 3240.4,
+      "p99": 3623.2,
+      "max": 3774.3,
+      "mean": 1290.3,
+      "statuses": {
+        "200": 1200
+      },
+      "endpoints": {
+        "GET /auth/me": {
+          "count": 200,
+          "okPct": 100,
+          "p50": 510.5,
+          "p95": 962.5
+        },
+        "GET /admin/classes": {
+          "count": 200,
+          "okPct": 100,
+          "p50": 1311.9,
+          "p95": 1549.8
+        },
+        "GET class questions": {
+          "count": 200,
+          "okPct": 100,
+          "p50": 2516,
+          "p95": 3628.9
+        },
+        "GET question": {
+          "count": 200,
+          "okPct": 100,
+          "p50": 1100.7,
+          "p95": 1850.7
+        },
+        "GET leaderboard": {
+          "count": 200,
+          "okPct": 100,
+          "p50": 855.5,
+          "p95": 1497.1
+        },
+        "GET class exams": {
+          "count": 200,
+          "okPct": 100,
+          "p50": 1088.2,
+          "p95": 1760.6
+        }
+      },
+      "note": "6 read requests per loop + 200-500 ms think time"
+    },
+    {
+      "name": "Students browsing",
+      "group": "browse",
+      "concurrency": 150,
+      "durationSec": 18.3,
+      "requests": 1230,
+      "rps": 67.1,
+      "okPct": 100,
+      "p50": 1595.4,
+      "p95": 3354.4,
+      "p99": 3589.5,
+      "max": 3982.4,
+      "mean": 1663.4,
+      "statuses": {
+        "200": 1230
+      },
+      "endpoints": {
+        "GET /auth/me": {
+          "count": 205,
+          "okPct": 100,
+          "p50": 581.5,
+          "p95": 978
+        },
+        "GET /admin/classes": {
+          "count": 205,
+          "okPct": 100,
+          "p50": 1691.4,
+          "p95": 2065.7
+        },
+        "GET class questions": {
+          "count": 205,
+          "okPct": 100,
+          "p50": 2596.2,
+          "p95": 2909.8
+        },
+        "GET question": {
+          "count": 205,
+          "okPct": 100,
+          "p50": 1312.2,
+          "p95": 1670.5
+        },
+        "GET leaderboard": {
+          "count": 205,
+          "okPct": 100,
+          "p50": 1638.6,
+          "p95": 2168.6
+        },
+        "GET class exams": {
+          "count": 205,
+          "okPct": 100,
+          "p50": 3182.9,
+          "p95": 3624.5
+        }
+      },
+      "note": "6 read requests per loop + 200-500 ms think time"
+    },
+    {
+      "name": "Students browsing",
+      "group": "browse",
+      "concurrency": 200,
+      "durationSec": 13.8,
+      "requests": 1206,
+      "rps": 87.5,
+      "okPct": 100,
+      "p50": 1864.6,
+      "p95": 4198.9,
+      "p99": 4362.4,
+      "max": 4691.2,
+      "mean": 2068.6,
+      "statuses": {
+        "200": 1206
+      },
+      "endpoints": {
+        "GET /auth/me": {
+          "count": 201,
+          "okPct": 100,
+          "p50": 743.9,
+          "p95": 1032.7
+        },
+        "GET /admin/classes": {
+          "count": 201,
+          "okPct": 100,
+          "p50": 1916.8,
+          "p95": 2195
+        },
+        "GET class questions": {
+          "count": 201,
+          "okPct": 100,
+          "p50": 4085,
+          "p95": 4473.1
+        },
+        "GET question": {
+          "count": 201,
+          "okPct": 100,
+          "p50": 2374.3,
+          "p95": 2590.5
+        },
+        "GET leaderboard": {
+          "count": 201,
+          "okPct": 100,
+          "p50": 1674.2,
+          "p95": 1925.3
+        },
+        "GET class exams": {
+          "count": 201,
+          "okPct": 100,
+          "p50": 1751.1,
+          "p95": 2321.2
+        }
+      },
+      "note": "6 read requests per loop + 200-500 ms think time"
+    },
+    {
+      "name": "Teachers on dashboards/reports",
+      "group": "teacher",
+      "concurrency": 5,
+      "durationSec": 12.8,
+      "requests": 399,
+      "rps": 31.1,
+      "okPct": 100,
+      "p50": 57.2,
+      "p95": 228.4,
+      "p99": 467.4,
+      "max": 701.3,
+      "mean": 83.1,
+      "statuses": {
+        "200": 399
+      },
+      "endpoints": {
+        "GET /admin/dashboard": {
+          "count": 57,
+          "okPct": 100,
+          "p50": 84.6,
+          "p95": 467.4
+        },
+        "GET /admin/classes": {
+          "count": 57,
+          "okPct": 100,
+          "p50": 66.2,
+          "p95": 266.9
+        },
+        "GET class overview": {
+          "count": 57,
+          "okPct": 100,
+          "p50": 87.4,
+          "p95": 224.1
+        },
+        "GET participant-stats": {
+          "count": 57,
+          "okPct": 100,
+          "p50": 31.7,
+          "p95": 110.7
+        },
+        "GET leaderboard": {
+          "count": 57,
+          "okPct": 100,
+          "p50": 24.2,
+          "p95": 116.6
+        },
+        "GET question report": {
+          "count": 57,
+          "okPct": 100,
+          "p50": 68.3,
+          "p95": 209.8
+        },
+        "GET /exams": {
+          "count": 57,
+          "okPct": 100,
+          "p50": 52.8,
+          "p95": 217.7
+        }
+      },
+      "note": "7 aggregate/report requests per loop + think time"
+    },
+    {
+      "name": "Teachers on dashboards/reports",
+      "group": "teacher",
+      "concurrency": 10,
+      "durationSec": 12.8,
+      "requests": 539,
+      "rps": 42.2,
+      "okPct": 100,
+      "p50": 123.4,
+      "p95": 381.4,
+      "p99": 519.9,
+      "max": 547.3,
+      "mean": 159.7,
+      "statuses": {
+        "200": 539
+      },
+      "endpoints": {
+        "GET /admin/dashboard": {
+          "count": 77,
+          "okPct": 100,
+          "p50": 196.5,
+          "p95": 524.2
+        },
+        "GET /admin/classes": {
+          "count": 77,
+          "okPct": 100,
+          "p50": 191.6,
+          "p95": 350.7
+        },
+        "GET class overview": {
+          "count": 77,
+          "okPct": 100,
+          "p50": 239,
+          "p95": 390.1
+        },
+        "GET participant-stats": {
+          "count": 77,
+          "okPct": 100,
+          "p50": 90.4,
+          "p95": 202.5
+        },
+        "GET leaderboard": {
+          "count": 77,
+          "okPct": 100,
+          "p50": 80.7,
+          "p95": 176.9
+        },
+        "GET question report": {
+          "count": 77,
+          "okPct": 100,
+          "p50": 175.6,
+          "p95": 299.5
+        },
+        "GET /exams": {
+          "count": 77,
+          "okPct": 100,
+          "p50": 99.5,
+          "p95": 209
+        }
+      },
+      "note": "7 aggregate/report requests per loop + think time"
+    },
+    {
+      "name": "Teachers on dashboards/reports",
+      "group": "teacher",
+      "concurrency": 20,
+      "durationSec": 14.8,
+      "requests": 581,
+      "rps": 39.3,
+      "okPct": 100,
+      "p50": 424.8,
+      "p95": 813.1,
+      "p99": 925,
+      "max": 1124.9,
+      "mean": 423.5,
+      "statuses": {
+        "200": 581
+      },
+      "endpoints": {
+        "GET /admin/dashboard": {
+          "count": 83,
+          "okPct": 100,
+          "p50": 618.9,
+          "p95": 850.3
+        },
+        "GET /admin/classes": {
+          "count": 83,
+          "okPct": 100,
+          "p50": 527,
+          "p95": 755.5
+        },
+        "GET class overview": {
+          "count": 83,
+          "okPct": 100,
+          "p50": 578,
+          "p95": 925
+        },
+        "GET participant-stats": {
+          "count": 83,
+          "okPct": 100,
+          "p50": 188.8,
+          "p95": 464.2
+        },
+        "GET leaderboard": {
+          "count": 83,
+          "okPct": 100,
+          "p50": 188.4,
+          "p95": 363.2
+        },
+        "GET question report": {
+          "count": 83,
+          "okPct": 100,
+          "p50": 528.5,
+          "p95": 816.4
+        },
+        "GET /exams": {
+          "count": 83,
+          "okPct": 100,
+          "p50": 353.3,
+          "p95": 524
+        }
+      },
+      "note": "7 aggregate/report requests per loop + think time"
+    },
+    {
+      "name": "Students submitting MCQ answers",
+      "group": "mcq",
+      "concurrency": 50,
+      "durationSec": 13.4,
+      "requests": 414,
+      "rps": 30.8,
+      "okPct": 100,
+      "p50": 1288.2,
+      "p95": 2163.8,
+      "p99": 2695.5,
+      "max": 3076,
+      "mean": 1324.8,
+      "statuses": {
+        "200": 414
+      },
+      "endpoints": {
+        "POST submit (MCQ)": {
+          "count": 414,
+          "okPct": 100,
+          "p50": 1288.2,
+          "p95": 2163.8
+        }
+      },
+      "note": "Writes Submission, Class counters ($inc) and Leaderboard (optimistic concurrency with retry)"
+    },
+    {
+      "name": "Students submitting MCQ answers",
+      "group": "mcq",
+      "concurrency": 100,
+      "durationSec": 15.1,
+      "requests": 384,
+      "rps": 25.5,
+      "okPct": 100,
+      "p50": 3501,
+      "p95": 4603.6,
+      "p99": 4942.4,
+      "max": 5224.7,
+      "mean": 3492.5,
+      "statuses": {
+        "200": 384
+      },
+      "endpoints": {
+        "POST submit (MCQ)": {
+          "count": 384,
+          "okPct": 100,
+          "p50": 3501,
+          "p95": 4603.6
+        }
+      },
+      "note": "Writes Submission, Class counters ($inc) and Leaderboard (optimistic concurrency with retry)"
+    },
+    {
+      "name": "Students submitting MCQ answers",
+      "group": "mcq",
+      "concurrency": 150,
+      "durationSec": 13.4,
+      "requests": 645,
+      "rps": 48,
+      "okPct": 100,
+      "p50": 2793.9,
+      "p95": 3823.9,
+      "p99": 4109,
+      "max": 4238,
+      "mean": 2755.9,
+      "statuses": {
+        "200": 645
+      },
+      "endpoints": {
+        "POST submit (MCQ)": {
+          "count": 645,
+          "okPct": 100,
+          "p50": 2793.9,
+          "p95": 3823.9
+        }
+      },
+      "note": "Writes Submission, Class counters ($inc) and Leaderboard (optimistic concurrency with retry)"
+    },
+    {
+      "name": "Students running code (judge)",
+      "group": "judge",
+      "concurrency": 1,
+      "durationSec": 0.6,
+      "requests": 1,
+      "rps": 1.6,
+      "okPct": 100,
+      "p50": 616,
+      "p95": 616,
+      "p99": 616,
+      "max": 616,
+      "mean": 616,
+      "statuses": {
+        "200": 1
+      },
+      "endpoints": {
+        "POST run (python)": {
+          "count": 1,
+          "okPct": 100,
+          "p50": 616,
+          "p95": 616
+        }
+      },
+      "note": "one run each, simultaneously; judge concurrency 4, queue 200",
+      "judge": {
+        "peakActive": 1,
+        "peakQueued": 0,
+        "rejected": 0
+      }
+    },
+    {
+      "name": "Students running code (judge)",
+      "group": "judge",
+      "concurrency": 4,
+      "durationSec": 1.3,
+      "requests": 4,
+      "rps": 3.1,
+      "okPct": 100,
+      "p50": 1287.6,
+      "p95": 1293.7,
+      "p99": 1293.7,
+      "max": 1293.7,
+      "mean": 1246.1,
+      "statuses": {
+        "200": 4
+      },
+      "endpoints": {
+        "POST run (python)": {
+          "count": 4,
+          "okPct": 100,
+          "p50": 1287.6,
+          "p95": 1293.7
+        }
+      },
+      "note": "one run each, simultaneously; judge concurrency 4, queue 200",
+      "judge": {
+        "peakActive": 4,
+        "peakQueued": 0,
+        "rejected": 0
+      }
+    },
+    {
+      "name": "Students running code (judge)",
+      "group": "judge",
+      "concurrency": 8,
+      "durationSec": 2.9,
+      "requests": 8,
+      "rps": 2.8,
+      "okPct": 100,
+      "p50": 2652.6,
+      "p95": 2902.8,
+      "p99": 2902.8,
+      "max": 2902.8,
+      "mean": 2070.2,
+      "statuses": {
+        "200": 8
+      },
+      "endpoints": {
+        "POST run (python)": {
+          "count": 8,
+          "okPct": 100,
+          "p50": 2652.6,
+          "p95": 2902.8
+        }
+      },
+      "note": "one run each, simultaneously; judge concurrency 4, queue 200",
+      "judge": {
+        "peakActive": 4,
+        "peakQueued": 4,
+        "rejected": 0
+      }
+    },
+    {
+      "name": "Students running code (judge)",
+      "group": "judge",
+      "concurrency": 16,
+      "durationSec": 5.5,
+      "requests": 16,
+      "rps": 2.9,
+      "okPct": 100,
+      "p50": 3826.5,
+      "p95": 5478.2,
+      "p99": 5478.2,
+      "max": 5478.2,
+      "mean": 3409.3,
+      "statuses": {
+        "200": 16
+      },
+      "endpoints": {
+        "POST run (python)": {
+          "count": 16,
+          "okPct": 100,
+          "p50": 3826.5,
+          "p95": 5478.2
+        }
+      },
+      "note": "one run each, simultaneously; judge concurrency 4, queue 200",
+      "judge": {
+        "peakActive": 4,
+        "peakQueued": 12,
+        "rejected": 0
+      }
+    },
+    {
+      "name": "Students running code (judge)",
+      "group": "judge",
+      "concurrency": 28,
+      "durationSec": 13.7,
+      "requests": 28,
+      "rps": 2,
+      "okPct": 100,
+      "p50": 6078.7,
+      "p95": 13433.1,
+      "p99": 13656,
+      "max": 13656,
+      "mean": 6698.4,
+      "statuses": {
+        "200": 28
+      },
+      "endpoints": {
+        "POST run (python)": {
+          "count": 28,
+          "okPct": 100,
+          "p50": 6078.7,
+          "p95": 13433.1
+        }
+      },
+      "note": "one run each, simultaneously; judge concurrency 4, queue 200",
+      "judge": {
+        "peakActive": 4,
+        "peakQueued": 24,
+        "rejected": 0
+      }
+    },
+    {
+      "name": "Students submitting code (judge)",
+      "group": "judge",
+      "concurrency": 4,
+      "durationSec": 4.8,
+      "requests": 4,
+      "rps": 0.8,
+      "okPct": 100,
+      "p50": 4811.5,
+      "p95": 4821.4,
+      "p99": 4821.4,
+      "max": 4821.4,
+      "mean": 4715.7,
+      "statuses": {
+        "200": 4
+      },
+      "endpoints": {
+        "POST submit (coding, 4 tests)": {
+          "count": 4,
+          "okPct": 100,
+          "p50": 4811.5,
+          "p95": 4821.4
+        }
+      },
+      "note": "one submit each (all 4 tests), simultaneously"
+    },
+    {
+      "name": "Students submitting code (judge)",
+      "group": "judge",
+      "concurrency": 16,
+      "durationSec": 11.2,
+      "requests": 16,
+      "rps": 1.4,
+      "okPct": 100,
+      "p50": 9039.7,
+      "p95": 11228.3,
+      "p99": 11228.3,
+      "max": 11228.3,
+      "mean": 7550,
+      "statuses": {
+        "200": 16
+      },
+      "endpoints": {
+        "POST submit (coding, 4 tests)": {
+          "count": 16,
+          "okPct": 100,
+          "p50": 9039.7,
+          "p95": 11228.3
+        }
+      },
+      "note": "one submit each (all 4 tests), simultaneously"
+    },
+    {
+      "name": "Students taking an exam",
+      "group": "exam",
+      "concurrency": 50,
+      "durationSec": 7.9,
+      "requests": 450,
+      "rps": 56.7,
+      "okPct": 100,
+      "p50": 740,
+      "p95": 1545.1,
+      "p99": 1727.3,
+      "max": 1801.7,
+      "mean": 828.2,
+      "statuses": {
+        "200": 450
+      },
+      "endpoints": {
+        "POST exam start": {
+          "count": 50,
+          "okPct": 100,
+          "p50": 1243.3,
+          "p95": 1347.4
+        },
+        "POST exam save answer": {
+          "count": 150,
+          "okPct": 100,
+          "p50": 908.5,
+          "p95": 1690.1
+        },
+        "POST exam heartbeat": {
+          "count": 150,
+          "okPct": 100,
+          "p50": 573,
+          "p95": 784.7
+        },
+        "GET exam attempt": {
+          "count": 50,
+          "okPct": 100,
+          "p50": 811.1,
+          "p95": 1004.1
+        },
+        "POST exam submit": {
+          "count": 50,
+          "okPct": 100,
+          "p50": 473.2,
+          "p95": 572.6
+        }
+      },
+      "note": "start → 3 answer saves + heartbeats → attempt → submit, all students at once"
+    },
+    {
+      "name": "Students taking an exam",
+      "group": "exam",
+      "concurrency": 100,
+      "durationSec": 11.6,
+      "requests": 900,
+      "rps": 77.5,
+      "okPct": 100,
+      "p50": 1279.4,
+      "p95": 1624.4,
+      "p99": 1737,
+      "max": 1811.5,
+      "mean": 1226.4,
+      "statuses": {
+        "200": 900
+      },
+      "endpoints": {
+        "POST exam start": {
+          "count": 100,
+          "okPct": 100,
+          "p50": 1469.9,
+          "p95": 1535.8
+        },
+        "POST exam save answer": {
+          "count": 300,
+          "okPct": 100,
+          "p50": 1417.2,
+          "p95": 1646.2
+        },
+        "POST exam heartbeat": {
+          "count": 300,
+          "okPct": 100,
+          "p50": 1054.1,
+          "p95": 1332.1
+        },
+        "GET exam attempt": {
+          "count": 100,
+          "okPct": 100,
+          "p50": 1514.9,
+          "p95": 1762.9
+        },
+        "POST exam submit": {
+          "count": 100,
+          "okPct": 100,
+          "p50": 890.1,
+          "p95": 1118.1
+        }
+      },
+      "note": "start → 3 answer saves + heartbeats → attempt → submit, all students at once"
+    },
+    {
+      "name": "Mixed classroom (100 browse + 30 MCQ + 8 coding + 8 teachers)",
+      "group": "mixed",
+      "concurrency": 146,
+      "durationSec": 31,
+      "requests": 2211,
+      "rps": 71.3,
+      "okPct": 100,
+      "p50": 1682.2,
+      "p95": 3481.6,
+      "p99": 4566.4,
+      "max": 10328,
+      "mean": 1767.2,
+      "statuses": {
+        "200": 2211
+      },
+      "endpoints": {
+        "POST submit (MCQ)": {
+          "count": 275,
+          "okPct": 100,
+          "p50": 2404.2,
+          "p95": 3782.9
+        },
+        "POST run (python)": {
+          "count": 24,
+          "okPct": 100,
+          "p50": 9328.5,
+          "p95": 10310.1
+        },
+        "GET /auth/me": {
+          "count": 300,
+          "okPct": 100,
+          "p50": 364.5,
+          "p95": 622.8
+        },
+        "GET /admin/classes": {
+          "count": 316,
+          "okPct": 100,
+          "p50": 1529.8,
+          "p95": 1905.6
+        },
+        "GET class questions": {
+          "count": 300,
+          "okPct": 100,
+          "p50": 2266.2,
+          "p95": 3481.6
+        },
+        "GET question": {
+          "count": 300,
+          "okPct": 100,
+          "p50": 1331.5,
+          "p95": 1790.4
+        },
+        "GET leaderboard": {
+          "count": 316,
+          "okPct": 100,
+          "p50": 2168.6,
+          "p95": 3081.9
+        },
+        "GET class exams": {
+          "count": 300,
+          "okPct": 100,
+          "p50": 1461.5,
+          "p95": 2468.2
+        },
+        "GET /admin/dashboard": {
+          "count": 16,
+          "okPct": 100,
+          "p50": 3339.3,
+          "p95": 3459.6
+        },
+        "GET class overview": {
+          "count": 16,
+          "okPct": 100,
+          "p50": 3222.5,
+          "p95": 3755.1
+        },
+        "GET participant-stats": {
+          "count": 16,
+          "okPct": 100,
+          "p50": 1219.3,
+          "p95": 1523.7
+        },
+        "GET question report": {
+          "count": 16,
+          "okPct": 100,
+          "p50": 3495.6,
+          "p95": 4106.5
+        },
+        "GET /exams": {
+          "count": 16,
+          "okPct": 100,
+          "p50": 2016.9,
+          "p95": 2693.1
+        }
+      },
+      "note": "All user types at once for 25 s"
+    }
+  ]
+}

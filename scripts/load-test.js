@@ -311,12 +311,12 @@ const healthSnapshot = async () => (await api('GET', '/health')).json;
         // ---- Scenario D: coding runs through the Docker judge (one wave per level)
         const codeRun = async (ctx, n, i) => {
             const q = ctx.coding[i % ctx.coding.length];
-            const r = await api('POST', `/questions/${q._id}/run`, { token: ctx.token, body: { answer: 'print(input())', classId: ctx.classId, language: 'python' }, timeoutMs: 180_000 });
+            const r = await api('POST', `/questions/${q._id}/run?wait=1`, { token: ctx.token, body: { answer: 'print(input())', classId: ctx.classId, language: 'python' }, timeoutMs: 180_000 });
             return { label: 'POST run (python)', status: r.status, ms: r.ms };
         };
         const codeSubmit = async (ctx, n, i) => {
             const q = ctx.coding[i % ctx.coding.length];
-            const r = await api('POST', `/questions/${q._id}/submit`, { token: ctx.token, body: { answer: 'print(input())', classId: ctx.classId, language: 'python' }, timeoutMs: 180_000 });
+            const r = await api('POST', `/questions/${q._id}/submit?wait=1`, { token: ctx.token, body: { answer: 'print(input())', classId: ctx.classId, language: 'python' }, timeoutMs: 180_000 });
             return { label: 'POST submit (coding, 4 tests)', status: r.status, ms: r.ms };
         };
         for (const c of pick([1, 7, 14, 28, 56], [1, 4, 8, 16, 28], [7, 20])) {

@@ -30,6 +30,7 @@ const {
     sendError,
 } = require('../utils/access');
 const { htmlToPlainText } = require('../utils/answerText');
+const { checkerFromInput } = require('../utils/judge');
 const mongoose = require('mongoose');
 const supportedLanguages = ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go'];
 
@@ -130,7 +131,7 @@ const ALLOWED_QUESTION_FIELDS = [
     'solutionCodes', 'level', 'type', 'options', 'correctOption', 'correctOptions', 'correctAnswer', 'codeSnippet',
     'starterCode', 'testCases', 'inputFormat', 'outputFormat', 'sampleIo', 'constraints', 'examples',
     'functionSignature', 'templateCode', 'driverCode', 'languages', 'timeLimit', 'memoryLimit', 'maxAttempts',
-    'explanation',
+    'explanation', 'checker',
 ];
 const ALLOWED_QUESTION_FIELD_SET = new Set(ALLOWED_QUESTION_FIELDS);
 
@@ -143,6 +144,7 @@ function pickQuestionFields(body) {
     // Typed answers and fill-the-code templates are compared / executed as plain text, never HTML.
     if (typeof out.correctAnswer === 'string') out.correctAnswer = htmlToPlainText(out.correctAnswer).trim();
     if (typeof out.codeSnippet === 'string') out.codeSnippet = htmlToPlainText(out.codeSnippet);
+    if (out.checker !== undefined) out.checker = checkerFromInput(out.checker);
     return out;
 }
 

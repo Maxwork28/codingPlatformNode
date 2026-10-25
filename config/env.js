@@ -9,8 +9,8 @@
 require('dotenv').config();
 
 /**
- * CONFIG_ROLE=worker (set by workers/judgeWorker.js) skips the API-only checks (MONGO_URI,
- * JWT_SECRET, CORS): a judge worker host only needs REDIS_URL plus the JUDGE_* variables.
+ * CONFIG_ROLE=worker (set by workers/judgeWorker.js) skips the API-only checks (JWT_SECRET, CORS):
+ * a judge worker needs MONGO_URI (the job queue lives in MongoDB) plus the JUDGE_* variables.
  */
 const role = String(process.env.CONFIG_ROLE || 'api').trim().toLowerCase() === 'worker' ? 'worker' : 'api';
 const isWorker = role === 'worker';
@@ -38,7 +38,7 @@ const list = (name) =>
         .filter(Boolean);
 
 const mongoUri = str('MONGO_URI');
-if (!mongoUri && !isWorker) fail('MONGO_URI is required');
+if (!mongoUri) fail('MONGO_URI is required');
 
 const jwtSecret = str('JWT_SECRET');
 if (isWorker) {
@@ -62,20 +62,18 @@ if (!corsOrigins.length && !isWorker) {
 const redisUrl = str('REDIS_URL', '');
 
 /**
- * JUDGE_MODE:
- *   local (default) - this process runs judge containers itself (in-process semaphore).
- *   queue           - the API enqueues runs on BullMQ (Redis); workers/judgeWorker.js executes them.
- *                     Needs REDIS_URL; without it we fall back to local so nothing breaks.
+ * JUDGE_WORKER (where code is judged; the job queue itself is in MongoDB):
+ *   inline   (default) the API process also runs the judge worker
+ *   external the API only queues jobs; run `node workers/judgeWorker.js` on the judge host
  */
-const requestedJudgeMode = str('JUDGE_MODE', 'local').toLowerCase();
-let judgeMode = 'local';
-if (requestedJudgeMode === 'queue') {
-    if (redisUrl) judgeMode = 'queue';
-    else if (!isWorker) console.warn('[config] JUDGE_MODE=queue needs REDIS_URL; falling back to JUDGE_MODE=local');
-} else if (requestedJudgeMode !== 'local') {
-    console.warn(`[config] Unknown JUDGE_MODE '${requestedJudgeMode}'; using local`);
+const requestedJudgeWorker = str('JUDGE_WORKER', 'inline').toLowerCase();
+if (!['inline', 'external'].includes(requestedJudgeWorker)) {
+    console.warn(`[config] Unknown JUDGE_WORKER '${requestedJudgeWorker}'; using inline`);
 }
-if (isWorker && !redisUrl) fail('REDIS_URL is required for the judge worker');
+const judgeWorkerMode = requestedJudgeWorker === 'external' ? 'external' : 'inline';
+if (process.env.JUDGE_MODE && !isWorker) {
+    console.warn('[config] JUDGE_MODE is no longer used (the judge queue is in MongoDB now). Use JUDGE_WORKER=inline|external.');
+}
 
 const config = {
     role,
@@ -100,7 +98,7 @@ const config = {
      */
     apiPublicUrl: str('API_PUBLIC_URL', isProd ? '' : `http://localhost:${int('PORT', 5000)}`).replace(/\/+$/, ''),
     redisUrl,
-    judgeMode,
+    judgeWorkerMode,
     logLevel: str('LOG_LEVEL', isProd ? 'info' : 'debug'),
     bodyLimit: str('BODY_LIMIT', '2mb'),
     rateLimits: {

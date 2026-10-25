@@ -40,6 +40,7 @@ const Class = require('../models/Class');
 const Question = require('../models/Question');
 const Submission = require('../models/Submission');
 const Leaderboard = require('../models/Leaderboard');
+const JudgeJob = require('../models/JudgeJob');
 
 const args = process.argv.slice(2);
 const TAG = '[LOAD TEST';
@@ -323,6 +324,7 @@ const cleanup = async (runId) => {
     const out = {
         submissions: (await Submission.deleteMany({ $or: [{ classId: { $in: classIds } }, { questionId: { $in: questionIds } }] })).deletedCount,
         leaderboardRows: (await Leaderboard.deleteMany({ classId: { $in: classIds } })).deletedCount,
+        judgeJobs: (await JudgeJob.deleteMany({ ownerId: { $in: userIds } })).deletedCount,
         questions: (await Question.deleteMany({ _id: { $in: questionIds } })).deletedCount,
         classes: (await Class.deleteMany({ _id: { $in: classIds } })).deletedCount,
         users: (await User.deleteMany({ _id: { $in: userIds } })).deletedCount,
@@ -472,11 +474,11 @@ const printRow = (kind, r) => console.log(
         const codeFor = (lang) => (heavy ? PAIRS_CODE : ECHO_CODE)[lang];
         const body = (code, lang) => ({ answer: code, classId: String(cls._id), language: lang });
         const doRun = (lang, code = codeFor(lang)) => async (s) => {
-            const r = await api('POST', `/questions/${question._id}/run`, { token: s.token, body: body(code, lang) });
+            const r = await api('POST', `/questions/${question._id}/run?wait=1`, { token: s.token, body: body(code, lang) });
             return { ...r, correct: r.json?.isCorrect === true, reason: wrongReason(r) };
         };
         const doSubmit = (lang, code = codeFor(lang)) => async (s) => {
-            const r = await api('POST', `/questions/${question._id}/submit`, { token: s.token, body: body(code, lang) });
+            const r = await api('POST', `/questions/${question._id}/submit?wait=1`, { token: s.token, body: body(code, lang) });
             return { ...r, correct: r.json?.submission?.isCorrect === true, reason: wrongReason(r) };
         };
 

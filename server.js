@@ -19,12 +19,14 @@ const questionRoutes = require('./routes/questionRoutes');
 const examRoutes = require('./routes/examRoutes');
 const aiCheckRoutes = require('./routes/aiCheckRoutes');
 const contactRoutes = require('./routes/contactRoutes');
+const judgeRoutes = require('./routes/judgeRoutes');
 const Class = require('./models/Class');
 const { verifyToken, resolveUser } = require('./middleware/auth');
 const { sanitizeRequest } = require('./middleware/sanitize');
 const { authLimiter, apiLimiter, judgeLimiterIfJudgePath, closeRateLimitStore } = require('./middleware/rateLimit');
-const { cleanupStaleJudgeArtifacts, dockerHealthy, getJudgeQueueStats } = require('./utils/judge');
-const { getJudgeMode, getRemoteQueueStats, closeJudgeRemote, setJudgeRemoteLogger } = require('./utils/judgeRemote');
+const { cleanupStaleJudgeArtifacts, dockerHealthy, calibrateLanguages, getBaselines } = require('./utils/judge');
+const { JobWorker, JobNotifier, queueStats, judgeSettings } = require('./services/judgeJobs');
+const { handlers: judgeHandlers } = require('./services/judgeKinds');
 
 const logger = pino({
     level: config.logLevel,
@@ -37,7 +39,6 @@ if (config.isProd && config.logLevel !== 'debug') {
     console.debug = () => {};
 }
 
-setJudgeRemoteLogger(logger);
 
 const app = express();
 const server = http.createServer(app);
@@ -157,6 +158,8 @@ io.on('connection', (socket) => {
                 return;
             }
             socket.join(`class:${classId}`);
+            // Live Run / Submit activity of students goes to staff only.
+            if (user.role !== 'student') socket.join(`class:${classId}:staff`);
             if (typeof ack === 'function') ack({ ok: true });
         } catch (err) {
             logger.warn({ err: err.message }, 'joinClass failed');
@@ -165,7 +168,10 @@ io.on('connection', (socket) => {
     });
 
     socket.on('leaveClass', (classId) => {
-        if (OBJECT_ID.test(String(classId))) socket.leave(`class:${classId}`);
+        if (OBJECT_ID.test(String(classId))) {
+            socket.leave(`class:${classId}`);
+            socket.leave(`class:${classId}:staff`);
+        }
     });
 });
 
@@ -195,20 +201,22 @@ app.use((req, _res, next) => {
 app.get('/health/live', (_req, res) => res.json({ status: 'ok' }));
 app.get('/health', async (_req, res) => {
     const mongoUp = mongoose.connection.readyState === 1;
-    const queueMode = getJudgeMode() === 'queue';
-    const [dockerUp, judgeQueue] = await Promise.all([dockerHealthy(), queueMode ? getRemoteQueueStats() : null]);
-    // In queue mode containers run on the worker hosts: the API host needs Redis + at least one
-    // worker instead of a local Docker daemon. workers === null means Redis cannot list clients.
-    const judgeUp = queueMode ? judgeQueue.redis === 'up' && judgeQueue.workers !== 0 : dockerUp;
+    const external = judgeSettings().mode === 'external';
+    const [dockerUp, judge] = await Promise.all([
+        external ? Promise.resolve(null) : dockerHealthy(),
+        mongoUp ? queueStats(judgeWorker).catch(() => null) : null,
+    ]);
+    // External mode: containers run on the worker hosts, so the API needs a live worker instead of Docker.
+    const judgeUp = external ? Boolean(judge?.workers?.length) : Boolean(dockerUp);
     const status = mongoUp && judgeUp ? 'ok' : 'degraded';
     res.status(mongoUp ? 200 : 503).json({
         status,
         uptimeSeconds: Math.round(process.uptime()),
         mongo: mongoUp ? 'up' : 'down',
-        docker: dockerUp ? 'up' : queueMode ? 'not-required' : 'down',
-        judgeMode: queueMode ? 'queue' : 'local',
-        judge: getJudgeQueueStats(),
-        ...(queueMode ? { judgeQueue } : {}),
+        docker: external ? 'not-required' : dockerUp ? 'up' : 'down',
+        judgeMode: external ? 'external' : 'inline',
+        judge,
+        ...(judgeWorker ? { judgeBaselinesMs: getBaselines() } : {}),
         version: process.env.APP_VERSION || null,
     });
 });
@@ -219,6 +227,7 @@ app.use('/questions', questionRoutes);
 app.use('/exams', examRoutes);
 app.use('/ai-check', aiCheckRoutes);
 app.use('/contact', contactRoutes);
+app.use('/judge', judgeRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
@@ -245,6 +254,9 @@ app.use((err, req, res, next) => {
 // ---------------------------------------------------------------------------
 // Boot / shutdown
 // ---------------------------------------------------------------------------
+let judgeWorker = null;
+let judgeNotifier = null;
+
 let shuttingDown = false;
 const shutdown = async (signal, code = 0) => {
     if (shuttingDown) return;
@@ -253,10 +265,12 @@ const shutdown = async (signal, code = 0) => {
     const force = setTimeout(() => process.exit(code || 1), 15_000).unref();
     try {
         await new Promise((resolve) => server.close(resolve));
+        judgeNotifier?.stop();
+        // Jobs still running finish here or are re-queued by another worker's sweep (exam grading is retried).
+        if (judgeWorker) await judgeWorker.stop(10_000);
         io.close();
         await Promise.allSettled([
             mongoose.disconnect(),
-            closeJudgeRemote(),
             closeRateLimitStore(),
             ...adapterClients.map((c) => c.quit()),
         ]);
@@ -295,13 +309,15 @@ const start = async () => {
         }
 
         await setupRedisAdapter();
-        if (getJudgeMode() === 'queue') {
-            // This process never starts containers; connect to the queue early so problems show at boot.
-            const q = await getRemoteQueueStats();
-            if (q.redis === 'up') logger.info({ workers: q.workers, waiting: q.waiting }, 'Judge mode: queue (BullMQ)');
-            else logger.warn({ error: q.error }, 'Judge mode: queue, but the judge queue is not reachable yet');
+        judgeNotifier = new JobNotifier({ io, logger });
+        judgeNotifier.start();
+        if (judgeSettings().mode === 'external') {
+            logger.info('Judge mode: external (run workers/judgeWorker.js on the judge host)');
         } else {
             await cleanupStaleJudgeArtifacts();
+            judgeWorker = new JobWorker({ handlers: judgeHandlers, mode: 'inline', logger });
+            await judgeWorker.start();
+            calibrateLanguages().then((ms) => logger.info({ baselinesMs: ms }, 'Judge start-up baselines measured')).catch(() => {});
         }
 
         server.timeout = 180_000;

@@ -21,6 +21,9 @@ const answerSchema = new mongoose.Schema({
     language: { type: String }, // For coding questions
     passedTestCases: { type: Number, default: 0 },
     totalTestCases: { type: Number, default: 0 },
+    /** Coding answers are stored instantly and graded by a judge job: pending -> done | error. */
+    gradingStatus: { type: String, enum: ['pending', 'done', 'error'] },
+    gradingError: { type: String },
     savedAt: { type: Date }
 }, { _id: false });
 

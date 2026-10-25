@@ -90,6 +90,24 @@ const questionSchema = new mongoose.Schema({
     }],
     timeLimit: { type: Number, default: 2 },
     memoryLimit: { type: Number, default: 256 },
+    /**
+     * How program output is compared with the expected output (coding questions):
+     *   exact (default) | token | float (tolerance) | ignoreCase | custom (teacher checker program)
+     * Custom checker: argv = <input file> <expected file> <student output file>; print "OK" to accept,
+     * anything else (e.g. "WA reason") to reject; a crash is a checker error.
+     */
+    checker: {
+        type: {
+            type: String,
+            enum: ['exact', 'token', 'float', 'ignoreCase', 'custom'],
+        },
+        tolerance: { type: Number },
+        language: {
+            type: String,
+            enum: ['javascript', 'c', 'cpp', 'java', 'python', 'php', 'ruby', 'go']
+        },
+        code: { type: String },
+    },
     maxAttempts: { type: Number },
     explanation: { type: String },
     // Draft-related fields

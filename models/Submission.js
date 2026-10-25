@@ -40,9 +40,12 @@ const submissionSchema = new mongoose.Schema({
   totalTestCases: { type: Number, default: 0 },
   status: {
     type: String,
-    enum: ['accepted', 'wrong_answer', 'tle', 'mle', 'runtime_error', 'compile_error'],
+    // pending: exam answer saved, grading job not finished yet
+    enum: ['accepted', 'wrong_answer', 'tle', 'mle', 'runtime_error', 'compile_error', 'checker_error', 'pending'],
     default: 'accepted'
   },
+  /** Practice runs expire (RUN_RETENTION_DAYS); submits and exam answers never set this. */
+  expiresAt: { type: Date },
   /** Full (un-sanitized) per-test results so staff views never need to re-judge. */
   testResults: { type: mongoose.Schema.Types.Mixed, select: false },
   aiCheck: { type: aiCheckSchema, select: false }
@@ -52,5 +55,6 @@ submissionSchema.index({ classId: 1, questionId: 1, studentId: 1, isRun: 1, subm
 submissionSchema.index({ studentId: 1, submittedAt: -1 });
 submissionSchema.index({ questionId: 1, isRun: 1, submittedAt: -1 });
 submissionSchema.index({ examAttemptId: 1 });
+submissionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0, partialFilterExpression: { expiresAt: { $type: 'date' } } });
 
 module.exports = mongoose.model('Submission', submissionSchema);

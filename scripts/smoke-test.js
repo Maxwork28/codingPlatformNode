@@ -57,6 +57,18 @@ const api = async (method, url, { token, body, raw } = {}) => {
     return { status: res.status, json };
 };
 
+/** Poll GET /judge/jobs/:id until the job is done / failed (async Run / Submit / exam grading). */
+const waitJob = async (token, jobId, timeoutMs = 90_000) => {
+    const deadline = Date.now() + timeoutMs;
+    let r;
+    while (Date.now() < deadline) {
+        r = await api('GET', `/judge/jobs/${jobId}`, { token });
+        if (r.status !== 200 || r.json.status === 'done' || r.json.status === 'failed') return r;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return r;
+};
+
 const waitForServer = async (child) => {
     const deadline = Date.now() + 60_000;
     while (Date.now() < deadline) {
@@ -81,6 +93,7 @@ const waitForServer = async (child) => {
     const Class = require(path.join(ROOT, 'models', 'Class'));
     const Question = require(path.join(ROOT, 'models', 'Question'));
     const Submission = require(path.join(ROOT, 'models', 'Submission'));
+    const ExamAttemptModel = require(path.join(ROOT, 'models', 'ExamAttempt'));
 
     await mongoose.connect(MONGO_URI);
     console.log(`seeding ${DB}`);
@@ -147,7 +160,7 @@ const waitForServer = async (child) => {
         // ---- health
         {
             const r = await api('GET', '/health');
-            check('GET /health reports mongo+docker+judge', r.status === 200 && r.json.mongo === 'up' && r.json.docker === 'up' && r.json.judge, JSON.stringify(r.json.judge));
+            check('GET /health reports mongo+docker+judge', r.status === 200 && r.json.mongo === 'up' && r.json.docker === 'up' && r.json.judge && r.json.judgeMode === 'inline', JSON.stringify(r.json.judge));
         }
 
         // ---- auth
@@ -214,13 +227,27 @@ const waitForServer = async (child) => {
             check('edit cannot overwrite createdBy / isExamOnly', String(after.createdBy) === String(teacher._id) && !after.isExamOnly, `status ${massAssign.status}`);
         }
 
-        // ---- run / submit through the judge
+        // ---- run / submit through the judge (async jobs; ?wait=1 = wait for the result)
         {
-            const run = await api('POST', `/questions/${question._id}/run`, {
+            const queued = await api('POST', `/questions/${question._id}/run`, {
+                token: studentTok,
+                body: { answer: 'print(input())', classId: String(cls._id), language: 'python', clientRequestId: 'smoke-run-0001' },
+            });
+            check('student run → 202 with a job id (async)', queued.status === 202 && queued.json.jobId && ['queued', 'running'].includes(queued.json.status), JSON.stringify(queued.json).slice(0, 160));
+            const again = await api('POST', `/questions/${question._id}/run`, {
+                token: studentTok,
+                body: { answer: 'print(input())', classId: String(cls._id), language: 'python', clientRequestId: 'smoke-run-0001' },
+            });
+            check('retry with the same clientRequestId returns the same job (no double run)', again.json.jobId === queued.json.jobId && again.json.duplicate === true, `${again.json.jobId} vs ${queued.json.jobId}`);
+            const peek = await api('GET', `/judge/jobs/${queued.json.jobId}`, { token: student2Tok });
+            check('another student cannot read the job', peek.status === 404, `status ${peek.status}`);
+            const done = await waitJob(studentTok, queued.json.jobId);
+            check('job finishes with the run result', done.json.status === 'done' && done.json.result?.testResults?.every((t) => t.passed), JSON.stringify(done.json).slice(0, 200));
+            const run = await api('POST', `/questions/${question._id}/run?wait=1`, {
                 token: studentTok,
                 body: { answer: 'print(input())', classId: String(cls._id), language: 'python' },
             });
-            check('student run → 200 with passing public tests', run.status === 200 && run.json.testResults?.every((t) => t.passed), JSON.stringify(run.json).slice(0, 160));
+            check('student run (?wait=1) → 200 with passing public tests', run.status === 200 && run.json.testResults?.every((t) => t.passed), JSON.stringify(run.json).slice(0, 160));
             const runOutsider = await api('POST', `/questions/${question._id}/run`, {
                 token: student2Tok,
                 body: { answer: 'print(input())', classId: String(cls._id), language: 'python' },
@@ -228,7 +255,7 @@ const waitForServer = async (child) => {
             check('non-enrolled student run → 403', runOutsider.status === 403, `status ${runOutsider.status}`);
 
             const t0 = Date.now();
-            const sub = await api('POST', `/questions/${question._id}/submit`, {
+            const sub = await api('POST', `/questions/${question._id}/submit?wait=1`, {
                 token: studentTok,
                 body: { answer: 'print(input())', classId: String(cls._id), language: 'python' },
             });
@@ -239,23 +266,30 @@ const waitForServer = async (child) => {
             check('full testResults stored on Submission', Array.isArray(saved?.testResults) && saved.testResults.length === 3, `len ${saved?.testResults?.length}`);
 
             const tle0 = Date.now();
-            const tle = await api('POST', `/questions/${question._id}/submit`, {
+            const tle = await api('POST', `/questions/${question._id}/submit?wait=1`, {
                 token: studentTok,
                 body: { answer: 'while True: pass', classId: String(cls._id), language: 'python' },
             });
             check('infinite loop submit returns tle (no hang)', tle.status === 200 && tle.json.submission?.status === 'tle', `${Date.now() - tle0} ms, status=${tle.json.submission?.status}`);
+            const tleRows = tle.json.testResults || [];
+            check('practice submit stops at the first failing test (rest skipped)', tleRows[0]?.status === 'tle' && tleRows.slice(1).every((t) => t.status === 'skipped'), tleRows.map((t) => t.status).join(','));
 
-            // Saturate the judge: concurrency 2 + queue 3 → the 6th+ concurrent request must get 429.
-            const burst = await Promise.all(
-                Array.from({ length: 8 }, () =>
-                    api('POST', `/questions/${question._id}/run`, {
-                        token: studentTok,
-                        body: { answer: 'import time\ntime.sleep(1)\nprint(input())', classId: String(cls._id), language: 'python' },
-                    })
-                )
-            );
-            const codes = burst.map((b) => b.status);
-            check('judge saturation returns 429 instead of OOM/500', codes.includes(429) && !codes.includes(500), codes.join(','));
+            // Saturate the judge: 2 running + queue of 3 practice jobs → the next request gets 429.
+            const codes = [];
+            for (let i = 0; i < 8; i += 1) {
+                const b = await api('POST', `/questions/${question._id}/run`, {
+                    token: studentTok,
+                    body: { answer: 'import time\ntime.sleep(1.5)\nprint(input())', classId: String(cls._id), language: 'python' },
+                });
+                codes.push(b.status);
+            }
+            check('judge saturation returns 429 instead of OOM/500', codes.includes(429) && codes.includes(202) && !codes.includes(500), codes.join(','));
+            // Let the queued jobs drain before the next checks.
+            for (let i = 0; i < 120; i += 1) {
+                const h = await api('GET', '/health');
+                if (h.json.judge && h.json.judge.queued === 0 && h.json.judge.active === 0) break;
+                await new Promise((r) => setTimeout(r, 250));
+            }
 
             const view = await api('GET', `/questions/submissions/${saved._id}/code`, { token: teacherTok });
             check('teacher view submission uses stored results (no re-judge)', view.status === 200 && Array.isArray(view.json.testResults), `status ${view.status}`);
@@ -310,8 +344,8 @@ const waitForServer = async (child) => {
             );
 
             // Run only bumps totalRuns; a wrong coding submit marked correct by staff updates row + totals atomically.
-            const run = await api('POST', `/questions/${question._id}/run`, { token: lbTok, body: { answer: 'print(input())', classId: String(cls._id), language: 'python' } });
-            const wrong = await api('POST', `/questions/${question._id}/submit`, { token: lbTok, body: { answer: 'print(0)', classId: String(cls._id), language: 'python' } });
+            const run = await api('POST', `/questions/${question._id}/run?wait=1`, { token: lbTok, body: { answer: 'print(input())', classId: String(cls._id), language: 'python' } });
+            const wrong = await api('POST', `/questions/${question._id}/submit?wait=1`, { token: lbTok, body: { answer: 'print(0)', classId: String(cls._id), language: 'python' } });
             const mark = wrong.json.submission?._id
                 ? await api('POST', `/questions/submissions/${wrong.json.submission._id}/mark-correct`, { token: teacherTok })
                 : { status: 0 };
@@ -422,7 +456,12 @@ const waitForServer = async (child) => {
                     token: studentTok,
                     body: { attemptId, questionId: String(question._id), answer: 'print(input())', language: 'python' },
                 });
-                check('exam answer graded', ans.status === 200 && ans.json.passedTestCases === 3, `status ${ans.status} ${JSON.stringify(ans.json).slice(0, 120)}`);
+                check('exam coding answer is saved at once (grading pending)', ans.status === 200 && ans.json.gradingStatus === 'pending' && ans.json.jobId, `status ${ans.status} ${JSON.stringify(ans.json).slice(0, 120)}`);
+                const graded = await waitJob(studentTok, ans.json.jobId);
+                check('exam answer graded by the background job', graded.json.status === 'done' && graded.json.result?.passedTestCases === 3, JSON.stringify(graded.json).slice(0, 160));
+                const att = await ExamAttemptModel.findById(attemptId).lean();
+                const entry = att?.answers?.find((a) => String(a.questionId) === String(question._id));
+                check('attempt answer updated with the grade', entry?.gradingStatus === 'done' && entry.passedTestCases === 3 && entry.score === 10, JSON.stringify(entry || {}).slice(0, 160));
                 const ev = await api('POST', `/exams/${examId}/events`, { token: studentTok, body: { attemptId, type: 'tab_switch', details: { huge: 'x'.repeat(5000) } } });
                 check('proctoring event with oversized details accepted and bounded', ev.status === 200);
                 const fin = await api('POST', `/exams/${examId}/submit`, { token: studentTok, body: { attemptId } });
@@ -894,10 +933,11 @@ const waitForServer = async (child) => {
                     api('POST', `/exams/${examId}/submit-answer`, { token: aiTokB, body: { attemptId: attemptB, questionId: qid, answer: AI_DIFFERENT, language: 'python' } }),
                 ]);
                 const mcqA = await api('POST', `/exams/${examId}/submit-answer`, { token: aiTokA, body: { attemptId: attemptA, questionId: mcqId, answer: 1 } });
+                const [gradeA, gradeB] = await Promise.all([waitJob(aiTokA, subA.json.jobId), waitJob(aiTokB, subB.json.jobId)]);
                 check(
                     'ai: both coding answers are graded by the judge and the MCQ is saved',
-                    subA.status === 200 && subA.json.passedTestCases === 2 && subB.status === 200 && subB.json.passedTestCases === 2 && mcqA.status === 200,
-                    `${subA.status}/${subA.json.passedTestCases} ${subB.status}/${subB.json.passedTestCases} ${mcqA.status}`
+                    subA.status === 200 && gradeA.json.result?.passedTestCases === 2 && subB.status === 200 && gradeB.json.result?.passedTestCases === 2 && mcqA.status === 200,
+                    `${subA.status}/${gradeA.json.result?.passedTestCases} ${subB.status}/${gradeB.json.result?.passedTestCases} ${mcqA.status}`
                 );
                 check('ai: submit-answer response carries no AI data', !JSON.stringify(subA.json).includes('aiCheck') && !JSON.stringify(subB.json).includes('aiCheck'));
 
@@ -987,11 +1027,24 @@ const waitForServer = async (child) => {
                 authed.socket.close();
             }
             const member = await connect({ auth: { token: studentTok } });
-            if (member.ok) {
+            const staff = await connect({ auth: { token: teacherTok } });
+            if (member.ok && staff.ok) {
                 const ack = await new Promise((r) => member.socket.emit('joinClass', String(cls._id), r));
                 check('member joinClass is accepted', ack && ack.ok === true, JSON.stringify(ack));
-                member.socket.close();
+                await new Promise((r) => staff.socket.emit('joinClass', String(cls._id), r));
+                const seen = { studentActivity: 0, staffActivity: 0, done: null };
+                member.socket.on('codeRun', () => (seen.studentActivity += 1));
+                member.socket.on('submissionUpdate', () => (seen.studentActivity += 1));
+                staff.socket.on('codeRun', () => (seen.staffActivity += 1));
+                const gotDone = new Promise((resolve) => member.socket.on('judge:done', (v) => resolve(v)));
+                const q2 = await api('POST', `/questions/${question._id}/run`, { token: studentTok, body: { answer: 'print(input())', classId: String(cls._id), language: 'python' } });
+                const doneEvent = await Promise.race([gotDone, new Promise((r) => setTimeout(() => r(null), 30_000))]);
+                await new Promise((r) => setTimeout(r, 500));
+                check('owner gets judge:done over the socket with the result', doneEvent?.jobId === q2.json.jobId && doneEvent?.status === 'done' && Array.isArray(doneEvent.result?.testResults), JSON.stringify(doneEvent || {}).slice(0, 120));
+                check('Run activity goes to staff only (classmates do not receive it)', seen.staffActivity >= 1 && seen.studentActivity === 0, JSON.stringify(seen));
             }
+            member.socket?.close();
+            staff.socket?.close();
         }
 
         // ---- security headers / 404

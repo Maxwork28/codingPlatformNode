@@ -11,13 +11,10 @@ const { scheduleAiCheck } = require('../utils/aiDetection');
 const seb = require('../utils/seb');
 const SebEntryThrottle = require('../models/SebEntryThrottle');
 const {
-    executeDockerCode,
     shouldMergeDriverForLanguage,
     shouldWrapBareArrayStdinForQuestion,
-    sanitizeTestResultsForStudent
 } = require('./questionController');
-
-const { compactTestResultsForStorage } = require('../utils/judge');
+const { enqueue, respondWithJob } = require('../services/judgeJobs');
 
 const CODING_TYPES = ['coding', 'fillInTheBlanksCoding', 'codingWithDriver'];
 const CLOSED_STATUSES = ['submitted', 'auto_submitted', 'terminated', 'expired'];
@@ -351,7 +348,9 @@ const studentAttempt = (attempt, { released = false, codingIds = new Set(), exam
                 answer: a.answer,
                 language: a.language,
                 savedAt: a.savedAt,
-                ...(coding ? { passedTestCases: a.passedTestCases, totalTestCases: a.totalTestCases } : {}),
+                ...(coding
+                    ? { passedTestCases: a.passedTestCases, totalTestCases: a.totalTestCases, gradingStatus: a.gradingStatus || 'done', gradingError: a.gradingError || null }
+                    : {}),
                 ...(showScore ? { score: a.score, maxScore: a.maxScore, isCorrect: a.isCorrect } : {}),
             };
         }),
@@ -451,36 +450,18 @@ const gradeAnswer = async (question, answer, language, maxScore) => {
             return result(typedAnswerMatches(answer, question.correctAnswer), answer);
         }
         default: {
+            // Coding: stored now with score 0 / gradingStatus 'pending'; an exam-grade judge job fills in the score.
             assertCodingInput(question, answer, language);
-            const code = runnableCode(question, answer, language);
-            try {
-                const tests = await executeDockerCode(language, code, question.testCases, question.timeLimit, question.memoryLimit, {
-                    wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language),
-                });
-                const passed = tests.filter((t) => t.passed).length;
-                const total = tests.length;
-                const isCorrect = total > 0 && passed === total;
-                return {
-                    answer,
-                    isCorrect,
-                    score: isCorrect ? maxScore : total ? Math.floor((passed / total) * maxScore) : 0,
-                    passedTestCases: passed,
-                    totalTestCases: total,
-                    output: JSON.stringify(compactTestResultsForStorage(sanitizeTestResultsForStudent(tests))),
-                    testResults: compactTestResultsForStorage(sanitizeTestResultsForStudent(tests)),
-                };
-            } catch (err) {
-                if (err?.status === 429) throw err; // judge saturated: tell the student to retry, don't record a zero
-                return {
-                    answer,
-                    isCorrect: false,
-                    score: 0,
-                    passedTestCases: 0,
-                    totalTestCases: question.testCases?.length || 0,
-                    output: `Error: ${err.message}`,
-                    executionError: 'Your code could not be run. Check it compiles and try again.',
-                };
-            }
+            runnableCode(question, answer, language); // a missing fill-the-code template is a 400 now, not a failed grade
+            return {
+                answer,
+                isCorrect: false,
+                score: 0,
+                passedTestCases: 0,
+                totalTestCases: 0,
+                output: '',
+                pending: true,
+            };
         }
     }
 };
@@ -1311,8 +1292,11 @@ exports.getExamReport = async (req, res) => {
                         isCorrect: ans.isCorrect,
                         passedTestCases: ans.passedTestCases,
                         totalTestCases: ans.totalTestCases,
+                        gradingStatus: ans.gradingStatus || undefined,
+                        gradingError: ans.gradingError || undefined,
                         savedAt: ans.savedAt,
                     })),
+                    pendingGrading: (p.answers || []).filter((ans) => ans.gradingStatus === 'pending').length,
                 };
             }),
             serverTime: new Date(),
@@ -1606,13 +1590,16 @@ exports.submitAnswer = async (req, res) => {
         const { questionId, answer, language } = req.body;
         if (!isObjectId(questionId)) throw clientError('questionId is required');
         const meta = assertQuestionOpen(exam, attempt, questionId);
-        const question = await Question.findById(questionId);
+        // Test cases are not needed here: coding answers are graded by a judge job.
+        const question = await Question.findById(questionId).select('-testCases -solution -solutionCode -solutionCodes');
         if (!question) throw clientError('Question not found', 404);
 
         const maxScore = Number(meta.points) || 0;
         const graded = await gradeAnswer(question, answer, language, maxScore);
         const coding = CODING_TYPES.includes(question.type);
 
+        // Save first, grade later: the answer is stored in milliseconds, so a save at the last
+        // second (or many students at time-up) can never lose code behind a busy judge.
         const submission = await Submission.create({
             questionId,
             classId: attempt.classId,
@@ -1626,16 +1613,8 @@ exports.submitAnswer = async (req, res) => {
             passedTestCases: graded.passedTestCases,
             totalTestCases: graded.totalTestCases,
             examAttemptId: attempt._id,
+            ...(coding ? { status: 'pending' } : {}),
         });
-
-        // AI-generated-code check: coding answers in exams only; asynchronous, never blocks or fails the save.
-        if (coding) {
-            try {
-                scheduleAiCheck({ submissionId: submission._id, examId: exam._id, attemptId: attempt._id, questionId });
-            } catch (err) {
-                console.warn('[exam] scheduleAiCheck failed:', err?.message);
-            }
-        }
 
         const savedAt = new Date();
         const entry = {
@@ -1648,6 +1627,7 @@ exports.submitAnswer = async (req, res) => {
             language: coding ? language : undefined,
             passedTestCases: graded.passedTestCases,
             totalTestCases: graded.totalTestCases,
+            ...(coding ? { gradingStatus: 'pending' } : {}),
             savedAt,
         };
         const applyAnswer = (doc) => {
@@ -1657,26 +1637,49 @@ exports.submitAnswer = async (req, res) => {
             // Not moving currentQuestionId here: only /navigate changes position (and the running timers).
         };
         applyAnswer(attempt);
-        // Grading took seconds; a concurrent auto-submit may have closed the attempt meanwhile.
-        const fresh = await ExamAttempt.findById(attempt._id).select('status endsAt');
-        if (!fresh || isClosed(fresh)) throw clientError('Time is up. Your exam has been submitted.', 409);
         await saveAttemptWithRetry(attempt, (doc) => {
             if (isClosed(doc)) throw clientError('Time is up. Your exam has been submitted.', 409);
             applyAnswer(doc);
         });
 
+        let jobId = null;
+        if (coding) {
+            // Graded even if the attempt closes meanwhile; the closed attempt's total is updated then.
+            const { job } = await enqueue({
+                kind: 'exam-grade',
+                ownerId: req.user._id,
+                spec: {
+                    language,
+                    code: runnableCode(question, answer, language),
+                    questionId: String(question._id),
+                    testSet: 'all',
+                    timeLimit: question.timeLimit,
+                    memoryLimit: question.memoryLimit,
+                    wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+                },
+                context: {
+                    examId: String(exam._id),
+                    attemptId: String(attempt._id),
+                    submissionId: String(submission._id),
+                    questionId: String(question._id),
+                    studentId: String(req.user._id),
+                    maxScore,
+                },
+            });
+            jobId = String(job._id);
+            // AI-generated-code check: coding answers in exams only; asynchronous, never blocks or fails the save.
+            try {
+                scheduleAiCheck({ submissionId: submission._id, examId: exam._id, attemptId: attempt._id, questionId });
+            } catch (err) {
+                console.warn('[exam] scheduleAiCheck failed:', err?.message);
+            }
+        }
+
         res.json({
             message: 'Answer saved',
             savedAt,
             questionId,
-            ...(coding
-                ? {
-                      passedTestCases: graded.passedTestCases,
-                      totalTestCases: graded.totalTestCases,
-                      testResults: graded.testResults || null,
-                      executionError: graded.executionError || null,
-                  }
-                : {}),
+            ...(coding ? { gradingStatus: 'pending', jobId, submissionId: String(submission._id) } : {}),
         });
     } catch (err) {
         sendError(res, err, 'Failed to save answer', 'submitAnswer');
@@ -1692,27 +1695,30 @@ exports.runCode = async (req, res) => {
         const { questionId, answer, language, customInput, expectedOutput } = req.body;
         if (!isObjectId(questionId)) throw clientError('questionId is required');
         assertQuestionOpen(exam, attempt, questionId);
-        const question = await Question.findById(questionId);
+        const question = await Question.findById(questionId).select('-testCases -solution -solutionCode -solutionCodes');
         if (!question) throw clientError('Question not found', 404);
         if (!CODING_TYPES.includes(question.type)) throw clientError('Only coding questions can be run');
         assertCodingInput(question, answer, language);
 
         const custom = typeof customInput === 'string' && customInput.trim() !== '';
-        const tests = custom
-            ? [{ input: customInput, expectedOutput: typeof expectedOutput === 'string' ? expectedOutput : '', isPublic: true }]
-            : question.testCases.filter((tc) => tc.isPublic);
-        if (!tests.length) throw clientError('This question has no sample tests. Run it with your own input instead.');
-
-        let results;
-        try {
-            results = await executeDockerCode(language, runnableCode(question, answer, language), tests, question.timeLimit, question.memoryLimit, {
-                wrapBareArrayStdinForDriver: shouldWrapBareArrayStdinForQuestion(question, language),
-            });
-        } catch (err) {
-            const busy = err?.status === 429;
-            throw clientError(busy ? err.message : `Your code could not be run: ${err.message}`, busy ? 429 : 422);
-        }
-        res.json({ custom, testResults: sanitizeTestResultsForStudent(results) });
+        const { job, duplicate } = await enqueue({
+            kind: 'exam-run',
+            ownerId: req.user._id,
+            clientRequestId: req.body.clientRequestId,
+            spec: {
+                language,
+                code: runnableCode(question, answer, language),
+                questionId: String(question._id),
+                testSet: custom ? 'custom' : 'public',
+                ...(custom ? { customTests: [{ input: customInput, expectedOutput: typeof expectedOutput === 'string' ? expectedOutput : '', isPublic: true }] } : {}),
+                noTestsMessage: 'This question has no sample tests. Run it with your own input instead.',
+                timeLimit: question.timeLimit,
+                memoryLimit: question.memoryLimit,
+                wrapStdin: shouldWrapBareArrayStdinForQuestion(question, language),
+            },
+            context: { examId: String(exam._id), attemptId: String(attempt._id), questionId: String(question._id) },
+        });
+        return respondWithJob(req, res, job, duplicate);
     } catch (err) {
         sendError(res, err, 'Failed to run code', 'runCode');
     }
@@ -1952,7 +1958,13 @@ exports.getStudentExamResults = async (req, res) => {
 
         res.json({
             ...summary,
-            attempt: { ...summary.attempt, totalScore: attempt.totalScore, maxScore: attempt.maxScore || totalPoints(exam) },
+            attempt: {
+                ...summary.attempt,
+                totalScore: attempt.totalScore,
+                maxScore: attempt.maxScore || totalPoints(exam),
+                // Coding answers still being graded: the total can still go up.
+                pendingGrading: (attempt.answers || []).filter((a) => a.gradingStatus === 'pending').length,
+            },
             answerKeysVisible: keysVisible,
             questions: [...exam.questions]
                 .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
@@ -1980,6 +1992,7 @@ exports.getStudentExamResults = async (req, res) => {
                                   isCorrect: ans.isCorrect,
                                   passedTestCases: ans.passedTestCases,
                                   totalTestCases: ans.totalTestCases,
+                                  gradingStatus: coding ? ans.gradingStatus || 'done' : undefined,
                                   savedAt: ans.savedAt,
                               }
                             : null,
