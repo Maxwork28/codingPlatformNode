@@ -50,6 +50,37 @@ const languageConfig = {
     go: { image: 'go-compiler', file: 'code.go', compileCmd: ['go', 'build', '-o', '/app/code', '/app/code.go'], runCmd: ['/app/code'], artifacts: ['code'], baselineCode: 'package main\nfunc main() {}' },
 };
 
+/**
+ * The Java class to run: the public top-level class (javac needs the file named after it), else the
+ * class that declares main, else Solution. Comments, strings and char literals are ignored.
+ */
+const javaMainClass = (code) => {
+    const src = String(code ?? '').replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])+'/g, ' ');
+    const pub = src.match(/\bpublic\s+(?:(?:final|abstract|strictfp)\s+)*class\s+([A-Za-z_$][\w$]*)/);
+    if (pub) return pub[1];
+    const mainAt = src.search(/\bstatic\s+void\s+main\s*\(/);
+    let name = null;
+    if (mainAt >= 0) {
+        const re = /\bclass\s+([A-Za-z_$][\w$]*)/g;
+        let m;
+        while ((m = re.exec(src)) && m.index < mainAt) name = m[1];
+    }
+    return name || 'Solution';
+};
+
+/** languageConfig for one program: Java file and run class follow the class the code declares (Main, Codechef, ...). */
+const configForCode = (language, code) => {
+    const config = languageConfig[language];
+    if (language !== 'java' || !config) return config;
+    const name = javaMainClass(code);
+    if (name === 'Solution') return config;
+    return {
+        ...config,
+        file: `${name}.java`,
+        compileCmd: ['javac', '-d', '/app', `/app/${name}.java`],
+        runCmd: [...config.runCmd.slice(0, -1), name],
+    };
+};
 
 const intEnv = (name, fallback) => {
     const n = Number.parseInt(process.env[name], 10);
@@ -73,6 +104,13 @@ const WALL_FACTOR = floatEnv('JUDGE_WALL_FACTOR', 3);
 const COMPILE_CACHE_ON = process.env.JUDGE_COMPILE_CACHE !== '0';
 const COMPILE_CACHE_MAX_ENTRIES = intEnv('JUDGE_COMPILE_CACHE_ENTRIES', 400);
 const COMPILE_CACHE_MAX_BYTES = intEnv('JUDGE_COMPILE_CACHE_MB', 256) * 1024 * 1024;
+/**
+ * Container memory while compiling (g++ with <bits/stdc++.h> needs ~150-300 MB). The question's
+ * limit still applies to each test: its measured peak decides MLE.
+ */
+const COMPILE_MEMORY_MB = intEnv('JUDGE_COMPILE_MEMORY_MB', 512);
+/** Lowest per-test memory limit per language (a JVM alone takes ~40-60 MB). */
+const MIN_MEMORY_MB = { java: 256 };
 /** Inputs at least this large (all tests together) go through the read-only tests cache. */
 const TESTS_CACHE_MIN_BYTES = intEnv('JUDGE_TESTS_CACHE_MIN_KB', 32) * 1024;
 const TESTS_CACHE_MAX_BYTES = intEnv('JUDGE_TESTS_CACHE_MB', 512) * 1024 * 1024;
@@ -777,7 +815,7 @@ const skippedRow = (test) => resultRow(test, { status: 'skipped', error: 'Not ru
 const runCustomChecker = async (checker, cases, rows, payloads, testsDir, outputs) => {
     const indexes = rows.map((r, i) => (r.status === 'pending_check' ? i : -1)).filter((i) => i >= 0);
     if (!indexes.length) return;
-    const config = languageConfig[checker.language];
+    const config = configForCode(checker.language, checker.code);
     const markAll = (status, error) => {
         for (const i of indexes) Object.assign(rows[i], { status, passed: false, error });
     };
@@ -850,7 +888,7 @@ const runCustomChecker = async (checker, cases, rows, payloads, testsDir, output
  * @param {string} spec.code                 final program (driver / template already merged)
  * @param {Array<{input:string, expectedOutput:string, isPublic?:boolean}>} spec.tests
  * @param {number} spec.timeLimit            CPU seconds per test (0.1..10)
- * @param {number} spec.memoryLimit          MB per container (16..2048)
+ * @param {number} spec.memoryLimit          MB per test (16..2048; Java at least 256)
  * @param {boolean} [spec.wrapStdin]         wrap bare JSON arrays for LeetCode-style drivers
  * @param {number} [spec.repeats]            teacher benchmark: run every test N times
  * @param {Array}  [spec.repeatSummaries]    filled with one summary per repeat round
@@ -860,7 +898,7 @@ const runCustomChecker = async (checker, cases, rows, payloads, testsDir, output
  */
 const runJudge = async (spec) => {
     const { language } = spec;
-    const config = languageConfig[language];
+    const config = configForCode(language, spec.code);
     if (!config) throw new Error(`Unsupported language: ${language}`);
 
     const cases = Array.isArray(spec.tests) ? spec.tests.slice(0, MAX_TEST_CASES) : [];
@@ -868,7 +906,7 @@ const runJudge = async (spec) => {
 
     const code = String(spec.code ?? '');
     const tlSec = clamp(Number(spec.timeLimit) || 2, 0.1, 10);
-    const memMb = clamp(Math.round(Number(spec.memoryLimit) || 256), 16, 2048);
+    const memMb = clamp(Math.max(Math.round(Number(spec.memoryLimit) || 256), MIN_MEMORY_MB[language] || 0), 16, 2048);
     let repeats = Number.parseInt(spec.repeats, 10);
     if (!Number.isFinite(repeats) || repeats < 1) repeats = 1;
     repeats = Math.min(MAX_REPEATS, repeats);
@@ -929,7 +967,9 @@ const runJudge = async (spec) => {
         ];
         const binds = [`${tempDir}:/app:rw`, ...(testsDir ? [`${testsDir}:/tests:ro`] : [])];
 
-        const container = await createContainer(language, config, { cmd, binds, memMb });
+        // Compiling gets its own headroom; tests are still held to memMb by their measured peak (evaluateCase).
+        const containerMb = compiling ? Math.max(memMb, COMPILE_MEMORY_MB) : memMb;
+        const container = await createContainer(language, config, { cmd, binds, memMb: containerMb });
 
         // ---- watch the work dir while the container runs
         let handshakeDone = !handshake;
@@ -1117,6 +1157,7 @@ module.exports = {
     getBaselines,
     supportedLanguages,
     languageConfig,
+    javaMainClass,
     parseOptionalJudgeLimit,
     summarizeRunCaseMetrics,
     averageNumbers,
